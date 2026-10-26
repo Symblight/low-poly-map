@@ -1,0 +1,153 @@
+schema_name: SimPlane
+schema_description: >-
+  Low-poly city tiles for the SimPlane streamed-city spike. Buildings keep their raw
+  OSM `building` value as `kind` plus height data at every zoom (z13-z16), with no
+  merging and no small-feature dropping, so the R3 ring (z13) still has one light
+  point per building. Landuse polygons let the Rust side resolve kind/levels
+  fallbacks by point-in-polygon. Roads keep `highway` + `lit` for a later spike.
+attribution: <a href="https://www.openstreetmap.org/copyright" target="_blank">&copy; OpenStreetMap contributors</a>
+version: 1.0.0
+
+args:
+  osm_path:
+    description: Local path of the OSM .osm.pbf extract
+    default: /data/sources/lithuania-latest.osm.pbf
+  minzoom: 13
+  maxzoom: 16
+  # The building layer is the payload; keep every footprint at every zoom.
+  min_feature_size: 0
+  min_feature_size_at_max_zoom: 0
+
+sources:
+  osm:
+    type: osm
+    local_path: '${ args.osm_path }'
+
+definitions:
+  - &osm_id
+    key: id
+    type: long
+    value: '${ feature.id }'
+  - &osm_type
+    key: osm_type
+    value: '${ feature.osm_type }'
+
+layers:
+  - id: buildings
+    buffer: 4
+    features:
+      - source: osm
+        geometry: polygon
+        min_zoom: 13
+        min_size: 0
+        min_size_at_max_zoom: 0
+        include_when:
+          building: __any__
+        exclude_when:
+          building: ["no", "none"]
+        attributes:
+          - *osm_id
+          - *osm_type
+          - key: kind
+            tag_value: building
+          # Numeric parse: "12", "12 m", "12,5" -> 12 / 12.5; values without a leading
+          # number fail to parse and the attribute is omitted. Units other than metres
+          # (e.g. "40'") are not converted.
+          - key: height
+            type: double
+            include_when:
+              height: __any__
+            value: '${ feature.tags.height.replace(",", ".").replaceRegex("^\\s*([0-9]+(?:\\.[0-9]+)?).*$", "$1") }'
+          - key: levels
+            type: double
+            include_when:
+              building:levels: __any__
+            value: '${ feature.tags["building:levels"].replace(",", ".").replaceRegex("^\\s*([0-9]+(?:\\.[0-9]+)?).*$", "$1") }'
+          - key: min_height
+            type: double
+            value: '${ feature.tags.has("min_height") ? feature.tags.min_height.replace(",", ".").replaceRegex("^\\s*([0-9]+(?:\\.[0-9]+)?).*$", "$1") : "0" }'
+          - key: colour
+            tag_value: building:colour
+
+  - id: landuse
+    buffer: 4
+    features:
+      - source: osm
+        geometry: polygon
+        min_zoom: 13
+        min_size: 0
+        min_size_at_max_zoom: 0
+        include_when:
+          landuse: __any__
+        attributes:
+          - *osm_id
+          - key: kind
+            tag_value: landuse
+      # Parks and green areas for the ground mesh: `kind` is the leisure value.
+      - source: osm
+        geometry: polygon
+        min_zoom: 13
+        min_size: 0
+        min_size_at_max_zoom: 0
+        include_when:
+          leisure: [park, garden, playground, pitch, golf_course, nature_reserve, recreation_ground]
+        attributes:
+          - *osm_id
+          - key: kind
+            tag_value: leisure
+      # Water, woods and other natural areas: `kind` is the natural value.
+      - source: osm
+        geometry: polygon
+        min_zoom: 13
+        min_size: 0
+        min_size_at_max_zoom: 0
+        include_when:
+          natural: [water, wood, grassland, scrub, wetland]
+        attributes:
+          - *osm_id
+          - key: kind
+            tag_value: natural
+      # Riverbank polygons: `kind` = `riverbank`.
+      - source: osm
+        geometry: polygon
+        min_zoom: 13
+        min_size: 0
+        min_size_at_max_zoom: 0
+        include_when:
+          waterway: riverbank
+        attributes:
+          - *osm_id
+          - key: kind
+            value: riverbank
+
+  - id: roads
+    buffer: 4
+    features:
+      - source: osm
+        geometry: line
+        # Major roads from z13, everything else (residential, service, footways...) from z14.
+        min_zoom:
+          default_value: 14
+          overrides:
+            13:
+              highway:
+                - motorway
+                - motorway_link
+                - trunk
+                - trunk_link
+                - primary
+                - primary_link
+                - secondary
+                - secondary_link
+                - tertiary
+                - tertiary_link
+        include_when:
+          highway: __any__
+        exclude_when:
+          highway: ["proposed", "construction", "abandoned", "razed", "platform"]
+        attributes:
+          - *osm_id
+          - key: kind
+            tag_value: highway
+          - key: lit
+            tag_value: lit

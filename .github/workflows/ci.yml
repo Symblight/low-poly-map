@@ -1,0 +1,120 @@
+# Per-push CI for the simworld / SimPlane spike (spec-library-packaging.md, section 1 and phase P0).
+#
+# Status of each step (be honest when editing this):
+#   - cargo test / cargo clippy / dotnet build: verified locally on macOS arm64 (rustc 1.99, .NET SDK 9.0.200)
+#     on 2026-10-26. Not yet run on a GitHub runner.
+#   - Godot smoke test: the command sequence (dotnet build -> godot --import -> godot --quit-after 120) was
+#     verified locally on a clean copy of low-poly-map/ without .godot/. The download URL was checked to
+#     resolve (HTTP 200). Running the .NET editor build headless on a GitHub macOS runner is UNVERIFIED.
+#     If it turns out brittle, set GODOT_SMOKE to 'false' below; the Rust and C# jobs are unaffected.
+#   - clippy runs without `-D warnings`: 13 warnings remain (10x chunks_exact_to_as_chunks, new in
+#     clippy 1.99; 1x large_enum_variant; 1x type_complexity; 1x redundant_field_names). Tighten later.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Must match low-poly-map/project.godot (config/features "4.7") and LowPolyMap.csproj (Godot.NET.Sdk/4.7.2).
+  GODOT_VERSION: "4.7.2"
+  # Kill switch for the Godot smoke test.
+  GODOT_SMOKE: "true"
+
+jobs:
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain (stable + clippy; MSRV in Cargo.toml is 1.94)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: cargo test
+        working-directory: rust
+        run: cargo test
+
+      - name: cargo clippy
+        working-directory: rust
+        # No -D warnings yet: existing warnings are reported, not fatal. Errors still fail the job.
+        run: cargo clippy --all-targets
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+
+      - name: dotnet build
+        working-directory: low-poly-map
+        run: dotnet build
+
+      # ---- Godot headless smoke test (disable with GODOT_SMOKE: "false") ----
+
+      - name: cargo build (debug dylib loaded by simplane_world.gdextension)
+        if: env.GODOT_SMOKE == 'true'
+        working-directory: rust
+        run: cargo build
+
+      - name: Cache Godot
+        if: env.GODOT_SMOKE == 'true'
+        id: godot-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/godot
+          key: godot-${{ env.GODOT_VERSION }}-stable-mono-macos-universal
+
+      - name: Download Godot ${{ env.GODOT_VERSION }} .NET
+        if: env.GODOT_SMOKE == 'true' && steps.godot-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/godot
+          url="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_mono_macos.universal.zip"
+          curl -fsSL --retry 3 -o ~/godot/godot.zip "$url"
+          unzip -q ~/godot/godot.zip -d ~/godot
+          rm ~/godot/godot.zip
+          ls ~/godot
+
+      - name: Godot headless smoke test
+        if: env.GODOT_SMOKE == 'true'
+        working-directory: low-poly-map
+        run: |
+          set -uo pipefail
+          G="$(echo ~/godot/Godot_mono.app/Contents/MacOS/Godot)"
+          "$G" --version
+          # A fresh checkout has no .godot/: import once so extension_list.cfg exists and the
+          # GDExtension is loaded on the real run. The import has crashed once locally at exit
+          # (MoltenVK shader conversion) while still producing .godot/, so its exit code is ignored
+          # and the result is checked instead.
+          "$G" --headless --path . --import || echo "::warning::godot --import exited non-zero"
+          test -f .godot/extension_list.cfg || { echo "::error::.godot/extension_list.cfg missing after import"; exit 1; }
+          # The C# assembly must be (re)built after the import created .godot/.
+          dotnet build
+          # Empty --tile-url forces the offline synthetic city (no tile server in CI).
+          "$G" --headless --path . --quit-after 120 -- --tile-url= 2>&1 | tee ../godot-smoke.log
+          status=${PIPESTATUS[0]}
+          [ "$status" -eq 0 ] || { echo "::error::Godot exited with $status"; exit 1; }
+          # Required markers: the Rust library loaded and WorldStreamer was configured.
+          grep -q "Initialize godot-rust" ../godot-smoke.log || { echo "::error::godot-rust did not initialize"; exit 1; }
+          grep -q "WorldStreamer configured origin=" ../godot-smoke.log || { echo "::error::WorldStreamer was not configured"; exit 1; }
+          # Soft marker: a tile reached Godot within 120 frames (timing-dependent on runners).
+          grep -q "\[StreamerBridge\] first tile" ../godot-smoke.log || echo "::warning::no tile delivered within 120 frames"
+          if grep -E "SCRIPT ERROR|Unhandled exception" ../godot-smoke.log; then
+            echo "::error::script errors in smoke log"; exit 1
+          fi
+
+      - name: Upload smoke log
+        if: always() && env.GODOT_SMOKE == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: godot-smoke-log
+          path: godot-smoke.log
+          if-no-files-found: ignore

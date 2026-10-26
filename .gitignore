@@ -1,0 +1,8 @@
+rust/target/
+low-poly-map/.godot/
+low-poly-map/bin/
+low-poly-map/obj/
+data/out/
+data/sources/
+addons/simworld/bin/
+.DS_Store

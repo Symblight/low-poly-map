@@ -1,0 +1,50 @@
+[package]
+name = "simplane_world"
+version = "0.5.0"
+edition = "2021"
+rust-version = "1.94"
+description = "SimPlane streamed-city WorldStreamer GDExtension (Rust owns the world, Godot displays it)"
+publish = false
+
+[lib]
+name = "simplane_world"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+# gdext; api-4-7 matches the Godot 4.7.x runtime (compatibility_minimum = 4.7 in the .gdextension).
+godot = { version = "0.5.5", features = ["api-4-7"] }
+
+# I/O: tokio runtime + reqwest (rustls only, no OpenSSL; plain http:// works too).
+tokio = { version = "1.54", default-features = false, features = ["rt-multi-thread", "sync", "time"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
+# PMTiles v3 reader over HTTP range requests (no mmap / s3 defaults).
+pmtiles = { version = "0.25.0", default-features = false, features = ["http-async", "reqwest-rustls"] }
+bytes = "1.12"
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+
+# Decode / CPU work.
+mvt-reader = "2.5.0"
+geo-types = { version = "0.7", default-features = false }
+rayon = "1.12"
+earcutr = "0.5.0"
+crossbeam-channel = "0.5.17"
+
+# Containers / hashing.
+lru = "0.19"
+ahash = "0.8.12"
+
+# Profiling only (SIMPLANE_PROFILE=1): per-thread CPU time to tell work from preemption.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# The editor loads the debug dylib: optimize dependencies (decode, HTTP, gdext glue) and lightly
+# optimize this crate so debug builds stay usable within the per-frame budgets. Debug info stays.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

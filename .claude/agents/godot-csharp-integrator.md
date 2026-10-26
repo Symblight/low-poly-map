@@ -12,7 +12,7 @@ You are the Godot C# engineer for the SimPlane streamed-city spike. Rust (`World
 ```
 low-poly-map/
   project.godot              # rendering method: mobile
-  simplane_world.gdextension # points to res://../rust/target/{debug,release}
+  simplane_world.gdextension # points to res://../rust/target/{debug,release}/libsimworld_godot.dylib
   scenes/CitySpike.tscn
   scripts/
     StreamerBridge.cs        # owns WorldStreamer, uploads tiles, origin shifts

@@ -1,0 +1,16 @@
+[package]
+name = "simworld-godot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "SimWorld Godot binding: the WorldStreamer GDExtension node (type conversion over simworld-core)"
+
+[lib]
+name = "simworld_godot"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+simworld-core = { path = "../simworld-core" }
+# gdext; api-4-7 matches the Godot 4.7.x runtime (compatibility_minimum = 4.7 in the .gdextension).
+godot = { version = "0.5.5", features = ["api-4-7"] }

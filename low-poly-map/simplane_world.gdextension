@@ -1,5 +1,6 @@
 ; SimPlane WorldStreamer GDExtension (Rust, gdext 0.5.x, api-4-7).
-; Owned by the Rust side (rust-world-streamer). Crate lives in ../rust/ (outside the project).
+; Owned by the Rust side (rust-world-streamer). Cargo workspace in ../rust/ (outside the project);
+; this loads the simworld-godot crate (libsimworld_godot.*), which wraps simworld-core.
 ; Build: cd ../rust && cargo build            (debug, used by the editor)
 ;        cd ../rust && cargo build --release  (release exports)
 
@@ -9,8 +10,8 @@ compatibility_minimum = 4.7
 reloadable = true
 
 [libraries]
-macos.debug = "res://../rust/target/debug/libsimplane_world.dylib"
-macos.release = "res://../rust/target/release/libsimplane_world.dylib"
+macos.debug = "res://../rust/target/debug/libsimworld_godot.dylib"
+macos.release = "res://../rust/target/release/libsimworld_godot.dylib"
 ; iOS (later): static xcframework built from the staticlib target, copied into the project, e.g.
-; ios.debug = "res://bin/ios/simplane_world.debug.xcframework"
-; ios.release = "res://bin/ios/simplane_world.release.xcframework"
+; ios.debug = "res://bin/ios/simworld_godot.debug.xcframework"
+; ios.release = "res://bin/ios/simworld_godot.release.xcframework"

@@ -1,13 +1,13 @@
 # CLAUDE.md (test bench)
 
-Test-bench notes only. Project status, layout, commands, architecture, constraints and the library plan are in the repo-root [`../CLAUDE.md`](../CLAUDE.md); the contract and specs are in `../docs/`. This folder is the Godot 4.7 .NET project (renderer Mobile, Jolt) that hosts the `WorldStreamer` GDExtension from `../rust/` and flies a camera over the streamed city.
+Test-bench notes only. Project status, layout, commands, architecture, constraints and the library plan are in the repo-root [`../CLAUDE.md`](../CLAUDE.md); the contract and specs are in `../docs/`. This folder is the Godot 4.7 .NET project (renderer Mobile, Jolt) that hosts the `WorldStreamer` GDExtension from `../rust/` (workspace crate `simworld-godot`, library `libsimworld_godot.*`, wrapping `simworld-core`) and flies a camera over the streamed city.
 
 ## Run it
 
 - `G=~/Downloads/Godot_mono.app/Contents/MacOS/Godot`; build Rust first (`cd ../rust && cargo build`) and C# (`dotnet build`).
 - Play: `$G --path .` (or F5 in the editor; main scene `scenes/CitySpike.tscn`). User arguments go after `--`, e.g. `$G --path . -- --time=13:00 --date=06-21`.
 - Tile source: `http://127.0.0.1:8787/vilnius.pmtiles` by default (start `../data/serve.sh`; tiles already in the disk cache at `user://tile_cache` render offline). `--tile-url=` (empty) switches to the synthetic city.
-- Headless smoke test: `$G --headless --path . --quit-after 120`. Expect `[StreamerBridge] tile source`, `poll_fades available`, `WorldStreamer configured ... [simplane_world <ver> (build ...)]`, the disk cache line and a `first tile` line, with no errors. `slow upload` lines are informational.
+- Headless smoke test: `$G --headless --path . --quit-after 120`. Expect `[StreamerBridge] tile source`, `poll_fades available`, `WorldStreamer configured ... [simworld-godot <ver> (build ...)]`, the disk cache line and a `first tile` line, with no errors. `slow upload` lines are informational.
 
 ## Keys and menus
 

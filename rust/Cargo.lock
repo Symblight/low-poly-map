@@ -1352,7 +1352,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
-name = "simplane_world"
+name = "simworld-cli"
+version = "0.5.0"
+dependencies = [
+ "simworld-core",
+]
+
+[[package]]
+name = "simworld-core"
 version = "0.5.0"
 dependencies = [
  "ahash",
@@ -1361,7 +1368,6 @@ dependencies = [
  "earcutr",
  "flate2",
  "geo-types",
- "godot",
  "libc",
  "lru",
  "mvt-reader",
@@ -1369,6 +1375,14 @@ dependencies = [
  "rayon",
  "reqwest",
  "tokio",
+]
+
+[[package]]
+name = "simworld-godot"
+version = "0.5.0"
+dependencies = [
+ "godot",
+ "simworld-core",
 ]
 
 [[package]]

@@ -1,0 +1,14 @@
+[package]
+name = "simworld-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "SimWorld headless runner (placeholder; fly scripts, cache bake, tile dumps and benches arrive in P6)"
+
+[[bin]]
+name = "simworld-cli"
+path = "src/main.rs"
+
+[dependencies]
+simworld-core = { path = "../simworld-core" }

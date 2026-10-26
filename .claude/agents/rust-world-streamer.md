@@ -9,21 +9,40 @@ You are the Rust engineer for the SimPlane streamed-city spike. Rust generates t
 
 ## Crate layout (`lowpolymap/rust/` — sibling of the Godot project `low-poly-map/`; never put crates inside the Godot project)
 
+Cargo workspace (spec-library-packaging.md, section 2, phase P1). Run cargo from `rust/`.
+
 ```
 lowpolymap/rust/
-  Cargo.toml            # crate-type = ["cdylib", "staticlib"]
-  src/
-    lib.rs              # ExtensionLibrary entry, registers WorldStreamer
-    streamer.rs         # #[derive(GodotClass)] WorldStreamer (Node)
-    geo.rs              # Web Mercator, z/x/y, f64 ENU, floating origin
-    rings.rs            # wanted set, look-ahead, hysteresis, priorities
-    fetch.rs            # PMTiles over HTTPS range requests + disk LRU cache
-    mvt.rs              # vector tile decode -> Building structs
-    mesher.rs           # simplify, extrude walls, earcut roofs, merge per tile
-    lights.rs           # light points + colors per building
-    synthetic.rs        # offline fake city when tile_url is empty
-    worker.rs           # tokio (I/O) + rayon (meshing) + crossbeam channels
+  Cargo.toml              # [workspace] members + shared [workspace.package] and profiles
+  simworld-core/          # rlib, NO godot dependency (cargo tree -p simworld-core | grep -i godot = empty)
+    src/
+      lib.rs              # module list, re-exports World / Log / Diagnostics, VERSION
+      world.rs            # World: frame, LocalSpace, scheduler, worker; re-center (RECENTER_DISTANCE_M)
+                          #   and pending origin shift, re-delivery pacing, warning limit, profiling.
+                          #   update_camera, pop_ready, drain_fades, drain_unload, take_origin_shift,
+                          #   stats, ground_height_at, debug_tiles, configure
+      diag.rs             # Log trait (info/warn/error), Diagnostics (profile, warnings_per_second)
+      geo.rs              # Web Mercator, z/x/y, f64 ENU, floating origin
+      rings.rs            # wanted set, look-ahead, hysteresis, priorities
+      scheduler.rs        # quadtree cover, sibling swap, fades, delivery guarantees
+      fetch.rs            # PMTiles over HTTPS range requests + disk LRU cache
+      mvt.rs              # vector tile decode -> Building structs
+      mesher.rs           # simplify, extrude walls, earcut roofs, merge per tile
+      ground.rs           # ground areas + road strips per tile
+      lights.rs           # light points + colors per building
+      synthetic.rs        # offline fake city when tile_url is empty
+      worker.rs           # tokio (I/O) + rayon (meshing) + crossbeam channels
+      integration_tests.rs
+  simworld-godot/         # cdylib + staticlib -> target/{debug,release}/libsimworld_godot.*
+    build.rs              # SIMPLANE_BUILD_MARKER (watches this crate and simworld-core)
+    src/
+      lib.rs              # #[gdextension] entry (entry_symbol gdext_rust_init), version_string()
+      streamer.rs         # #[derive(GodotClass)] WorldStreamer (Node): type conversion over World only
+      host.rs             # GodotLog (Log -> godot_print!/godot_warn!/godot_error!), SIMPLANE_PROFILE -> Diagnostics
+  simworld-cli/           # headless runner binary (placeholder until P6)
 ```
+
+Core rules: the core never depends on `godot`, never reads environment variables, and logs only through the `Log` passed to `World::new`. `streamer.rs` holds no constants or state beyond type conversion; new logic goes into the core.
 
 ## Dependencies (verify current versions on crates.io before pinning)
 
@@ -102,7 +121,7 @@ Slant distance `d = √(horizontal² + (cam_alt − ground)²)` to the nearest p
 - `update_camera` and `poll_*` must stay under 0.5 ms; no blocking, no allocation storms.
 - Deterministic output: the same tile always yields the same mesh and lit windows (seeded by OSM id, no time-based randomness).
 - Disk cache in `cache_dir`, LRU cap 300 MB, raw MVT bytes keyed by `z/x/y`.
-- Errors never panic across FFI: log with `godot_warn!` and retry with backoff.
+- Errors never panic across FFI: log through `Log::warn` (the binding maps it to `godot_warn!`) and retry with backoff.
 - Run `cargo check` and `cargo test` before reporting done; unit-test tile math, ring selection and extrusion.
 
 ## Done means

@@ -7,8 +7,10 @@
 #     verified locally on a clean copy of low-poly-map/ without .godot/. The download URL was checked to
 #     resolve (HTTP 200). Running the .NET editor build headless on a GitHub macOS runner is UNVERIFIED.
 #     If it turns out brittle, set GODOT_SMOKE to 'false' below; the Rust and C# jobs are unaffected.
-#   - clippy runs without `-D warnings`: 13 warnings remain (10x chunks_exact_to_as_chunks, new in
-#     clippy 1.99; 1x large_enum_variant; 1x type_complexity; 1x redundant_field_names). Tighten later.
+#   - clippy runs without `-D warnings`: 12 warnings remain, all in simworld-core (10x chunks_exact_to_as_chunks,
+#     new in clippy 1.99; 1x large_enum_variant; 1x type_complexity). Tighten later.
+#   - rust/ is a Cargo workspace since P1 (simworld-core, simworld-godot, simworld-cli); cargo commands run from
+#     rust/ cover all members. The core must not depend on godot (checked below).
 
 name: CI
 
@@ -43,6 +45,13 @@ jobs:
         working-directory: rust
         run: cargo test
 
+      - name: simworld-core has no godot dependency
+        working-directory: rust
+        run: |
+          if cargo tree -p simworld-core | grep -i godot; then
+            echo "::error::simworld-core depends on godot"; exit 1
+          fi
+
       - name: cargo clippy
         working-directory: rust
         # No -D warnings yet: existing warnings are reported, not fatal. Errors still fail the job.
@@ -59,7 +68,7 @@ jobs:
 
       # ---- Godot headless smoke test (disable with GODOT_SMOKE: "false") ----
 
-      - name: cargo build (debug dylib loaded by simplane_world.gdextension)
+      - name: cargo build (debug libsimworld_godot.dylib loaded by simplane_world.gdextension)
         if: env.GODOT_SMOKE == 'true'
         working-directory: rust
         run: cargo build

@@ -4,6 +4,14 @@ All notable changes to the SimWorld library (Rust `WorldStreamer` GDExtension pl
 
 Format: one section per release, newest first. Every contract change (a method, a dictionary key, an encoding, a guarantee) must be listed here and in the two agent files until `docs/contract.md` exists.
 
+## Unreleased
+
+P1 "Core split" (`docs/spec-library-packaging.md`). No contract change: the 9 `#[func]` methods, their signatures and every dictionary key are unchanged.
+
+- `rust/` is a Cargo workspace: `simworld-core` (rlib, no `godot`), `simworld-godot` (cdylib + staticlib, the `WorldStreamer` node), `simworld-cli` (placeholder). The library file is now `libsimworld_godot.*` (was `libsimplane_world.*`); `low-poly-map/simplane_world.gdextension` keeps its name and `entry_symbol = "gdext_rust_init"`, only the library paths changed.
+- `debug_stats()["version"]` (display string) now reads `simworld-godot 0.5.0 (build ...)` instead of `simplane_world 0.5.0 (build ...)`; the `configure` log line shows the same label.
+- New core types: `World` (floating origin and re-center, re-delivery pacing, warning rate limit, profiling; the logic that was in `streamer.rs`), `Log` trait, `Diagnostics`. The core reads no environment variables; the Godot binding maps `SIMPLANE_PROFILE=1` onto `Diagnostics` when the node is created (it used to be read on each `configure`).
+
 ## 0.5.0-spike (2026-10-26)
 
 First baseline: the spike as built, at milestone M5 and partway through M6. Crate `simplane_world` 0.5.0 (gdext 0.5.5, `api-4-7`, Godot 4.7). There is no `api_version` yet; `debug_stats()["version"]` is a display string only.

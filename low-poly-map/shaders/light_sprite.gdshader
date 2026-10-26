@@ -7,6 +7,8 @@ shader_type spatial;
 // clamp(sqrt(count) / 8, 0.125, 1). A single light is 0.125, clusters (100 m cells above ~3 km AGL) are higher.
 render_mode unshaded, blend_add, depth_draw_never, cull_disabled, fog_disabled, skip_vertex_transform;
 
+#include "res://shaders/earth_curve.gdshaderinc"
+
 uniform sampler2D dot_tex : source_color, filter_linear, repeat_disable;
 
 // Size in pixels by slant distance: sharp 2..4 px up to near_end_m, soft 6..12 px out to far_end_m.
@@ -46,6 +48,8 @@ varying float v_fade;
 void vertex() {
 	// MODELVIEW_MATRIX includes the MultiMesh instance transform.
 	vec3 c = (MODELVIEW_MATRIX * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+	// Earth curvature: drop the sprite centre in world space (via the view matrices, which hold no instance transform).
+	c -= (VIEW_MATRIX * vec4(0.0, earth_curve_drop((INV_VIEW_MATRIX * vec4(c, 1.0)).xyz), 0.0, 0.0)).xyz;
 	float d = length(c);
 
 	float k_near = clamp(d / near_end_m, 0.0, 1.0);

@@ -1,4 +1,4 @@
-[gd_scene load_steps=12 format=3]
+[gd_scene load_steps=13 format=3]
 
 [ext_resource type="Script" path="res://scripts/StreamerBridge.cs" id="1_bridge"]
 [ext_resource type="Script" path="res://scripts/FreeFlyCamera.cs" id="2_cam"]
@@ -6,13 +6,17 @@
 [ext_resource type="Script" path="res://scripts/NightRenderController.cs" id="4_night"]
 [ext_resource type="Script" path="res://scripts/TimeOfDay.cs" id="5_tod"]
 [ext_resource type="Script" path="res://scripts/DaylightMenu.cs" id="6_daymenu"]
+[ext_resource type="Shader" path="res://shaders/fallback_ground.gdshader" id="7_fallback"]
 
 [sub_resource type="PlaneMesh" id="PlaneMesh_ground"]
 size = Vector2(80000, 80000)
+subdivide_width = 127
+subdivide_depth = 127
 
-[sub_resource type="StandardMaterial3D" id="Mat_ground"]
-albedo_color = Color(0.18, 0.22, 0.17, 1)
-roughness = 1.0
+[sub_resource type="ShaderMaterial" id="Mat_ground"]
+shader = ExtResource("7_fallback")
+shader_parameter/albedo_color = Color(0.18, 0.22, 0.17, 1)
+shader_parameter/roughness_value = 1.0
 
 [sub_resource type="ProceduralSkyMaterial" id="Sky_mat"]
 

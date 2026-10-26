@@ -1,13 +1,13 @@
 # CLAUDE.md (test bench)
 
-Test-bench notes only. Project status, layout, commands, architecture, constraints and the library plan are in the repo-root [`../CLAUDE.md`](../CLAUDE.md); the contract and specs are in `../docs/`. This folder is the Godot 4.7 .NET project (renderer Mobile, Jolt) that hosts the `WorldStreamer` GDExtension from `../rust/` (workspace crate `simworld-godot`, library `libsimworld_godot.*`, wrapping `simworld-core`) and flies a camera over the streamed city.
+Test-bench notes only. Project status, layout, commands, architecture, constraints and the library plan are in the repo-root [`../CLAUDE.md`](../CLAUDE.md); the single contract document is [`../docs/contract.md`](../docs/contract.md) (read it before changing either side; do not copy it here) and the specs are in `../docs/`. This folder is the Godot 4.7 .NET project (renderer Mobile, Jolt) that hosts the `WorldStreamer` GDExtension from `../rust/` (workspace crate `simworld-godot`, library `libsimworld_godot.*`, wrapping `simworld-core`) and flies a camera over the streamed city.
 
 ## Run it
 
 - `G=~/Downloads/Godot_mono.app/Contents/MacOS/Godot`; build Rust first (`cd ../rust && cargo build`) and C# (`dotnet build`).
 - Play: `$G --path .` (or F5 in the editor; main scene `scenes/CitySpike.tscn`). User arguments go after `--`, e.g. `$G --path . -- --time=13:00 --date=06-21`.
 - Tile source: `http://127.0.0.1:8787/vilnius.pmtiles` by default (start `../data/serve.sh`; tiles already in the disk cache at `user://tile_cache` render offline). `--tile-url=` (empty) switches to the synthetic city.
-- Headless smoke test: `$G --headless --path . --quit-after 120`. Expect `[StreamerBridge] tile source`, `poll_fades available`, `WorldStreamer configured ... [simworld-godot <ver> (build ...)]`, the disk cache line and a `first tile` line, with no errors. `slow upload` lines are informational.
+- Headless smoke test: `$G --headless --path . --quit-after 120`. Expect `[StreamerBridge] tile source`, `[StreamerBridge] library api <major>.<minor>` (a `predates api_version` warning means a stale dylib), `poll_fades available`, `WorldStreamer configured ... [simworld-godot <ver> (build ...)]`, the disk cache line and a `first tile` line, with no errors. `slow upload` lines are informational.
 
 ## Keys and menus
 
@@ -28,13 +28,15 @@ Test-bench notes only. Project status, layout, commands, architecture, constrain
 | `--tonemap=filmic\|agx`, `--no-exposure`, `--no-glow`, `--glow-blend=<mode>` | night-look tests |
 | `--shot=<png>[,<frames>]`, `--shot-hud` | save the viewport after N frames (default 90) and quit; HUD hidden unless `--shot-hud` |
 | `--light-alpha=<x>`, `--fake-fade=<x>` | debug: sprite alpha, fixed fade when Rust has no `poll_fades` |
+| `--curvature=<x>` | visual earth curvature: 0 flat, 1 real Earth (default), e.g. 50 to see it clearly |
 | `--cover-selftest` | run the visibility-rule self-test (`CoverSelfTest`) at startup; prints PASS/FAIL |
 
 ## Scripts (`scripts/`, namespace `LowPolyMap`)
 
-Library-grade (move to the addon in P5): `WorldStreamerFacade` (only place with method-name strings), `StreamerBridge` (owns the node, uploads tiles within the 2 ms budget, origin shifts), `TilePool`, `TileCover`, `TileKey`.
+Library-grade (move to the addon in P5): `WorldStreamerFacade` (only place with method-name strings; checks `api_version()` once on attach: major mismatch = facade unavailable, low minor = warning naming the missing features, unknown = method probing as before), `StreamerBridge` (owns the node, uploads tiles within the 2 ms budget, origin shifts), `TilePool`, `TileCover`, `TileKey`.
 Host-only (stay here): `FreeFlyCamera`, `DebugOverlay`, `TimeOfDay` (date, clock, NOAA sun position, night factor, aims the `Sun` light; moon at night; UTC offset = round(longitude / 15) unless set), `DaylightMenu`, `NightRenderController` (glow, fog, tone map, exposure; mixes library look and host policy, see audit A12), `CoverSelfTest`.
-Shaders (`shaders/`): `building_day` (placeholder, no windows yet), `ground`, `light_sprite`, `lod_dither.gdshaderinc`.
+Shaders (`shaders/`): `building_day` (placeholder, no windows yet), `ground`, `light_sprite`, `fallback_ground` (the scene's big plane), `lod_dither.gdshaderinc`, `earth_curve.gdshaderinc`.
+Earth curvature is visual only: every world shader drops vertices by d²/2R from the camera (globals `curve_center`, `curve_inv_2r` in `project.godot`, set each frame by `StreamerBridge`). Rust, physics and AGL stay flat. Any new world mesh shader must include `earth_curve.gdshaderinc`, or it will float above the curved ground at range.
 
 ## Gotchas
 

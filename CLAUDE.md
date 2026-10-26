@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-"SimWorld" (working name; the repo folder is still `lowpolymap`, the Rust crates are `simworld-core` / `simworld-godot` / `simworld-cli`) is a streamed low-poly OSM city for the SimPlane flight game: a Rust GDExtension (`WorldStreamer`) streams PMTiles around a camera and generates everything; a Godot 4.7 (.NET/C#) project displays it. It started as a spike and is being turned into a reusable library with a test bench. The packaging plan is in `docs/spec-library-packaging.md` (phases P0-P7); this repo has finished P0 (baseline) and P1 (core split: Cargo workspace, `World`, `Log`, `Diagnostics`). Current API version in `CHANGELOG.md`: `0.5.0-spike`.
+"SimWorld" (working name; the repo folder is still `lowpolymap`, the Rust crates are `simworld-core` / `simworld-godot` / `simworld-cli`) is a streamed low-poly OSM city for the SimPlane flight game: a Rust GDExtension (`WorldStreamer`) streams PMTiles around a camera and generates everything; a Godot 4.7 (.NET/C#) project displays it. It started as a spike and is being turned into a reusable library with a test bench. The packaging plan is in `docs/spec-library-packaging.md` (phases P0-P7); this repo has finished P0 (baseline) and P1 (core split: Cargo workspace, `World`, `Log`, `Diagnostics`), and P2 (contract: `docs/contract.md`, `api_version`) is in progress. Contract version: `api_version` 0.5 (`docs/contract.md`); crate version 0.5.0 (`CHANGELOG.md`).
 
 Milestones (`docs/spike-streamed-osm-city.md`, "Milestones, acceptance and risks"):
 
@@ -12,7 +12,7 @@ Milestones (`docs/spike-streamed-osm-city.md`, "Milestones, acceptance and risks
 - **M6 Night: partway.** Built: dithered LOD fades (`poll_fades`, `shaders/lod_dither.gdshaderinc`), glow/fog/tone map/eye adaptation (`NightRenderController`), light sprites and lit roads with a `night_factor`, and an interim C# daylight clock (`TimeOfDay`, `DaylightMenu`; NOAA sun math in C#). **Not built:** the window shader with light profiles (`building_windows.gdshader`; `building_day.gdshader` is still the daytime placeholder and there is no `hour` uniform), sprite/window cross-fade, and `set_clock` / `daylight()` in Rust.
 - **M7 Imagery, M8 Measure: not started.** `ground_height_at` returns 0 (no DEM).
 
-The Rust side has a `cargo test` baseline of 66 passed, 0 failed, 3 ignored (2026-10-26; after P1: 65 in `simworld-core` + 1 in `simworld-godot`). `scheduler::tests::GodotSim` mirrors the C# visibility rule.
+The Rust side has a `cargo test` baseline of 68 passed, 0 failed, 3 ignored (P2: 66 in `simworld-core` + 2 in `simworld-godot`; the two P2 tests pin `api_version` and the `#[func]` list to `docs/contract.md`). `scheduler::tests::GodotSim` mirrors the C# visibility rule.
 
 ## Commands
 
@@ -28,6 +28,7 @@ The Rust side has a `cargo test` baseline of 66 passed, 0 failed, 3 ignored (202
 - `docs/spec-library-packaging.md`: how the spike becomes a reusable library (audit, target structure, phases P0-P7, versioning, daylight menu acceptance). Read it before restructuring anything.
 - `docs/spike-streamed-osm-city.md`: the full design (LOD rings, data pipeline, light profiles, imagery, daylight, library API, rendering, iOS constraints, budgets, milestones). Source: https://claude.ai/artifact/1Li6b4rWTHqGtKGDYQZE6E. Read it before making architectural decisions.
 - `docs/spec-night-rendering.md`: night details (LOD fades, bloom, tone map, exposure, depth precision). Source: https://claude.ai/artifact/HpzXEiRh1VS71asBF2ER4d.
+- `docs/contract.md`: **the** `WorldStreamer` contract (methods, call order, ready-tile dictionary, visibility rule and guarantees, fades, encodings, lights, ground, coordinates, planned API with target `api_version`s). The single source; read it before changing either side.
 - `CHANGELOG.md`: API history. Update it with every contract change.
 
 ## Layout (today)
@@ -36,8 +37,8 @@ The Rust side has a `cargo test` baseline of 66 passed, 0 failed, 3 ignored (202
 lowpolymap/                  # repo root (git); the future library repo is called `simworld`
   CLAUDE.md                  # this file
   CHANGELOG.md
-  docs/                      # specs and the design doc
-  .claude/agents/            # rust-world-streamer.md, godot-csharp-integrator.md (hold the contract today)
+  docs/                      # contract.md (the WorldStreamer contract), specs and the design doc
+  .claude/agents/            # rust-world-streamer.md, godot-csharp-integrator.md (point to docs/contract.md)
   low-poly-map/              # Godot project root and test bench (project.godot, scenes/, scripts/, shaders/, textures/)
   rust/                      # Cargo workspace, OUTSIDE the Godot project:
     simworld-core/           #   pure Rust world (no godot), rlib; World, Log, Diagnostics, all modules
@@ -57,13 +58,12 @@ Not built yet; do not create these folders without the matching phase.
 - Done in P1: `rust/` is a Cargo workspace with `simworld-core`, `simworld-godot`, `simworld-cli` (see Layout). Still to come in the core: `daylight` (M6), `config` (P3); real CLI commands (P6).
 - `addons/simworld/` at the repo root: the Godot rendering addon (`plugin.cfg`, multi-platform `.gdextension`, C# runtime `WorldView`/`TilePool`/`TileCover`/`TileKey`/facade, shaders, textures, default JSON world profile). Phase P5.
 - `low-poly-map/` stays as the test bench and demo host: `FreeFlyCamera`, `DebugOverlay`, `TimeOfDay`, `DaylightMenu`, test drivers.
-- `docs/contract.md` becomes the single source of the `WorldStreamer` contract (phase P2); until then it is duplicated in the two agent files.
 - Releases: git tag `vX.Y.Z` plus `simworld-addon-vX.Y.Z.zip` with prebuilt libraries; the SimPlane game vendors the zip and needs no Rust toolchain.
 
 ## Architecture
 
 - **Rust owns the world, Godot only displays it.** The `WorldStreamer` Node does the quadtree cover by 3D slant distance (R0 z16 < 0.6 km, R1 z15 < 2.5 km, R2 z14 < 7 km, R3 z13 < 25 km), PMTiles fetching over HTTPS range requests, disk LRU cache, MVT decoding, meshing, ground meshes and light points on worker threads (tokio for I/O, rayon for meshing, crossbeam channel back). C# drives the camera, uploads finished tiles (at most 2 per frame, at most 2 ms) and renders.
-- **The `WorldStreamer` API is a contract** shared by both sides: `configure`, `update_camera`, `poll_ready`, `poll_unload`, `poll_fades`, `take_origin_shift`, `debug_stats`, `debug_tiles`, `ground_height_at`, plus the ready-tile dictionary shape (incl. the quadtree sibling-swap visibility rule and dithered fades) and the vertex COLOR encodings. It is specified identically in `.claude/agents/rust-world-streamer.md` and `.claude/agents/godot-csharp-integrator.md`; any change must be made in both (and in `CHANGELOG.md`) until P2 moves it to `docs/contract.md`.
+- **The `WorldStreamer` API is a contract** shared by both sides: `api_version`, `configure`, `update_camera`, `poll_ready`, `poll_unload`, `poll_fades`, `take_origin_shift`, `debug_stats`, `debug_tiles`, `ground_height_at`, plus the ready-tile dictionary shape (incl. the quadtree sibling-swap visibility rule and dithered fades) and the vertex COLOR encodings. **The contract is `docs/contract.md`** (single source; the agent files only point to it). Any change updates that file, `api_version` (`API_MAJOR`/`API_MINOR` in `rust/simworld-core/src/lib.rs`) and `CHANGELOG.md` in the same commit. `api_version` = contract `major.minor`, independent of the crate version: a minor bump is additive only, a major bump is breaking. `cargo test` fails if the constants and the `api_version:` line of `docs/contract.md` disagree or a `#[func]` is missing from it.
 - **Floating origin:** f64 ENU inside Rust, f32 relative to origin in Godot; re-center beyond 5 km and shift camera + all tile roots in the same frame.
 - **Coordinates:** Y-up, x = east, z = -north, meters.
 - **Determinism:** same tile gives the same mesh and the same lit windows (seeded by OSM id). Not yet pinned by tests (spec audit A16).

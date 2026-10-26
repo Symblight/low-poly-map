@@ -12,6 +12,7 @@ shader_type spatial;
 render_mode cull_disabled, diffuse_burley, specular_schlick_ggx;
 
 #include "res://shaders/lod_dither.gdshaderinc"
+#include "res://shaders/earth_curve.gdshaderinc"
 
 // Overall subtle darkening so the ground sits below the buildings in brightness.
 uniform float darken : hint_range(0.0, 1.0) = 0.88;
@@ -50,6 +51,9 @@ vec3 palette(int k) {
 void vertex() {
 	// Tile roots are only translated, so world = model + translation (floating origin keeps this precise).
 	vec3 world = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+	float drop = earth_curve_drop(world);
+	VERTEX.y -= drop;
+	world.y -= drop;
 	vec3 to_cam = CAMERA_POSITION_WORLD - world;
 	float d = length(to_cam);
 	float bias = min(d * depth_bias_per_m, depth_bias_max_m);

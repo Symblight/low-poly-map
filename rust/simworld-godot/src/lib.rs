@@ -38,4 +38,23 @@ mod tests {
         assert!(v.contains(env!("CARGO_PKG_VERSION")));
         assert!(v.contains("build "));
     }
+
+    /// Every `#[func]` of `WorldStreamer` is documented in `docs/contract.md` (as `` `name(``).
+    #[test]
+    fn every_func_is_in_contract_doc() {
+        let src = include_str!("streamer.rs");
+        let doc = include_str!("../../../docs/contract.md");
+        let mut lines = src.lines();
+        let mut n = 0;
+        while let Some(l) = lines.next() {
+            if l.trim() != "#[func]" {
+                continue;
+            }
+            let sig = lines.next().expect("fn after #[func]");
+            let name = sig.trim().strip_prefix("fn ").and_then(|r| r.split('(').next()).expect("fn name");
+            assert!(doc.contains(&format!("`{name}(")), "#[func] {name} is missing from docs/contract.md");
+            n += 1;
+        }
+        assert_eq!(n, 10, "WorldStreamer #[func] count changed: update docs/contract.md and this test");
+    }
 }

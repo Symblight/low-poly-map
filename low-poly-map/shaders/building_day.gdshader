@@ -8,6 +8,7 @@ shader_type spatial;
 render_mode cull_back, diffuse_burley, specular_schlick_ggx;
 
 #include "res://shaders/lod_dither.gdshaderinc"
+#include "res://shaders/earth_curve.gdshaderinc"
 
 uniform float roof_darken : hint_range(0.0, 1.0) = 0.62;
 uniform float floor_line_strength : hint_range(0.0, 1.0) = 0.22;
@@ -37,6 +38,7 @@ vec3 srgb_to_linear(vec3 c) {
 void vertex() {
 	// Tile roots are only translated, so model-space normal.y is world normal.y.
 	v_roof = step(0.7, NORMAL.y);
+	VERTEX.y -= earth_curve_drop((MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz);
 	v_depth = -(MODELVIEW_MATRIX * vec4(VERTEX, 1.0)).z;
 }
 

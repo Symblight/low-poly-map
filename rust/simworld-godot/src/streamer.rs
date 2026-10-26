@@ -18,7 +18,7 @@ use godot::prelude::*;
 use simworld_core::geo::TileKey;
 use simworld_core::mesher::MeshData;
 use simworld_core::rings::RING_COUNT;
-use simworld_core::World;
+use simworld_core::{World, API_MAJOR, API_MINOR};
 
 use crate::host::{diagnostics_from_env, GodotLog};
 use crate::version_string;
@@ -160,7 +160,17 @@ impl WorldStreamer {
         d.set("origin_lat", st.origin_lat);
         d.set("origin_lon", st.origin_lon);
         d.set("version", &GString::from(self.world.version()));
+        d.set("api_major", API_MAJOR as i64);
+        d.set("api_minor", API_MINOR as i64);
         d
+    }
+
+    /// Contract version (`docs/contract.md`): `Vector2i(major, minor)`. A minor bump is
+    /// additive; a major bump is breaking. Constant for the lifetime of the library; callable
+    /// before `configure`.
+    #[func]
+    fn api_version(&self) -> Vector2i {
+        Vector2i::new(API_MAJOR as i32, API_MINOR as i32)
     }
 
     /// Terrain height (m) under a point in current local x/z meters: `geo::ground_height` at the

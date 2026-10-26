@@ -55,7 +55,7 @@ flowchart TB
 
 *Rust does the heavy work off the main thread; Godot only uploads meshes.*
 
-- **Interface:** a `WorldStreamer` node registered by Rust, called from C# through `Call()`. `update_camera(lat, lon, alt, vel)` runs each frame; `poll_ready()` returns at most N finished tiles.
+- **Interface:** a `WorldStreamer` node registered by Rust, called from C# through `Call()`. `update_camera(local_pos, velocity, alt_agl)` runs each frame (local floating-origin coordinates; a geodetic variant is planned, see [contract.md](contract.md)); `poll_ready()` returns at most N finished tiles.
 - **Threads:** a tokio runtime for I/O and a rayon pool for meshing. Results go back over a crossbeam channel. Rust never touches Godot nodes off the main thread.
 - **Floating origin:** world position in f64 ENU inside Rust, f32 local to the origin in Godot. Re-center when the camera is more than 5 km from the origin; every tile root gets shifted in one frame.
 - **Output per tile:** `PackedVector3Array` positions and normals, `PackedColorArray` for profile, seed and floors, `PackedInt32Array` indices, and a separate point list for light sprites. With imagery enabled, also the tile's ground texture as a Godot `Image` with mipmaps.
@@ -213,21 +213,18 @@ The library computes daylight, so the spike and the game share one answer for wh
 
 ## Library API
 
-`WorldStreamer` is the whole public surface of the library; the contract is mirrored in `.claude/agents/rust-world-streamer.md` and `.claude/agents/godot-csharp-integrator.md`.
+`WorldStreamer` is the whole public surface of the library. The full contract (methods, call order, ready-tile dictionary, visibility rule, fades, color encodings, lights, coordinates, each with the `api_version` that introduced it) lives in [contract.md](contract.md); this section no longer repeats it. The host reads `api_version()` once on attach and logs a mismatch instead of probing silently.
 
-| Method | Purpose |
-|--------|---------|
-| `configure(origin_lat, origin_lon, tile_url, cache_dir)` | World origin and vector tile source |
-| `configure_imagery(sources: Array[Dictionary])` | Image sources: `url`, `min_zoom`, `max_zoom`, `attribution`; plus `cache_mb`, `timeout_s`. Empty array = imagery off |
-| `update_camera(local_pos, velocity, alt_agl_m)` | Every frame |
-| `poll_ready(max)` / `poll_unload()` | Tile deliveries / removals; ready dictionary gains `ground` and `imagery` |
-| `take_origin_shift()` | Floating origin |
-| `ground_height_at(local_x, local_z)` | Terrain hook (0 for now) |
-| `set_clock(unix_utc, utc_offset_hours)` / `daylight()` | Daylight |
-| `attributions()` | Attribution strings currently required on screen (OSM, plus each active image source) |
-| `debug_stats()` / `debug_tiles()` | Overlay |
+Design intent behind the surface (not contract text):
 
-The library has no knowledge of the spike scene: cameras, UI, materials and the time slider live in the host. Contract changes are additive where possible, and `debug_stats()["version"]` identifies the build.
+- Configuration: world origin and vector tile source (`configure`), later image sources (`configure_imagery`: `url`, `min_zoom`, `max_zoom`, `attribution`, plus `cache_mb`, `timeout_s`; an empty array turns imagery off).
+- Per frame: `update_camera`, then `poll_ready` / `poll_unload` (ready dictionaries gain `ground` and, with imagery, `imagery`), `take_origin_shift` for the floating origin, `ground_height_at` as the terrain hook (0 until a DEM spike).
+- Daylight: `set_clock` / `daylight()` as described above. `attributions()` returns the strings currently required on screen (OSM, plus each active image source).
+- Overlay: `debug_stats()` / `debug_tiles()`.
+
+Note: the imagery, clock and daylight entries above are planned API (milestones M7+); check contract.md for what exists today.
+
+The library has no knowledge of the spike scene: cameras, UI, materials and the time slider live in the host. Contract changes are additive where possible, `api_version` is the contract version, and `debug_stats()["version"]` is a display string that identifies the build.
 
 ## Rendering
 

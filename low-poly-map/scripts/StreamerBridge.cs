@@ -24,6 +24,10 @@ public partial class StreamerBridge : Node3D
     [Export] public FreeFlyCamera? Camera { get; set; }
     /// <summary>0 = day, 1 = night: lights and lit-road emission. Plain value until M6's TimeOfDay owns it as a global.</summary>
     [Export(PropertyHint.Range, "0,1,0.01")] public float NightFactor { get; set; } = 1f;
+    /// <summary>Visual earth curvature (shaders/earth_curve.gdshaderinc): 0 = flat, 1 = real Earth, larger exaggerates. User arg --curvature=&lt;x&gt;.</summary>
+    [Export(PropertyHint.Range, "0,100,0.1")] public float Curvature { get; set; } = 1f;
+
+    private const double EarthRadiusM = 6_371_000.0;
 
     public WorldStreamerFacade Streamer { get; private set; } = new();
     /// <summary>Human readable tile source actually in use.</summary>
@@ -87,6 +91,14 @@ public partial class StreamerBridge : Node3D
 
     public override void _Ready()
     {
+        foreach (var arg in OS.GetCmdlineUserArgs())
+            if (arg.StartsWith("--curvature=", System.StringComparison.Ordinal)
+                && float.TryParse(arg.Substring(12), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var cv))
+                Curvature = Mathf.Max(cv, 0f);
+        // Curved vertices sink below the flat tile AABBs: widen the cull box by the drop at the camera's far plane.
+        float far = Camera?.Far ?? 30000f;
+        TilePool.CurveCullMargin = (float)(far * (double)far * Curvature / (2.0 * EarthRadiusM));
+
         _tileRoot = new Node3D { Name = "Tiles" };
         AddChild(_tileRoot);
         _pool = new TilePool(_tileRoot);
@@ -103,6 +115,7 @@ public partial class StreamerBridge : Node3D
         GD.Print($"[StreamerBridge] tile source: {TileSource}");
 
         Streamer = WorldStreamerFacade.Create();
+        if (Streamer.IsAvailable) GD.Print($"[StreamerBridge] library api {Streamer.ApiVersionText}");
         foreach (var arg in OS.GetCmdlineUserArgs())
             if (arg.StartsWith("--fake-fade=", System.StringComparison.Ordinal)
                 && float.TryParse(arg.Substring(12), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var ff))
@@ -153,6 +166,8 @@ public partial class StreamerBridge : Node3D
                 Camera.GlobalPosition -= shift;
                 Cover.Shift(shift);
             }
+            RenderingServer.GlobalShaderParameterSet("curve_center", Camera.GlobalPosition);
+            RenderingServer.GlobalShaderParameterSet("curve_inv_2r", (float)(Curvature / (2.0 * EarthRadiusM)));
 
             // Poll one tile at a time so a single heavy tile cannot drag a second one into the same
             // frame: stop as soon as the budget is spent (Rust keeps the rest queued).

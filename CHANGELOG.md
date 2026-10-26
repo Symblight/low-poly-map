@@ -1,10 +1,17 @@
 # Changelog
 
-All notable changes to the SimWorld library (Rust `WorldStreamer` GDExtension plus the Godot-side runtime) and its `WorldStreamer` contract. Versions follow semver; once `api_version` exists (planned for P2 in `docs/spec-library-packaging.md`) it is the contract major.minor and is listed per release.
+All notable changes to the SimWorld library (Rust `WorldStreamer` GDExtension plus the Godot-side runtime) and its `WorldStreamer` contract. Versions follow semver. `api_version` (from P2) is the contract major.minor, independent of the crate version, and is listed per release; the contract itself is `docs/contract.md`.
 
-Format: one section per release, newest first. Every contract change (a method, a dictionary key, an encoding, a guarantee) must be listed here and in the two agent files until `docs/contract.md` exists.
+Format: one section per release, newest first. Every contract change (a method, a dictionary key, an encoding, a guarantee) must be listed here, in `docs/contract.md` and in `api_version` (`API_MAJOR`/`API_MINOR`), in the same commit.
 
 ## Unreleased
+
+P2 "Contract" (`docs/spec-library-packaging.md`). **api_version 0.5** (introduced; additive only, nothing existing changed).
+
+- `docs/contract.md` is the single statement of the `WorldStreamer` contract: methods and call order, ready-tile dictionary, visibility rule and guarantees, fades and dither rule, vertex/ground COLOR and UV encodings, lights, ground, coordinates, data source, determinism, and the planned API with target versions (0.6 configuration, 0.7 host API and lifecycle, 0.8 daylight, 0.9 imagery). It records behaviour the old copies left out (no-fade exceptions, `update_camera` ignoring `local_pos.y`, horizontal re-center distance, tile-local roof UVs, profile id 5 never emitted). The copies in `.claude/agents/*.md` are replaced by a pointer to it.
+- New `#[func] api_version() -> Vector2i(major, minor)` on `WorldStreamer` (currently `(0, 5)`); callable before `configure`.
+- `debug_stats()` gains `api_major` and `api_minor` (int), same values.
+- `simworld_core::API_MAJOR` / `API_MINOR` constants. Two new tests pin them to the `api_version:` line of `docs/contract.md` and check that every `#[func]` is documented there (`cargo test`: 68 passed).
 
 P1 "Core split" (`docs/spec-library-packaging.md`). No contract change: the 9 `#[func]` methods, their signatures and every dictionary key are unchanged.
 
@@ -39,7 +46,7 @@ Encodings:
 - Building vertex COLOR: `r` = profile id / 8 (0 residential, 1 office, 2 retail, 3 industrial, 4 civic, 5 unknown), `g` = seed 0..1, `b` = floor height / 10 m, `a` = building height / 400 m. UV = meters (u along wall, v up).
 - Ground COLOR: `r` = class / 16 (0 grass/park, 1 forest, 2 water, 3 residential, 4 commercial, 5 industrial, 6 other landuse, 8 road), `g` = lit road flag, `b` = road class / 8 (0 for areas), `a` = 1.
 
-Guarantees: refining requests all 4 children as one sibling group; every requested tile is delivered; a parent is unloaded only after its 4 children were delivered and the swap fade finished; when coarsening, the parent is delivered again before its children are unloaded. Visibility rule (evaluated by the host): see `.claude/agents/godot-csharp-integrator.md`.
+Guarantees: refining requests all 4 children as one sibling group; every requested tile is delivered; a parent is unloaded only after its 4 children were delivered and the swap fade finished; when coarsening, the parent is delivered again before its children are unloaded. Visibility rule (evaluated by the host): see `docs/contract.md` section 5 (until P2 it lived in `.claude/agents/godot-csharp-integrator.md`).
 
 ### Rings and data
 

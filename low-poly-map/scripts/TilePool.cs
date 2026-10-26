@@ -75,6 +75,8 @@ public sealed class TilePool
 
     /// <summary>Debug (user arg --light-alpha=&lt;v&gt;): force every light's weight, ignoring Rust's alpha. Negative = off.</summary>
     public static float DebugLightAlpha { get; set; } = -1f;
+    /// <summary>Extra cull margin (m) for the earth-curvature drop of building and ground meshes; set before the pool is created.</summary>
+    public static float CurveCullMargin { get; set; }
 
     public int TotalCreated { get; private set; }
     public int FreeCount => _free.Count;
@@ -183,7 +185,7 @@ public sealed class TilePool
             CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
             Visible = false,
             // The billboard is expanded in the vertex shader; keep distant sprites out of any frustum-edge pop.
-            ExtraCullMargin = 200f,
+            ExtraCullMargin = 200f + CurveCullMargin,
         };
         var am = new ArrayMesh();
         var mi = new MeshInstance3D
@@ -191,6 +193,7 @@ public sealed class TilePool
             Name = "Mesh",
             Mesh = am,
             MaterialOverride = _buildingMaterial,
+            ExtraCullMargin = CurveCullMargin,
             Visible = false,
         };
         var gm = new ArrayMesh();
@@ -201,6 +204,7 @@ public sealed class TilePool
             MaterialOverride = _groundMaterial,
             // Flat ground never needs to cast shadows (and every shadow caster costs an extra draw call).
             CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
+            ExtraCullMargin = CurveCullMargin,
             Visible = false,
         };
         var root = new Node3D { Name = "Tile", Visible = false };

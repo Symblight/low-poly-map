@@ -32,3 +32,14 @@ project/assembly_name="LowPolyMap"
 
 rendering_device/driver.windows="d3d12"
 renderer/rendering_method="mobile"
+
+[shader_globals]
+
+curve_center={
+"type": "vec3",
+"value": Vector3(0, 0, 0)
+}
+curve_inv_2r={
+"type": "float",
+"value": 0.0
+}

@@ -178,7 +178,20 @@ public partial class DebugOverlay : Control
         _head.AddThemeColorOverride("font_color", overDraws || overPrims ? new Color(1f, 0.3f, 0.25f) : Colors.White);
         sb.Clear();
 
-        if (Bridge != null) sb.Append("source: ").Append(Bridge.TileSource).Append('\n');
+        if (Bridge != null)
+        {
+            sb.Append("source: ").Append(Bridge.TileSource);
+            if (Bridge.BandsText.Length > 0) sb.Append("  ").Append(Bridge.BandsText);
+            sb.Append('\n');
+            if (Bridge.ConfigureError.Length > 0)
+                sb.Append("WORLD NOT CONFIGURED: ").Append(Bridge.ConfigureError).Append('\n');
+            else if (!Bridge.Status.IsOk)
+            {
+                var st = Bridge.Status;
+                sb.Append("STATUS ").Append(st.State.ToUpperInvariant()).Append(": ").Append(st.Message)
+                  .Append("  (failed fetches ").Append(st.FailedFetches).Append(st.LastError.Length > 0 ? ", last: " + st.LastError : "").Append(")\n");
+            }
+        }
 
         if (streamer == null || !streamer.IsAvailable)
         {
@@ -254,6 +267,8 @@ public partial class DebugOverlay : Control
             else sb.Append("debug_tiles: not exported by this Rust build\n");
         }
         sb.Append("[F2] daylight  [F3] overlay  [F] autopilot  [PgUp/PgDn] alt x2 / x0.5  [H] hidden tiles: ").Append(_showHidden ? "outlined" : "off").Append("  [M] map zoom (").Append(ZoomSpansM[_zoom] / 1000f).Append(" km)");
+        if (Bridge != null && Bridge.Attributions.Length > 0)
+            sb.Append('\n').Append(string.Join(" | ", Bridge.Attributions));
     }
 
     private static void AppendRings(StringBuilder sb, string name, int[] v)

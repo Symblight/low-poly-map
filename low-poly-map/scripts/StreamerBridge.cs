@@ -64,6 +64,34 @@ public partial class StreamerBridge : Node3D
     /// <summary>Terrain height under the camera in meters (Rust ground_height_at; 0 until a DEM exists).</summary>
     public double CameraGroundHeight { get; private set; }
 
+    /// <summary>Latest data-source status (contract 3.5): from status() after configure and from the status_changed signal.</summary>
+    public StreamerStatus Status { get; private set; } = new();
+    /// <summary>Non-empty when the world could not be configured (e.g. "cache_dir in use"); the spike then runs without a world.</summary>
+    public string ConfigureError { get; private set; } = "";
+    /// <summary>True when a configure call succeeded and the world is streaming.</summary>
+    public bool WorldRunning { get; private set; }
+    /// <summary>Attribution strings to show while map data is visible (empty for the synthetic city).</summary>
+    public string[] Attributions { get; private set; } = System.Array.Empty<string>();
+    /// <summary>Effective band edges for the overlay, e.g. "bands 0.6/2.5/7/25 km" (empty until the profile is readable, api 0.6+).</summary>
+    public string BandsText { get; private set; } = "";
+    /// <summary>The resolved profile overrides passed to configure_world (empty = none), for logs and tests.</summary>
+    public Godot.Collections.Dictionary ProfileOverrides { get; private set; } = new();
+
+    /// <summary>Re-centers seen through take_origin_shift() (the authoritative path) and the latest / summed shift.</summary>
+    public int OriginShiftCount { get; private set; }
+    public Vector3 LastShift { get; private set; }
+    public Vector3 TotalShift { get; private set; }
+    /// <summary>Re-centers seen through the origin_shifted signal (diagnostic; must equal <see cref="OriginShiftCount"/>) and its latest vector.</summary>
+    public int SignalShiftCount { get; private set; }
+    public Vector3 LastSignalShift { get; private set; }
+    /// <summary>
+    /// Host hook: when set, replaces the update_camera(...) call in each frame (same place in the call order, before
+    /// take_origin_shift). The hook may move <see cref="Camera"/> (in the pre-shift frame; the bridge subtracts the shift
+    /// afterwards) and must call one camera update on the Streamer (e.g. UpdateCameraGeodetic).
+    /// </summary>
+    public System.Action<double>? ExternalCameraUpdate { get; set; }
+
+    private string _lastLoggedStatus = "";
     private TilePool? _pool;
     private Node3D? _tileRoot;
 
@@ -126,11 +154,192 @@ public partial class StreamerBridge : Node3D
         {
             node.Name = "WorldStreamer";
             AddChild(node);
+            Streamer.StatusChanged += OnStatusChanged;
+            Streamer.OriginShifted += OnOriginShifted;
             var cacheDir = ProjectSettings.GlobalizePath("user://tile_cache");
             DirAccess.MakeDirRecursiveAbsolute(cacheDir);
-            Streamer.Configure(OriginLat, OriginLon, url, cacheDir);
+            ConfigureWorld(url, cacheDir);
             GD.Print($"[StreamerBridge] WorldStreamer created, cache_dir={cacheDir}, debug_tiles={Streamer.HasDebugTiles}");
         }
+    }
+
+    public override void _ExitTree()
+    {
+        // Deterministic stop before the node is freed: waits (bounded 1 s) for cache I/O and releases the cache_dir lock.
+        if (Streamer.IsAvailable)
+        {
+            Streamer.StatusChanged -= OnStatusChanged;
+            Streamer.OriginShifted -= OnOriginShifted;
+            if (Streamer.HasHostApi) GD.Print("[StreamerBridge] shutdown (releasing the cache lock)");
+            Streamer.Shutdown();
+        }
+    }
+
+    private void OnStatusChanged(StreamerStatus st)
+    {
+        Status = st;
+        var line = $"status: {st.State} - {st.Message}";
+        if (line == _lastLoggedStatus) return;
+        _lastLoggedStatus = line;
+        GD.Print($"[StreamerBridge] {line}");
+    }
+
+    // Diagnostic only: the bridge shifts from take_origin_shift() (same-frame ordering); never consume the shift here.
+    private void OnOriginShifted(Vector3 shift)
+    {
+        SignalShiftCount++;
+        LastSignalShift = shift;
+    }
+
+    // ---- configuration ---------------------------------------------------
+
+    private const string ProfileArg = "--profile=";
+    private const string SetArg = "--set=";
+    private const string AreaArg = "--area=";
+    private static readonly string[] BandEdgeKeys = { "r0_edge_m", "r1_edge_m", "r2_edge_m", "r3_edge_m" };
+    private static readonly double[] BandEdgeDefaults = { 600.0, 2500.0, 7000.0, 25000.0 };
+
+    private static bool TryNumber(string text, out double v) =>
+        double.TryParse(text, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out v);
+
+    /// <summary>
+    /// Builds the profile options from the user args: --profile=&lt;path&gt;, --area=&lt;0.05..1&gt; (scales the four band edges, applied
+    /// first) and repeated --set=&lt;dotted.key&gt;=&lt;number&gt; (applied last, wins). Returns the nested overrides (may be empty).
+    /// </summary>
+    private Godot.Collections.Dictionary ParseProfileArgs(out string profilePath)
+    {
+        profilePath = "";
+        double area = 0;
+        var sets = new List<(string Key, Variant Value)>();
+        foreach (var arg in OS.GetCmdlineUserArgs())
+        {
+            if (arg.StartsWith(ProfileArg, System.StringComparison.Ordinal))
+            {
+                var path = arg.Substring(ProfileArg.Length).Trim();
+                if (path.Length == 0) continue;
+                // Rust reads the file itself: hand over an OS path (res:// and user:// resolve through Godot).
+                profilePath = path.Contains("://") ? ProjectSettings.GlobalizePath(path) : System.IO.Path.GetFullPath(path);
+            }
+            else if (arg.StartsWith(AreaArg, System.StringComparison.Ordinal))
+            {
+                if (!TryNumber(arg.Substring(AreaArg.Length), out var a)) { GD.PushWarning($"[StreamerBridge] bad {arg}; expected --area=<0.05..1>"); continue; }
+                area = System.Math.Clamp(a, 0.05, 1.0);
+                if (area != a) GD.Print($"[StreamerBridge] --area={a} clamped to {area}");
+            }
+            else if (arg.StartsWith(SetArg, System.StringComparison.Ordinal))
+            {
+                var kv = arg.Substring(SetArg.Length);
+                int eq = kv.IndexOf('=');
+                if (eq <= 0 || eq == kv.Length - 1) { GD.PushWarning($"[StreamerBridge] bad {arg}; expected --set=<dotted.key>=<number>"); continue; }
+                var key = kv.Substring(0, eq).Trim();
+                var text = kv.Substring(eq + 1).Trim();
+                // Numbers always go as float (like Godot's JSON parser): Rust accepts integral floats for integer keys.
+                if (TryNumber(text, out var num)) sets.Add((key, num));
+                else if (text == "true" || text == "false") sets.Add((key, text == "true"));
+                else sets.Add((key, text));
+            }
+        }
+
+        var overrides = new Godot.Collections.Dictionary();
+        if (area > 0)
+        {
+            Godot.Collections.Dictionary bands = new();
+            var profile = Streamer.WorldProfile();
+            Godot.Collections.Dictionary? pb = profile.TryGetValue("bands", out var bv) && bv.VariantType == Variant.Type.Dictionary ? bv.AsGodotDictionary() : null;
+            for (int i = 0; i < BandEdgeKeys.Length; i++)
+            {
+                double def = pb != null && pb.TryGetValue(BandEdgeKeys[i], out var e) ? e.AsDouble() : BandEdgeDefaults[i];
+                bands[BandEdgeKeys[i]] = def * area;
+            }
+            overrides["bands"] = bands;
+        }
+        foreach (var (key, value) in sets) SetDotted(overrides, key, value);
+        return overrides;
+    }
+
+    private static void SetDotted(Godot.Collections.Dictionary root, string dotted, Variant value)
+    {
+        var parts = dotted.Split('.');
+        var d = root;
+        for (int i = 0; i < parts.Length - 1; i++)
+        {
+            if (!(d.TryGetValue(parts[i], out var sub) && sub.VariantType == Variant.Type.Dictionary))
+            {
+                var nd = new Godot.Collections.Dictionary();
+                d[parts[i]] = nd;
+                d = nd;
+            }
+            else d = sub.AsGodotDictionary();
+        }
+        d[parts[^1]] = value;
+    }
+
+    /// <summary>
+    /// configure_world (api 0.6+, with the profile args) or the legacy configure. On a profile error the world is retried with the
+    /// default profile; any other failure (e.g. cache_dir in use) leaves the spike running without a world.
+    /// </summary>
+    private void ConfigureWorld(string url, string cacheDir)
+    {
+        var overrides = ParseProfileArgs(out var profilePath);
+        ProfileOverrides = overrides;
+        bool haveProfileArgs = profilePath.Length > 0 || overrides.Count > 0;
+        if (profilePath.Length > 0) GD.Print($"[StreamerBridge] profile file: {profilePath}");
+        if (overrides.Count > 0) GD.Print($"[StreamerBridge] profile overrides: {Godot.Json.Stringify(overrides)}");
+
+        if (!Streamer.HasConfigureWorld)
+        {
+            if (haveProfileArgs) GD.PushWarning($"[StreamerBridge] profile args ignored: library api {Streamer.ApiVersionText} has no configure_world (needs 0.6)");
+            Streamer.Configure(OriginLat, OriginLon, url, cacheDir);
+            WorldRunning = true; // legacy configure reports errors only in the Godot log
+            AfterConfigure();
+            return;
+        }
+
+        var options = WorldStreamerFacade.MakeWorldOptions(OriginLat, OriginLon, url, cacheDir);
+        if (profilePath.Length > 0) options["profile_path"] = profilePath;
+        if (overrides.Count > 0) options["profile_overrides"] = overrides;
+        var result = Streamer.ConfigureWorld(options);
+        if (!result.Ok && haveProfileArgs && result.Error.StartsWith("profile", System.StringComparison.Ordinal))
+        {
+            GD.PushError($"[StreamerBridge] profile rejected by the library: {result.Error}");
+            GD.Print("[StreamerBridge] retrying with the default world profile");
+            ProfileOverrides = new Godot.Collections.Dictionary();
+            options.Remove("profile_path");
+            options.Remove("profile_overrides");
+            result = Streamer.ConfigureWorld(options);
+        }
+        if (!result.Ok)
+        {
+            ConfigureError = result.Error.Length > 0 ? result.Error : "configure_world failed";
+            GD.PushError($"[StreamerBridge] configure_world failed: {ConfigureError}. Running without a world (no tiles will load).");
+            return;
+        }
+        WorldRunning = true;
+        Attributions = result.Attributions;
+        AfterConfigure();
+    }
+
+    private void AfterConfigure()
+    {
+        Status = Streamer.Status();
+        if (Attributions.Length == 0) Attributions = Streamer.Attributions();
+        if (Attributions.Length > 0) GD.Print($"[StreamerBridge] attribution: {string.Join(" | ", Attributions)}");
+        else if (Streamer.HasHostApi) GD.Print("[StreamerBridge] attribution: none required (synthetic city)");
+
+        var profile = Streamer.WorldProfile();
+        if (profile.TryGetValue("bands", out var bv) && bv.VariantType == Variant.Type.Dictionary)
+        {
+            var b = bv.AsGodotDictionary();
+            var sb = new StringBuilder("bands ");
+            for (int i = 0; i < BandEdgeKeys.Length; i++)
+            {
+                if (!b.TryGetValue(BandEdgeKeys[i], out var e)) { sb.Clear(); break; }
+                if (i > 0) sb.Append('/');
+                sb.Append((e.AsDouble() / 1000.0).ToString("0.##", System.Globalization.CultureInfo.InvariantCulture));
+            }
+            if (sb.Length > 0) BandsText = sb.Append(" km").ToString();
+        }
+        if (BandsText.Length > 0) GD.Print($"[StreamerBridge] effective {BandsText}");
     }
 
     private string ResolveTileUrl()
@@ -157,12 +366,16 @@ public partial class StreamerBridge : Node3D
             // Height above ground = camera y - terrain height under it (0 until the DEM spike).
             CameraGroundHeight = Streamer.GroundHeightAt(Camera.GlobalPosition.X, Camera.GlobalPosition.Z);
             Camera.GroundY = (float)CameraGroundHeight;
-            Streamer.UpdateCamera(Camera.GlobalPosition, Camera.Velocity, Camera.AltitudeAgl);
+            if (ExternalCameraUpdate != null) ExternalCameraUpdate(delta);
+            else Streamer.UpdateCamera(Camera.GlobalPosition, Camera.Velocity, Camera.AltitudeAgl);
 
             // Shift first so tiles polled below (already in the new frame) are not shifted twice.
             var shift = Streamer.TakeOriginShift();
+            LastShift = shift;
             if (shift != Vector3.Zero)
             {
+                OriginShiftCount++;
+                TotalShift += shift;
                 Camera.GlobalPosition -= shift;
                 Cover.Shift(shift);
             }

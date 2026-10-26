@@ -1,4 +1,4 @@
-[gd_scene load_steps=13 format=3]
+[gd_scene load_steps=14 format=3]
 
 [ext_resource type="Script" path="res://scripts/StreamerBridge.cs" id="1_bridge"]
 [ext_resource type="Script" path="res://scripts/FreeFlyCamera.cs" id="2_cam"]
@@ -7,6 +7,7 @@
 [ext_resource type="Script" path="res://scripts/TimeOfDay.cs" id="5_tod"]
 [ext_resource type="Script" path="res://scripts/DaylightMenu.cs" id="6_daymenu"]
 [ext_resource type="Shader" path="res://shaders/fallback_ground.gdshader" id="7_fallback"]
+[ext_resource type="Script" path="res://scripts/GeodeticFlightTest.cs" id="8_geotest"]
 
 [sub_resource type="PlaneMesh" id="PlaneMesh_ground"]
 size = Vector2(80000, 80000)
@@ -68,6 +69,11 @@ Speed = 40.0
 [node name="StreamerBridge" type="Node3D" parent="." node_paths=PackedStringArray("Camera")]
 script = ExtResource("1_bridge")
 TileUrl = "http://127.0.0.1:8787/vilnius.pmtiles"
+Camera = NodePath("../FreeFlyCamera")
+
+[node name="GeodeticFlightTest" type="Node" parent="." node_paths=PackedStringArray("Bridge", "Camera")]
+script = ExtResource("8_geotest")
+Bridge = NodePath("../StreamerBridge")
 Camera = NodePath("../FreeFlyCamera")
 
 [node name="TimeOfDay" type="Node" parent="." node_paths=PackedStringArray("Bridge", "Sun")]

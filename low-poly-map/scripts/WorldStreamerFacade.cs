@@ -39,6 +39,38 @@ public struct ReadyTile
     public Godot.Collections.Array? Ground;
 }
 
+/// <summary>Data-source health from status() / the status_changed signal (contract 3.5). Unknown states count as degraded.</summary>
+public sealed class StreamerStatus
+{
+    public string State = "ok";
+    public string Message = "";
+    public int FailedFetches;
+    public string LastError = "";
+
+    public bool IsOk => State == "ok";
+
+    public static StreamerStatus From(Dictionary d)
+    {
+        var st = new StreamerStatus();
+        if (d.TryGetValue(WorldStreamerFacade.KState, out var s)) st.State = s.AsString();
+        if (d.TryGetValue(WorldStreamerFacade.KMessage, out var m)) st.Message = m.AsString();
+        if (d.TryGetValue(WorldStreamerFacade.KFailedFetches, out var f)) st.FailedFetches = (int)f.AsInt64();
+        if (d.TryGetValue(WorldStreamerFacade.KLastError, out var e)) st.LastError = e.AsString();
+        return st;
+    }
+
+    public override string ToString() => Message.Length > 0 ? $"{State} - {Message}" : State;
+}
+
+/// <summary>Result of configure_world() (contract 3.1). <see cref="Supported"/> is false when the library predates 0.6.</summary>
+public sealed class ConfigureResult
+{
+    public bool Supported = true;
+    public bool Ok;
+    public string Error = "";
+    public string[] Attributions = System.Array.Empty<string>();
+}
+
 /// <summary>Typed, reusable result of debug_stats(). Per-ring arrays have length <see cref="Rings"/>.</summary>
 public sealed class StreamerStats
 {
@@ -67,6 +99,8 @@ public sealed class WorldStreamerFacade
     public const int ExpectedApiMajor = 0;
     /// <summary>Lowest contract minor the facade fully supports. Below it, the features in <see cref="FeatureMinors"/> may be missing.</summary>
     public const int MinApiMinor = 5;
+    /// <summary>Highest contract minor this facade knows (0.6 configure_world / world_profile, 0.7 host API). A library above it gets one info line.</summary>
+    public const int LatestKnownMinor = 7;
 
     /// <summary>Facade features that need a minor above the baseline, with the api minor that introduces each (docs/contract.md).</summary>
     private static readonly (string Feature, string Method, int Minor)[] FeatureMinors =
@@ -87,6 +121,29 @@ public sealed class WorldStreamerFacade
     private static readonly StringName MDebugTiles = new("debug_tiles");
     private static readonly StringName MGroundHeightAt = new("ground_height_at");
 
+    private static readonly StringName MConfigureWorld = new("configure_world");
+    private static readonly StringName MWorldProfile = new("world_profile");
+    private static readonly StringName MUpdateCameraGeodetic = new("update_camera_geodetic");
+    private static readonly StringName MGeodeticToLocal = new("geodetic_to_local");
+    private static readonly StringName MLocalToGeodetic = new("local_to_geodetic");
+    private static readonly StringName MAttributions = new("attributions");
+    private static readonly StringName MStatus = new("status");
+    private static readonly StringName MShutdown = new("shutdown");
+    private static readonly StringName SigOriginShifted = new("origin_shifted");
+    private static readonly StringName SigStatusChanged = new("status_changed");
+
+    private static readonly StringName KOk = new("ok");
+    private static readonly StringName KError = new("error");
+    private static readonly StringName KAttributions = new("attributions");
+    private static readonly StringName KOptOriginLat = new("origin_lat");
+    private static readonly StringName KOptOriginLon = new("origin_lon");
+    private static readonly StringName KOptTileUrl = new("tile_url");
+    private static readonly StringName KOptCacheDir = new("cache_dir");
+    internal static readonly StringName KState = new("state");
+    internal static readonly StringName KMessage = new("message");
+    internal static readonly StringName KFailedFetches = new("failed_fetches");
+    internal static readonly StringName KLastError = new("last_error");
+
     private static readonly StringName KKey = new("key");
     private static readonly StringName KOrigin = new("origin");
     private static readonly StringName KMesh = new("mesh");
@@ -94,7 +151,6 @@ public sealed class WorldStreamerFacade
     private static readonly StringName KLights = new("lights");
     private static readonly StringName KLightColors = new("light_colors");
     private static readonly StringName KRing = new("ring");
-    private static readonly StringName KState = new("state");
     private static readonly StringName KMin = new("min");
     private static readonly StringName KMax = new("max");
     private static readonly StringName KQueued = new("queued");
@@ -135,6 +191,42 @@ public sealed class WorldStreamerFacade
     /// <summary>Known version that satisfies <see cref="MinApiMinor"/>: the facade features are guaranteed, no probing.</summary>
     private bool VersionGuaranteesFeatures => ApiVersionKnown && ApiMajor == ExpectedApiMajor && ApiMinor >= MinApiMinor;
 
+    /// <summary>Known library version at least 0.<paramref name="minor"/> (never true while the version is unknown or the major differs).</summary>
+    private bool AtLeast(int minor) => ApiVersionKnown && ApiMajor == ExpectedApiMajor && ApiMinor >= minor;
+
+    /// <summary>configure_world(), world_profile() available (api 0.6+).</summary>
+    public bool HasConfigureWorld => IsAvailable && AtLeast(6);
+    /// <summary>Geodetic input and conversions, signals, attributions, status, shutdown available (api 0.7+).</summary>
+    public bool HasHostApi => IsAvailable && AtLeast(7);
+
+    /// <summary>The library's origin_shifted signal (api 0.7+), raised during UpdateCamera/UpdateCameraGeodetic. It does not consume TakeOriginShift().</summary>
+    public event System.Action<Vector3>? OriginShifted;
+    /// <summary>The library's status_changed signal (api 0.7+), raised when the state or message of status() changes.</summary>
+    public event System.Action<StreamerStatus>? StatusChanged;
+
+    private Callable _originShiftedCallable;
+    private Callable _statusChangedCallable;
+    private bool _signalsConnected;
+
+    private void ConnectSignals()
+    {
+        if (_signalsConnected || !HasHostApi) return;
+        _originShiftedCallable = Callable.From<Vector3>(v => OriginShifted?.Invoke(v));
+        _statusChangedCallable = Callable.From<Dictionary>(d => StatusChanged?.Invoke(StreamerStatus.From(d)));
+        _node!.Connect(SigOriginShifted, _originShiftedCallable);
+        _node.Connect(SigStatusChanged, _statusChangedCallable);
+        _signalsConnected = true;
+    }
+
+    private void DisconnectSignals()
+    {
+        if (!_signalsConnected) return;
+        _signalsConnected = false;
+        if (!IsAvailable) return;
+        if (_node!.IsConnected(SigOriginShifted, _originShiftedCallable)) _node.Disconnect(SigOriginShifted, _originShiftedCallable);
+        if (_node.IsConnected(SigStatusChanged, _statusChangedCallable)) _node.Disconnect(SigStatusChanged, _statusChangedCallable);
+    }
+
     public static bool ClassExists() => ClassDB.ClassExists(ClassNameSn);
 
     /// <summary>Instantiate the Rust class. Returns null (and logs) if it is not registered.</summary>
@@ -162,7 +254,11 @@ public sealed class WorldStreamerFacade
             GD.PushError("[WorldStreamerFacade] " + facade.Error);
             obj?.Free();
         }
-        if (facade._node != null) facade.CheckApiVersion();
+        if (facade._node != null)
+        {
+            facade.CheckApiVersion();
+            if (facade._node != null) facade.ConnectSignals();
+        }
         return facade;
     }
 
@@ -225,9 +321,9 @@ public sealed class WorldStreamerFacade
             GD.PushWarning($"[WorldStreamerFacade] Rust library api {ApiMajor}.{ApiMinor} is older than the required {ExpectedApiMajor}.{MinApiMinor}. Missing facade features:{missing}\n"
                 + "These stay off (probed by method name). Rebuild ../rust.");
         }
-        else if (ApiMinor > MinApiMinor)
+        if (ApiMinor > LatestKnownMinor)
         {
-            GD.Print($"[WorldStreamerFacade] Rust library api {ApiMajor}.{ApiMinor} is newer than the facade's {ExpectedApiMajor}.{MinApiMinor}; additive changes only, fine.");
+            GD.Print($"[WorldStreamerFacade] Rust library api {ApiMajor}.{ApiMinor} is newer than the facade's {ExpectedApiMajor}.{LatestKnownMinor}; additive changes only, fine.");
         }
     }
 
@@ -237,6 +333,99 @@ public sealed class WorldStreamerFacade
     {
         if (!IsAvailable) return;
         _node!.Call(MConfigure, originLat, originLon, tileUrl, cacheDir);
+    }
+
+    /// <summary>
+    /// configure_world(options) (api 0.6+): origin_lat, origin_lon, tile_url, cache_dir, profile_path, profile_overrides, diagnostics.
+    /// Validates first; on an error nothing changes and <see cref="ConfigureResult.Error"/> says why. On older libraries
+    /// returns Supported=false, Ok=false without calling anything (use <see cref="Configure"/>).
+    /// </summary>
+    public ConfigureResult ConfigureWorld(Dictionary options)
+    {
+        var r = new ConfigureResult();
+        if (!IsAvailable) { r.Supported = false; r.Error = "WorldStreamer unavailable"; return r; }
+        if (!HasConfigureWorld) { r.Supported = false; r.Error = $"configure_world needs api 0.6 (library {ApiVersionText})"; return r; }
+        var v = _node!.Call(MConfigureWorld, options);
+        if (v.VariantType != Variant.Type.Dictionary) { r.Error = "configure_world returned no result dictionary"; return r; }
+        var d = v.AsGodotDictionary();
+        r.Ok = d.TryGetValue(KOk, out var ok) && ok.AsBool();
+        if (d.TryGetValue(KError, out var e)) r.Error = e.AsString();
+        if (d.TryGetValue(KAttributions, out var a) && a.VariantType == Variant.Type.PackedStringArray) r.Attributions = a.AsStringArray();
+        return r;
+    }
+
+    /// <summary>Builds the standard configure_world option keys (origin, tile source, cache folder).</summary>
+    public static Dictionary MakeWorldOptions(double originLat, double originLon, string tileUrl, string cacheDir)
+        => new()
+        {
+            [KOptOriginLat] = originLat,
+            [KOptOriginLon] = originLon,
+            [KOptTileUrl] = tileUrl,
+            [KOptCacheDir] = cacheDir,
+        };
+
+    /// <summary>world_profile() (api 0.6+): the resolved world profile (defaults before a configure with a profile). Empty when unavailable.</summary>
+    public Dictionary WorldProfile()
+    {
+        if (!HasConfigureWorld) return new Dictionary();
+        var v = _node!.Call(MWorldProfile);
+        return v.VariantType == Variant.Type.Dictionary ? v.AsGodotDictionary() : new Dictionary();
+    }
+
+    /// <summary>
+    /// update_camera_geodetic (api 0.7+): WGS84 degrees, meters above MSL, velocity as (north, east, down) m/s. Use instead of
+    /// <see cref="UpdateCamera"/> in a frame. Returns false when unavailable (nothing was sent).
+    /// </summary>
+    public bool UpdateCameraGeodetic(double lat, double lon, double altMslM, Vector3 velNed)
+    {
+        if (!HasHostApi) return false;
+        _node!.Call(MUpdateCameraGeodetic, lat, lon, altMslM, velNed);
+        return true;
+    }
+
+    /// <summary>geodetic_to_local (api 0.7+): WGS84 point to the current local frame; Vector3.Zero when unavailable or invalid.</summary>
+    public Vector3 GeodeticToLocal(double lat, double lon, double altMsl)
+    {
+        if (!HasHostApi) return Vector3.Zero;
+        var v = _node!.Call(MGeodeticToLocal, lat, lon, altMsl);
+        return v.VariantType == Variant.Type.Vector3 ? v.AsVector3() : Vector3.Zero;
+    }
+
+    /// <summary>local_to_geodetic (api 0.7+): current local point to Vector3(lat, lon, alt_msl) (f32 resolution, about 0.1-0.4 m); Vector3.Zero when unavailable.</summary>
+    public Vector3 LocalToGeodetic(Vector3 local)
+    {
+        if (!HasHostApi) return Vector3.Zero;
+        var v = _node!.Call(MLocalToGeodetic, local);
+        return v.VariantType == Variant.Type.Vector3 ? v.AsVector3() : Vector3.Zero;
+    }
+
+    /// <summary>attributions() (api 0.7+): strings to show while map data is visible; empty for the synthetic city or when unavailable.</summary>
+    public string[] Attributions()
+    {
+        if (!HasHostApi) return EmptyUnload;
+        var v = _node!.Call(MAttributions);
+        return v.VariantType == Variant.Type.PackedStringArray ? v.AsStringArray() : EmptyUnload;
+    }
+
+    private static readonly StreamerStatus OkStatus = new();
+
+    /// <summary>status() (api 0.7+): data-source health. A shared "ok" instance (do not modify) when unavailable.</summary>
+    public StreamerStatus Status()
+    {
+        if (!HasHostApi) return OkStatus;
+        var v = _node!.Call(MStatus);
+        return v.VariantType == Variant.Type.Dictionary ? StreamerStatus.From(v.AsGodotDictionary()) : OkStatus;
+    }
+
+    /// <summary>
+    /// shutdown() (api 0.7+): stops the workers (bounded 1 s wait), releases the cache_dir lock; the node is inert until configured again.
+    /// Also disconnects the signals. Safe to call twice or when unavailable.
+    /// </summary>
+    public void Shutdown()
+    {
+        if (!HasHostApi) return;
+        DisconnectSignals();
+        _node!.Call(MShutdown);
     }
 
     public void UpdateCamera(Vector3 localPos, Vector3 velocity, double altAglM)

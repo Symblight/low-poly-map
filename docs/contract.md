@@ -228,7 +228,7 @@ One flat ground mesh per R0–R2 tile: landuse/park/water areas plus buffered ro
 - Same tile → same mesh, same ground, same lights and same lit windows: everything is seeded by OSM id, with no time-based or process-random state. Output order is deterministic. Pinned since 0.6 by golden hashes in `cargo test` (`simworld-core` `golden_tests`: per-tile hashes of the synthetic city for all 4 bands, positions quantized to 1 mm, colors to 8 bits, per-building output sorted by OSM id; plus the cover for fixed cameras). P6 adds the real-data fixture and both CPU architectures.
 - The library never calls Godot APIs off the main thread; workers produce plain Rust structs and conversion to Packed arrays happens inside `poll_ready` on the calling thread.
 
-**Lifecycle today [0.5]:** one node = one world. Re-calling `configure` or (0.6) a successful `configure_world` is a fresh start (see `configure`); a failed `configure_world` changes nothing. Freeing the node stops the workers in the background (no wait, no cache flush). Several nodes in one process are not specified yet and must not share a `cache_dir` (rules arrive in 0.7).
+**Lifecycle today [0.5]:** one node = one world. Re-calling `configure` or (0.6) a successful `configure_world` is a fresh start (see `configure`); a failed `configure_world` changes nothing. Freeing the node stops the workers in the background (no wait, no cache flush). Several nodes in one process are not specified yet and must not share a `cache_dir` (rules arrive in 0.7: a lock on `cache_dir/.simworld.lock` taken synchronously in `configure_world`, see the planned lifecycle rules below).
 
 ## 12. Planned API (not built)
 
@@ -243,13 +243,13 @@ Shapes below are targets from `docs/spec-library-packaging.md` (section 4) and `
 | `local_to_geodetic(local: Vector3) -> Vector3` | `(lat, lon, alt)` |
 | signal `origin_shifted(shift: Vector3)` | Emitted on the main thread during `update_camera` when a re-center happens; `take_origin_shift()` stays for the same-frame ordering of the tile host |
 | `attributions() -> PackedStringArray` | Attribution strings currently required on screen (OSM, plus each active image source from 0.9) |
-| `shutdown()` | Stops the workers and flushes the cache index deterministically (for level unloads without freeing the node) |
-| `status() -> Dictionary` + signal `status_changed(status: Dictionary)` | `{ state: "ok" \| "degraded" \| "offline" \| "error", message: String, failed_fetches: int, last_error: String }` |
+| `shutdown()` | Stops the workers, then waits (bounded, 1 s) for the disk cache to flush and close and releases the `cache_dir` lock (for level unloads without freeing the node). Dropping the node remains a background stop with no wait. |
+| `status() -> Dictionary` + signal `status_changed(status: Dictionary)` | `{ state: "ok" \| "degraded" \| "offline" \| "error", message: String, failed_fetches: int, last_error: String }`. A disk cache disabled for the session after repeated write failures sets `degraded`. |
 
 **Lifecycle rules (0.7):**
 
-- Several instances in one process are allowed (e.g. a main view plus a map viewport), each with its own world; they share nothing except optionally the tokio runtime. Two instances must not use the same `cache_dir`: the core takes an exclusive lock file and `configure_world` returns an error if the folder is in use.
-- **Teleport:** calling `configure_world` again with a new origin drops all tiles (every loaded key appears in `poll_unload`), resets the origin and keeps the cache. The host treats it as a fresh start. (Already holds for `configure` since 0.5 and `configure_world` since 0.6; 0.7 adds the cache lock and several instances.)
+- Several instances in one process are allowed (e.g. a main view plus a map viewport), each with its own world; they share nothing except optionally the tokio runtime. Two instances must not use the same `cache_dir`: `configure_world` takes an exclusive lock on `cache_dir/.simworld.lock` synchronously, before the asynchronous archive and cache open, and returns an error ("cache_dir in use") if the folder is held by another instance or process. The lock is per folder (not per tile source); a world with no disk cache (empty `cache_dir`, or the synthetic city) takes none.
+- **Teleport:** calling `configure_world` again with a new origin drops all tiles (every loaded key appears in `poll_unload`), resets the origin and keeps the cache. The host treats it as a fresh start. The old world's cache is flushed and closed (bounded wait), or its open handle reused when `tile_url` and `cache_dir` are unchanged, before the new world opens it, and the folder lock stays held across a teleport with the same `cache_dir`. (Already holds for `configure` since 0.5 and `configure_world` since 0.6; 0.7 adds the cache lock and several instances.)
 - The cache key includes the tileset fingerprint and the cache schema version; raw bytes are cached, meshes are not, so a profile change never serves stale geometry. If meshes are ever cached, the profile hash joins the key.
 
 ### 0.8 — Daylight (M6)

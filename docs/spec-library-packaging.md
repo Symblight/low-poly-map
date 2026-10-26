@@ -171,15 +171,15 @@ All additions follow the "additive where possible" rule from the design doc.
 | signal `origin_shifted(shift: Vector3)` | Emitted on the main thread during `update_camera` when a re-center happens. Any game node can subscribe; `take_origin_shift()` stays for the bridge's same-frame ordering. |
 | `world_profile() -> Dictionary` | The resolved profile, for shader globals and debug UI |
 | `attributions() -> PackedStringArray` | Already planned. It moves forward, because a reusable library must state its own licensing needs (© OpenStreetMap contributors). |
-| `shutdown()` | Stops the workers and flushes the cache index deterministically. This is needed when a game unloads a level without freeing the node. Today `Worker::drop` calls `shutdown_background()`, which doesn't wait or flush. |
-| signal `status_changed(status: Dictionary)` + `status() -> Dictionary` | `{ state: "ok" \| "degraded" \| "offline" \| "error", message, failed_fetches, last_error }`. A game needs to show "map data unavailable" or switch to a fallback. Today this information exists only in `debug_stats` and warnings. |
+| `shutdown()` | Stops the workers, then waits (bounded, 1 s) for the disk cache to flush pending writes and close, and releases the cache-folder lock. This is needed when a game unloads a level without freeing the node. Today `Worker::drop` calls `shutdown_background()`, which doesn't wait or flush. Dropping the node stays a background stop with no wait. |
+| signal `status_changed(status: Dictionary)` + `status() -> Dictionary` | `{ state: "ok" \| "degraded" \| "offline" \| "error", message, failed_fetches, last_error }`. A game needs to show "map data unavailable" or switch to a fallback. Today this information exists only in `debug_stats` and warnings. Disk-cache trouble also feeds it: a corrupt cache that was recreated is only logged, but a cache disabled for the session after repeated write failures sets `degraded` (see [spec-tile-cache.md](spec-tile-cache.md)). |
 
 `set_clock`, `daylight`, `configure_imagery` and `poll_fades` keep their planned shapes. They are listed in `docs/contract.md` with the `api_version` that introduces them. `poll_fades` already exists and goes in as `api_version` 0.5.
 
 **Lifecycle rules** (go in `contract.md`):
 
-- **Several instances in one process are allowed.** Example: a main view plus a map viewport, each with its own `World`. They share nothing except, optionally, the tokio runtime. Two instances must not use the same `cache_dir`. The core takes an exclusive lock file and returns an error from `configure_world` if the directory is already in use.
-- **Teleport:** calling `configure_world` again with a new origin drops all tiles (every loaded key appears in `poll_unload`), resets the origin, and keeps the cache. The facade treats it as a fresh start.
+- **Several instances in one process are allowed.** Example: a main view plus a map viewport, each with its own `World`. They share nothing except, optionally, the tokio runtime. Two instances must not use the same `cache_dir`. `configure_world` takes an exclusive lock on `cache_dir/.simworld.lock` **synchronously, before** any asynchronous archive or cache open, and returns an error ("cache_dir in use") if another instance or process holds it. The lock is per folder, not per tile source, and a world with no disk cache (empty `cache_dir`, or the synthetic city) takes none. It uses `std::fs::File::try_lock` (stable since Rust 1.89, MSRV is 1.94; verify on all targets), so it needs no new dependency and works with whichever cache implementation sits behind it, including the SQLite cache in [spec-tile-cache.md](spec-tile-cache.md), which keeps this lock and uses its own `locking_mode=EXCLUSIVE` only as a second safeguard.
+- **Teleport:** calling `configure_world` again with a new origin drops all tiles (every loaded key appears in `poll_unload`), resets the origin, and keeps the cache. The facade treats it as a fresh start. The instance must not lock itself out: the old world's cache is flushed and closed (bounded wait) before the new one opens, or the open handle is reused when `tile_url` and `cache_dir` are unchanged. The folder lock stays held across a teleport with the same `cache_dir`; it is released and retaken if `cache_dir` changes.
 - **The cache key includes** the tileset fingerprint (already present) and `CACHE_SCHEMA_VERSION`. Raw tile bytes are cached; meshes are not. So a profile change never serves stale geometry. Keep it that way, or add the profile hash to the key if meshes are ever cached.
 
 ### 5. Single contract document (fixes A4)
@@ -228,7 +228,7 @@ The test bench is the project's main role after the split. Testing happens at fo
 `simworld-cli` commands:
 
 - `fly <script.json>` runs a scripted flight and reports.
-- `bake --bbox ... --zooms ...` pre-fills a cache directory (this is the planned "pre-download the test area").
+- `bake --bbox ... --zooms ...` pre-fills a cache directory (this is the planned "pre-download the test area"). It writes the same on-disk format as the runtime cache, the one-file SQLite format in [spec-tile-cache.md](spec-tile-cache.md) once that lands, so a baked cache can be shipped or copied. It takes the same folder lock, so it cannot run against a cache folder a game is using.
 - `tile <z/x/y> --out tile.obj` dumps one tile's meshes for inspection.
 - `validate-profile <file>` checks a world profile.
 

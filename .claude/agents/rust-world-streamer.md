@@ -19,9 +19,14 @@ lowpolymap/rust/
       lib.rs              # module list, re-exports World / Log / Diagnostics / Profile, VERSION, API_MAJOR / API_MINOR
       world.rs            # World: frame, LocalSpace, scheduler, worker, Arc<Profile>; re-center and pending
                           #   origin shift, re-delivery pacing, warning limit, profiling. configure_world
-                          #   (WorldOptions -> ConfigureResult; validates first, nothing changes on error),
-                          #   configure (wrapper, default profile), update_camera, pop_ready, drain_fades,
-                          #   drain_unload, take_origin_shift, stats, ground_height_at, debug_tiles
+                          #   (WorldOptions -> ConfigureResult; validates first, takes the cache folder lock,
+                          #   nothing changes on error; old worker stops before the new one starts),
+                          #   configure (wrapper, default profile), update_camera (returns the shift it
+                          #   applied), update_camera_geodetic, geodetic_to_local / local_to_geodetic,
+                          #   pop_ready, drain_fades, drain_unload, take_origin_shift, status /
+                          #   take_status_change, shutdown (bounded 1 s), stats, ground_height_at, debug_tiles
+      lock.rs             # FolderLock: exclusive {cache_dir}/.simworld.lock via std::fs::File::try_lock
+      status.rs           # Health -> Status { state ok|degraded|offline|error, message, failed_fetches, last_error }
       profile.rs          # world profile: WorldProfile (serde data tree, Default = the spike constants),
                           #   Profile (validated + lookup tables, shared as Arc), resolve(file, overrides),
                           #   RANGES (single source of the allowed ranges), PROFILE_VERSION
@@ -38,6 +43,7 @@ lowpolymap/rust/
       synthetic.rs        # offline fake city when tile_url is empty
       worker.rs           # tokio (I/O) + rayon (meshing) + crossbeam channels
       integration_tests.rs
+      lifecycle_tests.rs  # api 0.7: geodetic input, shift, status, shutdown, folder lock, two worlds, teleport
   simworld-godot/         # cdylib + staticlib -> target/{debug,release}/libsimworld_godot.*
     build.rs              # SIMPLANE_BUILD_MARKER (watches this crate and simworld-core)
     src/
@@ -59,7 +65,7 @@ Core rules: the core never depends on `godot`, never reads environment variables
 
 The contract is `docs/contract.md`; read it before changing either side; any change updates that file, `api_version` and `CHANGELOG.md` in the same commit.
 
-`api_version` lives in `simworld-core/src/lib.rs` (`API_MAJOR`, `API_MINOR`) and is exposed by `WorldStreamer.api_version()` and `debug_stats()["api_major"/"api_minor"]`. `cargo test` pins it to the `api_version:` line of `docs/contract.md` and checks that every `#[func]` in `streamer.rs` is documented there (update the expected count in `simworld-godot/src/lib.rs` when you add one). Minor bump = additive only; anything breaking is a major bump and needs the `godot-csharp-integrator` side updated in the same change.
+`api_version` lives in `simworld-core/src/lib.rs` (`API_MAJOR`, `API_MINOR`) and is exposed by `WorldStreamer.api_version()` and `debug_stats()["api_major"/"api_minor"]`. `cargo test` pins it to the `api_version:` line of `docs/contract.md` and checks that every `#[func]` and every `#[signal]` in `streamer.rs` is documented there (update the expected count / signal list in `simworld-godot/src/lib.rs` when you add one). Minor bump = additive only; anything breaking is a major bump and needs the `godot-csharp-integrator` side updated in the same change.
 
 ## Implementation notes (not contract)
 
@@ -70,7 +76,8 @@ The contract is `docs/contract.md`; read it before changing either side; any cha
 
 ## Rules
 
-- Never call Godot APIs from worker threads. Workers produce plain Rust structs; convert to Packed arrays only on the main thread inside `poll_ready`.
+- Never call Godot APIs from worker threads. Workers produce plain Rust structs; convert to Packed arrays only on the main thread inside `poll_ready`. Signals (`origin_shifted`, `status_changed`) are emitted by the binding on the main thread from inside `update_camera(_geodetic)` / `poll_ready`, through gdext typed signals (`self.signals()`, re-entrant via `base_mut`).
+- No process-global state in the core (several `World`s per process are part of the contract); one world per cache folder (`lock.rs`).
 - `update_camera` and `poll_*` must stay under 0.5 ms; no blocking, no allocation storms.
 - Deterministic output: the same tile always yields the same mesh and lit windows (seeded by OSM id, no time-based randomness).
 - Disk cache in `cache_dir`, LRU cap 300 MB, raw MVT bytes keyed by `z/x/y`.

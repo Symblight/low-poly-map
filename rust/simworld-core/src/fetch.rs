@@ -75,6 +75,49 @@ pub enum Note {
     Error(String),
 }
 
+/// Why a fetch failed (for the host status, contract `status()`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FetchErrorKind {
+    /// The archive could not be opened (server unreachable, HTTP error on the header, ...).
+    Unreachable,
+    /// The archive opened but does not match the tileset contract (permanent).
+    Contract,
+    /// One tile request failed (or anything else).
+    Tile,
+}
+
+/// A failed fetch: what kind of failure and the message that is logged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FetchError {
+    pub kind: FetchErrorKind,
+    pub message: String,
+}
+
+impl FetchError {
+    pub fn new(kind: FetchErrorKind, message: impl Into<String>) -> Self {
+        Self { kind, message: message.into() }
+    }
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Plain messages are tile-level failures.
+impl From<String> for FetchError {
+    fn from(message: String) -> Self {
+        Self::new(FetchErrorKind::Tile, message)
+    }
+}
+
+impl From<&str> for FetchError {
+    fn from(message: &str) -> Self {
+        Self::new(FetchErrorKind::Tile, message)
+    }
+}
+
 /// Check an opened archive against the tileset contract: zooms 13..16 and the layers the
 /// decoder needs (`metadata` = the archive's JSON metadata).
 pub fn check_tileset(min_zoom: u8, max_zoom: u8, metadata: &str) -> Result<(), String> {
@@ -426,17 +469,18 @@ impl Fetcher {
             .clone()
     }
 
-    async fn reader(&self) -> Result<Arc<Reader>, String> {
+    async fn reader(&self) -> Result<Arc<Reader>, FetchError> {
+        use FetchErrorKind::{Contract, Unreachable};
         let mut slot = self.reader.lock().await;
         if let Some(e) = &slot.fatal {
-            return Err(e.clone());
+            return Err(FetchError::new(Contract, e.clone()));
         }
         if let Some(r) = &slot.reader {
             return Ok(r.clone());
         }
         if let Some((t, e)) = &slot.last_failure {
             if t.elapsed() < self.params.open_retry {
-                return Err(e.clone());
+                return Err(FetchError::new(Unreachable, e.clone()));
             }
         }
         match Reader::new_with_cached_url(HashMapCache::default(), self.client.clone(), &self.url).await {
@@ -454,14 +498,14 @@ impl Fetcher {
                     Err(e) => {
                         let msg = format!("open {}: metadata: {e}", self.url);
                         slot.last_failure = Some((Instant::now(), msg.clone()));
-                        return Err(msg);
+                        return Err(FetchError::new(Unreachable, msg));
                     }
                 };
                 if let Err(e) = check_tileset(min_zoom, max_zoom, &meta) {
                     let msg = format!("{}: {e}", self.url);
                     (self.notify)(Note::Error(msg.clone()));
                     slot.fatal = Some(msg.clone());
-                    return Err(msg);
+                    return Err(FetchError::new(Contract, msg));
                 }
                 let r = Arc::new(r);
                 slot.reader = Some(r.clone());
@@ -471,7 +515,7 @@ impl Fetcher {
             Err(e) => {
                 let msg = format!("open {}: {e}", self.url);
                 slot.last_failure = Some((Instant::now(), msg.clone()));
-                Err(msg)
+                Err(FetchError::new(Unreachable, msg))
             }
         }
     }
@@ -500,7 +544,7 @@ impl Fetcher {
     }
 
     /// Raw tile bytes (as archived; empty = no tile in the archive) and where they came from.
-    pub async fn fetch(&self, key: TileKey) -> Result<(Bytes, Source), String> {
+    pub async fn fetch(&self, key: TileKey) -> Result<(Bytes, Source), FetchError> {
         let disk = self.disk().await;
         if let Some(d) = &disk {
             self.validate_cache(d).await;
@@ -526,7 +570,7 @@ impl Fetcher {
                     self.reader.lock().await.reader = None;
                     self.validation.lock().await.done = false;
                 }
-                return Err(format!("{key}: {msg}"));
+                return Err(format!("{key}: {msg}").into());
             }
         };
         if let Some(d) = disk {

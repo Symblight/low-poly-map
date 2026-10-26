@@ -17,11 +17,13 @@ pub mod fetch;
 pub mod geo;
 pub mod ground;
 pub mod lights;
+pub mod lock;
 pub mod mesher;
 pub mod mvt;
 pub mod profile;
 pub mod rings;
 pub mod scheduler;
+pub mod status;
 pub mod synthetic;
 pub mod worker;
 pub mod world;
@@ -30,9 +32,12 @@ pub mod world;
 mod golden_tests;
 #[cfg(test)]
 mod integration_tests;
+#[cfg(test)]
+mod lifecycle_tests;
 
 pub use diag::{Diagnostics, Log, NullLog};
 pub use profile::{Profile, WorldProfile, PROFILE_VERSION};
+pub use status::{Status, StatusState};
 pub use world::{ConfigureResult, ReadyTileView, World, WorldOptions, WorldStats, OSM_ATTRIBUTION};
 
 /// Version of this crate (`simworld-core`).
@@ -43,7 +48,7 @@ pub const API_MAJOR: u32 = 0;
 /// Contract (`docs/contract.md`) minor version. A minor bump is additive only.
 /// Independent of the crate version; must equal the `api_version:` line of `docs/contract.md`
 /// (pinned by `tests::api_version_matches_contract_doc`).
-pub const API_MINOR: u32 = 6;
+pub const API_MINOR: u32 = 7;
 
 #[cfg(test)]
 mod tests {

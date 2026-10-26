@@ -10,7 +10,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender};
 
-use crate::fetch::{FetchParams, Fetcher, Note, Source};
+use crate::fetch::{FetchError, FetchParams, Fetcher, Note, Source};
 use crate::geo::{Frame, TileKey};
 use crate::lights::LightSet;
 use crate::mesher::{mesh_tile, MeshData};
@@ -99,7 +99,7 @@ pub enum Job {
 
 #[derive(Debug)]
 pub enum WorkerMsg {
-    Fetched { key: TileKey, ring: usize, job: u64, result: Result<(Bytes, Source), String> },
+    Fetched { key: TileKey, ring: usize, job: u64, result: Result<(Bytes, Source), FetchError> },
     Decoded { key: TileKey, ring: usize, job: u64, result: Result<TileData, String> },
     Info(String),
     /// A configuration problem (logged as an error on the main thread).
@@ -179,6 +179,8 @@ pub struct Worker {
     frame: Frame,
     profile: Arc<Profile>,
     cache_bytes: Arc<AtomicU64>,
+    /// A disk cache folder is in use (tile source + non-empty `cache_dir`).
+    disk_cache: bool,
 }
 
 impl Worker {
@@ -219,11 +221,30 @@ impl Worker {
             )?;
             (Some(rt), Some(Arc::new(f)))
         };
-        Ok(Self { rt, pool, tx, rx, fetcher, frame, profile, cache_bytes })
+        let disk_cache = fetcher.is_some() && !cache_dir.is_empty();
+        Ok(Self { rt, pool, tx, rx, fetcher, frame, profile, cache_bytes, disk_cache })
     }
 
     pub fn is_synthetic(&self) -> bool {
         self.fetcher.is_none()
+    }
+
+    /// Whether this worker may write to a disk cache folder.
+    pub fn uses_disk_cache(&self) -> bool {
+        self.disk_cache
+    }
+
+    /// Stop and wait (at most `wait`) until the I/O runtime has stopped: async tasks (HTTP
+    /// requests) are cancelled at their next await, blocking tasks (disk cache reads, writes,
+    /// the cache index scan) run to completion. Returns false if the wait timed out (a blocking
+    /// task may still be touching the cache folder). CPU jobs on the rayon pool are not waited
+    /// for; they never touch the disk and their results are discarded. Dropping a `Worker`
+    /// instead stops in the background without waiting.
+    pub fn shutdown(mut self, wait: std::time::Duration) -> bool {
+        let Some(rt) = self.rt.take() else { return true };
+        let t0 = std::time::Instant::now();
+        rt.shutdown_timeout(wait);
+        t0.elapsed() < wait
     }
 
     pub fn cache_bytes(&self) -> u64 {
@@ -252,7 +273,7 @@ impl Worker {
                     // Inner task so a panic becomes a JoinError instead of a lost reply.
                     let result = match tokio::spawn(async move { f.fetch(key).await }).await {
                         Ok(r) => r,
-                        Err(e) => Err(format!("fetch task: {e}")),
+                        Err(e) => Err(format!("fetch task: {e}").into()),
                     };
                     let _ = tx.send(WorkerMsg::Fetched { key, ring, job, result });
                 });
@@ -273,7 +294,8 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        // Never block the main thread on in-flight HTTP requests.
+        // Never block the main thread on in-flight HTTP requests (`shutdown` is the bounded,
+        // waiting stop).
         if let Some(rt) = self.rt.take() {
             rt.shutdown_background();
         }

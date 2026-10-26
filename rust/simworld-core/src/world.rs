@@ -13,17 +13,28 @@
 //! rects) is in the post-shift local frame.
 //!
 //! Local frame = host axes: x = east, y = up, z = -north, meters relative to the current origin.
+//! Heights: local y = meters above MSL (the world is flat in local space; the terrain is at
+//! `ground_height`, 0 until a DEM exists).
+//!
+//! Lifecycle (api 0.7): several `World`s may run side by side (no process-global state); each
+//! cache folder is held by one world through [`crate::lock::FolderLock`]; `shutdown` stops a
+//! world with a bounded wait and makes it inert until the next configure.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::diag::{thread_cpu_us, Diagnostics, Log, WarnLimiter};
 use crate::geo::{Frame, LocalSpace, TileKey, MERCATOR_MAX_LAT};
+use crate::lock::{canonical_dir, FolderLock, LockError};
 use crate::mesher::MeshData;
 use crate::profile::Profile;
 use crate::rings::RING_COUNT;
 use crate::scheduler::Scheduler;
+use crate::status::{Health, Status, StatusState, MSG_NOT_CONFIGURED, MSG_SHUT_DOWN};
 use crate::worker::{Job, Worker, WorkerMsg};
+
+/// Bounded wait of `shutdown` and of a re-configure that replaces a worker using a disk cache.
+pub const STOP_WAIT: Duration = Duration::from_secs(1);
 
 // Tuning from the world profile: `origin.recenter_distance_m` (re-center the floating origin
 // when the camera is farther than this from it, horizontal) and `streaming.redeliveries_per_frame`
@@ -123,6 +134,13 @@ pub struct World {
     /// Light-mode re-deliveries handed out since the last `update_camera`.
     redelivered_this_frame: usize,
     warn_limiter: WarnLimiter,
+
+    /// Exclusive lock on the cache folder in use (tile source + non-empty `cache_dir`).
+    folder_lock: Option<FolderLock>,
+    /// Data-source health (contract `status()`).
+    health: Health,
+    /// State and message last returned by `take_status_change`.
+    reported: (StatusState, String),
 }
 
 impl World {
@@ -147,6 +165,9 @@ impl World {
             stale_unloads: Vec::new(),
             redelivered_this_frame: 0,
             warn_limiter: WarnLimiter::default(),
+            folder_lock: None,
+            health: Health::idle(MSG_NOT_CONFIGURED),
+            reported: (StatusState::Ok, MSG_NOT_CONFIGURED.to_string()),
         }
     }
 
@@ -163,9 +184,36 @@ impl World {
         &self.profile
     }
 
-    /// Attribution strings for the current data source (empty for the synthetic city).
+    /// Attribution strings for the current data source (empty for the synthetic city, before
+    /// configure and after `shutdown`).
     pub fn attributions(&self) -> &[String] {
         &self.attributions
+    }
+
+    /// Whether a configuration is running (false before configure and after `shutdown`).
+    pub fn is_running(&self) -> bool {
+        self.scheduler.is_some()
+    }
+
+    /// Canonical path of the cache folder this world holds locked, if any.
+    pub fn locked_cache_dir(&self) -> Option<&std::path::Path> {
+        self.folder_lock.as_ref().map(|l| l.dir())
+    }
+
+    /// Data-source health (contract `status()`).
+    pub fn status(&self) -> Status {
+        self.health.status_at(Instant::now())
+    }
+
+    /// The status, if its state or message changed since the last call (the host emits
+    /// `status_changed` with it). Call on the main thread after `update_camera` / `pop_ready`.
+    pub fn take_status_change(&mut self) -> Option<Status> {
+        let s = self.status();
+        if self.reported.0 == s.state && self.reported.1 == s.message {
+            return None;
+        }
+        self.reported = (s.state, s.message.clone());
+        Some(s)
     }
 
     fn warn(&mut self, msg: &str) {
@@ -181,8 +229,18 @@ impl World {
             let Some(msg) = worker.try_recv() else { break };
             match msg {
                 WorkerMsg::Info(s) => self.log.info(&format!("WorldStreamer: {s}")),
-                WorkerMsg::Error(s) => self.log.error(&format!("WorldStreamer: {s}")),
-                m => warns.extend(sched.handle(m, now)),
+                WorkerMsg::Error(s) => {
+                    self.log.error(&format!("WorldStreamer: {s}"));
+                    self.health.set_fatal(&s);
+                }
+                m => {
+                    match &m {
+                        WorkerMsg::Fetched { result, .. } => self.health.record_fetch(result, now),
+                        WorkerMsg::Decoded { result: Err(e), .. } => self.health.record_decode_failure(e, now),
+                        _ => {}
+                    }
+                    warns.extend(sched.handle(m, now));
+                }
             }
         }
         for w in warns {
@@ -248,12 +306,18 @@ impl World {
     /// the old workers are dropped and tiles delivered before are reported by the next
     /// `drain_unload` (teleport); the disk cache is kept.
     pub fn configure_world(&mut self, o: WorldOptions) -> ConfigureResult {
+        let fail = |w: &Self, e: String| {
+            w.log.error(&format!("WorldStreamer: configure_world failed: {e}"));
+            ConfigureResult { ok: false, error: e, attributions: w.attributions.clone() }
+        };
         let profile = match self.prepare(&o) {
             Ok(p) => p,
-            Err(e) => {
-                self.log.error(&format!("WorldStreamer: configure_world failed: {e}"));
-                return ConfigureResult { ok: false, error: e, attributions: self.attributions.clone() };
-            }
+            Err(e) => return fail(self, e),
+        };
+        // Cache folder lock, synchronously and before anything changes or opens.
+        let lock = match self.plan_lock(&o) {
+            Ok(l) => l,
+            Err(e) => return fail(self, e),
         };
         let custom = profile != Profile::default();
         self.profile = Arc::new(profile);
@@ -261,12 +325,13 @@ impl World {
             self.diag = d;
         }
         let (origin_lat, origin_lon, cache_dir) = (o.origin_lat, o.origin_lon, o.cache_dir.as_str());
-        // The host keeps whatever we handed out before: unload it with the next drain_unload.
-        if let Some(s) = &self.scheduler {
-            self.stale_unloads.extend(s.delivered_keys());
+        // Old workers stop before the new ones start (and before an old lock is released).
+        self.stop_running();
+        match lock {
+            LockPlan::Keep => {}
+            LockPlan::New(l) => self.folder_lock = Some(l),
+            LockPlan::None => self.folder_lock = None,
         }
-        self.scheduler = None;
-        self.worker = None; // shuts the old runtime down in the background
 
         self.origin_lat = origin_lat;
         self.origin_lon = origin_lon;
@@ -277,6 +342,8 @@ impl World {
 
         let url = o.tile_url.trim().to_string();
         self.attributions = if url.is_empty() { Vec::new() } else { vec![OSM_ATTRIBUTION.to_string()] };
+        let hold = Duration::from_secs_f64(self.profile.streaming.retry_max_s + 5.0);
+        self.health = Health::running(hold);
         let mut error = String::new();
         match Worker::new(frame, &url, cache_dir, self.profile.clone()) {
             Ok(w) => {
@@ -286,6 +353,8 @@ impl World {
             Err(e) => {
                 error = format!("cannot start workers: {e}");
                 self.log.error(&format!("WorldStreamer: {error}"));
+                self.health.set_fatal(&error);
+                self.folder_lock = None;
             }
         }
         let source = if url.is_empty() { "synthetic city".to_string() } else { url };
@@ -312,13 +381,145 @@ impl World {
         ConfigureResult { ok: error.is_empty(), error, attributions: self.attributions.clone() }
     }
 
+    /// Decide the cache folder lock for `o` without changing anything: keep the held lock (same
+    /// folder), take a new one, or none (synthetic city / no `cache_dir`). Errors when another
+    /// world or process holds the folder. Other I/O problems (read-only volume, no lock support)
+    /// are logged and the world runs without a lock (the cache itself will likely be disabled).
+    fn plan_lock(&self, o: &WorldOptions) -> Result<LockPlan, String> {
+        if o.tile_url.trim().is_empty() || o.cache_dir.is_empty() {
+            return Ok(LockPlan::None);
+        }
+        let dir = match canonical_dir(std::path::Path::new(&o.cache_dir)) {
+            Ok(d) => d,
+            Err(e) => {
+                self.log.warn(&format!("WorldStreamer: cache_dir {}: {e}; running without the folder lock", o.cache_dir));
+                return Ok(LockPlan::None);
+            }
+        };
+        if self.folder_lock.as_ref().is_some_and(|l| l.dir() == dir) {
+            return Ok(LockPlan::Keep);
+        }
+        match FolderLock::try_acquire(&dir) {
+            Ok(l) => Ok(LockPlan::New(l)),
+            Err(LockError::InUse) => Err(format!("cache_dir in use: {}", o.cache_dir)),
+            Err(LockError::Io(e)) => {
+                self.log.warn(&format!(
+                    "WorldStreamer: cannot lock cache_dir {}: {e}; running without the folder lock",
+                    o.cache_dir
+                ));
+                Ok(LockPlan::None)
+            }
+        }
+    }
+
+    /// Stop the running configuration: delivered tiles go to the next `drain_unload`, the
+    /// worker stops (bounded wait if it may be writing to a cache folder, else in the
+    /// background: nothing to flush, and a blocked DNS lookup must not stall the frame). Keeps
+    /// the folder lock (the caller decides). Returns false if the bounded wait timed out.
+    fn stop_running(&mut self) -> bool {
+        // The host keeps whatever we handed out before: unload it with the next drain_unload.
+        if let Some(s) = &self.scheduler {
+            self.stale_unloads.extend(s.delivered_keys());
+        }
+        self.scheduler = None;
+        self.jobs.clear();
+        self.pending_shift = [0.0; 3];
+        let Some(w) = self.worker.take() else { return true };
+        if !w.uses_disk_cache() {
+            drop(w);
+            return true;
+        }
+        let done = w.shutdown(STOP_WAIT);
+        if !done {
+            self.log.warn(&format!(
+                "WorldStreamer: workers still busy after {:.1} s; a cache write may finish late",
+                STOP_WAIT.as_secs_f32()
+            ));
+        }
+        done
+    }
+
+    /// Stop the workers, wait (at most 1 s) for in-flight cache reads/writes to finish, release
+    /// the cache folder lock. Afterwards the world is inert (every call is a no-op returning
+    /// empty values) until the next `configure` / `configure_world`. The tiles delivered
+    /// before are still reported once by the next `drain_unload`. Returns false if the wait
+    /// timed out. Dropping a `World` instead stops in the background without waiting.
+    pub fn shutdown(&mut self) -> bool {
+        let done = self.stop_running();
+        self.folder_lock = None;
+        self.frame = None;
+        self.local = LocalSpace::default();
+        self.origin_lat = 0.0;
+        self.origin_lon = 0.0;
+        self.attributions.clear();
+        self.health = Health::idle(MSG_SHUT_DOWN);
+        done
+    }
+
+    /// Camera from geodetic input (contract `update_camera_geodetic`): `lat`/`lon` WGS84
+    /// degrees, `alt_msl_m` meters above mean sea level, `vel_ned` m/s (north, east, down).
+    /// Converted to the local frame through the current origin (AGL = altitude - terrain,
+    /// velocity x = E, y = -D, z = -N), then the same path as [`World::update_camera`],
+    /// re-centering included. Invalid input (non-finite, |lat| > 90, |lon| > 180) is logged
+    /// and ignored (no state change); returns `Err` with the reason then.
+    pub fn update_camera_geodetic(
+        &mut self,
+        lat: f64,
+        lon: f64,
+        alt_msl_m: f64,
+        vel_ned: [f64; 3],
+    ) -> Result<Option<[f64; 3]>, String> {
+        if self.scheduler.is_none() {
+            return Ok(None);
+        }
+        let checked = check_geodetic(lat, lon, alt_msl_m).and_then(|()| {
+            if vel_ned.iter().all(|v| v.is_finite()) {
+                Ok(())
+            } else {
+                Err(format!("vel_ned = {vel_ned:?} is not finite"))
+            }
+        });
+        if let Err(e) = checked {
+            let msg = format!("WorldStreamer: update_camera_geodetic ignored: {e}");
+            self.warn(&msg);
+            return Err(e);
+        }
+        let Some(p) = self.geodetic_to_local(lat, lon, alt_msl_m) else { return Ok(None) };
+        let agl = alt_msl_m - crate::geo::ground_height(lat, lon);
+        let vel = [vel_ned[1], -vel_ned[2], -vel_ned[0]];
+        Ok(self.update_camera(p, vel, agl))
+    }
+
+    /// WGS84 point (degrees, meters above MSL) -> current local frame (x east, y = altitude
+    /// above MSL, z -north), through the current floating origin. `None` before configure,
+    /// after `shutdown` and for invalid input.
+    pub fn geodetic_to_local(&self, lat: f64, lon: f64, alt_msl_m: f64) -> Option<[f64; 3]> {
+        let f = self.frame.as_ref()?;
+        check_geodetic(lat, lon, alt_msl_m).ok()?;
+        let [e, n] = f.enu(lat, lon);
+        let [x, z] = self.local.to_local(e, n);
+        Some([x, alt_msl_m, z])
+    }
+
+    /// Current local frame point -> `[lat, lon, alt_msl]` (degrees, meters). Inverse of
+    /// [`World::geodetic_to_local`]. `None` before configure, after `shutdown` and for
+    /// non-finite input.
+    pub fn local_to_geodetic(&self, p: [f64; 3]) -> Option<[f64; 3]> {
+        let f = self.frame.as_ref()?;
+        if !p.iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        let [e, n] = self.local.to_enu(p[0], p[2]);
+        let (lat, lon) = f.lat_lon(e, n);
+        Some([lat, lon, p[1]])
+    }
+
     /// Call every frame. `local_pos` and `velocity` are in the local frame (x east, y up,
     /// z -north). Re-centers the floating origin when needed, recomputes the wanted set and
-    /// queues jobs.
-    pub fn update_camera(&mut self, local_pos: [f64; 3], velocity: [f64; 3], alt_agl_m: f64) {
-        if self.scheduler.is_none() {
-            return;
-        }
+    /// queues jobs. Returns the origin shift applied by this call (also reported once by
+    /// `take_origin_shift`, which this does not consume), `None` if there was none.
+    pub fn update_camera(&mut self, local_pos: [f64; 3], velocity: [f64; 3], alt_agl_m: f64) -> Option<[f64; 3]> {
+        self.scheduler.as_ref()?;
         let profile = self.diag.profile;
         let t_start = Instant::now();
         self.redelivered_this_frame = 0;
@@ -333,11 +534,13 @@ impl World {
         let vel = [velocity[0], -velocity[2], velocity[1]];
 
         // Floating origin: translate (never rotate) the local frame onto the camera.
+        let mut shift = None;
         if x.hypot(z) > self.profile.origin.recenter_distance_m {
             self.local.offset_e += x;
             self.local.offset_n -= z;
             self.pending_shift[0] += x;
             self.pending_shift[2] += z;
+            shift = Some([x, 0.0, z]);
         }
 
         let now = Instant::now();
@@ -360,6 +563,7 @@ impl World {
                 ));
             }
         }
+        shift
     }
 
     /// Hand at most `max` finished tiles to `f`, in priority order. Returns how many were
@@ -479,4 +683,28 @@ impl World {
         let local = self.local;
         s.for_each_tile(|key, ring, state, rect| f(key, ring, state, local.rect_to_local(rect)));
     }
+}
+
+/// What `configure_world` does with the cache folder lock.
+enum LockPlan {
+    /// Same folder as the held lock: keep the handle (no self-lockout).
+    Keep,
+    /// A newly taken lock (replaces the held one after the old workers stopped).
+    New(FolderLock),
+    /// No lock (synthetic city, no `cache_dir`, or locking unavailable).
+    None,
+}
+
+/// Geodetic input check: finite, |lat| <= 90, |lon| <= 180.
+fn check_geodetic(lat: f64, lon: f64, alt: f64) -> Result<(), String> {
+    if !(lat.is_finite() && lat.abs() <= 90.0) {
+        return Err(format!("lat = {lat} is out of range [-90, 90]"));
+    }
+    if !(lon.is_finite() && lon.abs() <= 180.0) {
+        return Err(format!("lon = {lon} is out of range [-180, 180]"));
+    }
+    if !alt.is_finite() {
+        return Err(format!("alt_msl_m = {alt} is not finite"));
+    }
+    Ok(())
 }

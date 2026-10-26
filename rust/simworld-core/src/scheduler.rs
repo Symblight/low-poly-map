@@ -588,7 +588,7 @@ impl Scheduler {
                         e.state = TileState::Fetched(bytes);
                         None
                     }
-                    Err(err) => Some(Self::fail(e, now, "fetch", &err, &self.profile)),
+                    Err(err) => Some(Self::fail(e, now, "fetch", &err.message, &self.profile)),
                 }
             }
             WorkerMsg::Decoded { key, ring, job, result } => {

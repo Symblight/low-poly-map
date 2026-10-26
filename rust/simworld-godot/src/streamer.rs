@@ -8,6 +8,11 @@
 //! `poll_fades` -> `poll_unload`. Fades advance and complete inside `update_camera`; a fade
 //! started by a `poll_ready` delivery is already in that frame's `poll_fades`. Re-centering happens inside `update_camera`; every position handed out
 //! afterwards (`poll_ready` origins, `debug_tiles` rects) is in the post-shift local frame.
+//!
+//! Signals (api 0.7) are emitted on the main thread from inside the calls that cause them:
+//! `origin_shifted` from `update_camera` / `update_camera_geodetic`, `status_changed` from those
+//! and `poll_ready`. Emission goes through `base_mut()` (gdext typed signals), so handlers may
+//! call back into this node.
 
 use std::sync::Arc;
 
@@ -18,7 +23,7 @@ use godot::prelude::*;
 use simworld_core::geo::TileKey;
 use simworld_core::mesher::MeshData;
 use simworld_core::rings::RING_COUNT;
-use simworld_core::{ConfigureResult, Log, World, API_MAJOR, API_MINOR};
+use simworld_core::{ConfigureResult, Log, Status, World, API_MAJOR, API_MINOR};
 
 use crate::convert::{json_to_variant, options_from_dict};
 use crate::host::{diagnostics_from_env, GodotLog};
@@ -84,8 +89,50 @@ fn key_string(k: TileKey) -> GString {
     GString::from(k.to_string().as_str())
 }
 
+fn v3(p: [f64; 3]) -> Vector3 {
+    Vector3::new(p[0] as f32, p[1] as f32, p[2] as f32)
+}
+
+fn status_dict(s: &Status) -> VarDictionary {
+    let mut d = VarDictionary::new();
+    d.set("state", &GString::from(s.state.as_str()));
+    d.set("message", &GString::from(s.message.as_str()));
+    d.set("failed_fetches", s.failed_fetches.min(i64::MAX as u64) as i64);
+    d.set("last_error", &GString::from(s.last_error.as_str()));
+    d
+}
+
+impl WorldStreamer {
+    /// Emit `origin_shifted` for a re-center done by this call, then `status_changed` if the
+    /// status changed. Main thread, no world borrow held while handlers run.
+    fn emit_after_update(&mut self, shift: Option<[f64; 3]>) {
+        if let Some(s) = shift {
+            self.signals().origin_shifted().emit(v3(s));
+        }
+        self.emit_status_change();
+    }
+
+    fn emit_status_change(&mut self) {
+        if let Some(s) = self.world.take_status_change() {
+            let d = status_dict(&s);
+            self.signals().status_changed().emit(&d);
+        }
+    }
+}
+
 #[godot_api]
 impl WorldStreamer {
+    /// Emitted during `update_camera` / `update_camera_geodetic` when the floating origin is
+    /// re-centered: `shift` (local meters, y = 0) is what to subtract from every node in local
+    /// space. Same vector as the next `take_origin_shift()`, which this does not consume.
+    #[signal]
+    fn origin_shifted(shift: Vector3);
+
+    /// Emitted (from `update_camera` / `update_camera_geodetic` / `poll_ready`) when the
+    /// `status()` state or message changes. Same Dictionary shape as `status()`.
+    #[signal]
+    fn status_changed(status: VarDictionary);
+
     /// Set world origin and data source with the default world profile. Empty `tile_url` =
     /// synthetic city. A wrapper over `configure_world` (errors are logged).
     #[func]
@@ -129,11 +176,56 @@ impl WorldStreamer {
     /// Call every frame. Recomputes the wanted set and queues jobs.
     #[func]
     fn update_camera(&mut self, local_pos: Vector3, velocity: Vector3, alt_agl_m: f64) {
-        self.world.update_camera(
+        let shift = self.world.update_camera(
             [local_pos.x as f64, local_pos.y as f64, local_pos.z as f64],
             [velocity.x as f64, velocity.y as f64, velocity.z as f64],
             alt_agl_m,
         );
+        self.emit_after_update(shift);
+    }
+
+    /// Camera from geodetic input instead of `update_camera` (call one of the two per frame):
+    /// WGS84 degrees, meters above MSL, velocity NED (north, east, down) m/s. Invalid input is
+    /// logged and ignored.
+    #[func]
+    fn update_camera_geodetic(&mut self, lat: f64, lon: f64, alt_msl_m: f64, vel_ned: Vector3) {
+        let v = [vel_ned.x as f64, vel_ned.y as f64, vel_ned.z as f64];
+        let shift = self.world.update_camera_geodetic(lat, lon, alt_msl_m, v).ok().flatten();
+        self.emit_after_update(shift);
+    }
+
+    /// WGS84 (degrees, meters above MSL) -> current local frame (x east, y = altitude, z
+    /// -north). `Vector3.ZERO` before configure / after `shutdown` / for invalid input.
+    #[func]
+    fn geodetic_to_local(&self, lat: f64, lon: f64, alt_msl: f64) -> Vector3 {
+        self.world.geodetic_to_local(lat, lon, alt_msl).map_or(Vector3::ZERO, v3)
+    }
+
+    /// Current local frame -> `Vector3(lat, lon, alt_msl)`. f32 output: lat/lon resolution is
+    /// ~4e-6 degrees (decimeters). `Vector3.ZERO` before configure / after `shutdown`.
+    #[func]
+    fn local_to_geodetic(&self, local: Vector3) -> Vector3 {
+        self.world.local_to_geodetic([local.x as f64, local.y as f64, local.z as f64]).map_or(Vector3::ZERO, v3)
+    }
+
+    /// Attribution strings the host must show while map data is visible (empty for the
+    /// synthetic city, before configure and after `shutdown`).
+    #[func]
+    fn attributions(&self) -> PackedStringArray {
+        self.world.attributions().iter().map(|s| GString::from(s.as_str())).collect()
+    }
+
+    /// Data-source health: `{ state, message, failed_fetches, last_error }`.
+    #[func]
+    fn status(&self) -> VarDictionary {
+        status_dict(&self.world.status())
+    }
+
+    /// Stop the workers, wait (at most 1 s) for in-flight cache I/O, release the cache folder
+    /// lock. The node is inert until the next `configure` / `configure_world`.
+    #[func]
+    fn shutdown(&mut self) {
+        self.world.shutdown();
     }
 
     /// Finished tiles, at most `max`.
@@ -152,6 +244,7 @@ impl WorldStreamer {
             d.set("light_colors", &PackedColorArray::from(as_col(t.light_colors)));
             out.push(&d);
         });
+        self.emit_status_change();
         out
     }
 

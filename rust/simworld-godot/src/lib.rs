@@ -56,6 +56,26 @@ mod tests {
             assert!(doc.contains(&format!("`{name}(")), "#[func] {name} is missing from docs/contract.md");
             n += 1;
         }
-        assert_eq!(n, 12, "WorldStreamer #[func] count changed: update docs/contract.md and this test");
+        assert_eq!(n, 18, "WorldStreamer #[func] count changed: update docs/contract.md and this test");
+    }
+
+    /// Every `#[signal]` of `WorldStreamer` is documented in `docs/contract.md` (as
+    /// `` signal `name( ``).
+    #[test]
+    fn every_signal_is_in_contract_doc() {
+        let src = include_str!("streamer.rs");
+        let doc = include_str!("../../../docs/contract.md");
+        let mut lines = src.lines();
+        let mut names = Vec::new();
+        while let Some(l) = lines.next() {
+            if l.trim() != "#[signal]" {
+                continue;
+            }
+            let sig = lines.next().expect("fn after #[signal]");
+            let name = sig.trim().strip_prefix("fn ").and_then(|r| r.split('(').next()).expect("signal name");
+            assert!(doc.contains(&format!("signal `{name}(")), "#[signal] {name} is missing from docs/contract.md");
+            names.push(name);
+        }
+        assert_eq!(names, ["origin_shifted", "status_changed"], "WorldStreamer signals changed: update docs/contract.md and this test");
     }
 }

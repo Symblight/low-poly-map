@@ -7,7 +7,7 @@ Test-bench notes only. Project status, layout, commands, architecture, constrain
 - `G=~/Downloads/Godot_mono.app/Contents/MacOS/Godot`; build Rust first (`cd ../rust && cargo build`) and C# (`dotnet build`).
 - Play: `$G --path .` (or F5 in the editor; main scene `scenes/CitySpike.tscn`). User arguments go after `--`, e.g. `$G --path . -- --time=13:00 --date=06-21`.
 - Tile source: `http://127.0.0.1:8787/vilnius.pmtiles` by default (start `../data/serve.sh`; tiles already in the disk cache at `user://tile_cache` render offline). `--tile-url=` (empty) switches to the synthetic city.
-- Headless smoke test: `$G --headless --path . --quit-after 120`. Expect `[StreamerBridge] tile source`, `[StreamerBridge] library api <major>.<minor>` (a `predates api_version` warning means a stale dylib), `poll_fades available`, `WorldStreamer configured ... [simworld-godot <ver> (build ...)]`, the disk cache line and a `first tile` line, with no errors. `slow upload` lines are informational.
+- Headless smoke test: `$G --headless --path . --quit-after 120`. Expect `[StreamerBridge] tile source`, `[StreamerBridge] library api <major>.<minor>` (a `predates api_version` warning means a stale dylib; while the library's minor is above the facade's `MinApiMinor` = 5, e.g. api 0.6, the facade also prints one `[WorldStreamerFacade] ... is newer than the facade's 0.5` info line, which is fine), `poll_fades available`, `WorldStreamer configured ... [simworld-godot <ver> (build ...)]`, the disk cache line and a `first tile` line, with no errors. `slow upload` lines are informational.
 
 ## Keys and menus
 

@@ -12,5 +12,7 @@ crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 simworld-core = { path = "../simworld-core" }
+# JSON values for configure_world's profile_overrides and world_profile() (pure Rust).
+serde_json = "1.0.154"
 # gdext; api-4-7 matches the Godot 4.7.x runtime (compatibility_minimum = 4.7 in the .gdextension).
 godot = { version = "0.5.5", features = ["api-4-7"] }

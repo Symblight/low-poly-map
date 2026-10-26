@@ -10,12 +10,13 @@ use std::sync::Arc;
 use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender};
 
-use crate::fetch::{Fetcher, Source};
+use crate::fetch::{FetchParams, Fetcher, Note, Source};
 use crate::geo::{Frame, TileKey};
 use crate::lights::LightSet;
 use crate::mesher::{mesh_tile, MeshData};
 use crate::ground::mesh_ground;
 use crate::mvt::{decode_tile, Building, DecodedTile, GroundFeatures, TileProjector};
+use crate::profile::Profile;
 use crate::synthetic;
 
 /// Decoded tile, ready for conversion on the main thread. Only flat arrays cross the channel:
@@ -57,29 +58,30 @@ mod tests {
     fn tile_data_records_max_roof_height() {
         let frame = Frame::new(54.6872, 25.2797);
         let key = crate::geo::tile_for(54.6872, 25.2797, 16);
-        let d = build_tile(key, 0, frame, &Payload::Synthetic).unwrap();
+        let p = Profile::default();
+        let d = build_tile(key, 0, frame, &Payload::Synthetic, &p).unwrap();
         let expect = synthetic::generate(key, frame)
             .iter()
-            .map(|b| crate::mesher::resolve(b).height)
+            .map(|b| crate::mesher::resolve(b, &p).height)
             .fold(0.0f32, f32::max);
         assert!(d.max_height > 10.0);
         assert_eq!(d.max_height, expect);
-        assert_eq!(build_tile(key, 0, frame, &Payload::Bytes(Bytes::new())).unwrap().max_height, 0.0);
+        assert_eq!(build_tile(key, 0, frame, &Payload::Bytes(Bytes::new()), &p).unwrap().max_height, 0.0);
         // Lights only for R2/R3.
         assert!(d.lights.is_empty() && !d.mesh.is_empty());
         let k14 = crate::geo::tile_for(54.6872, 25.2797, 14);
-        let d2 = build_tile(k14, 2, frame, &Payload::Synthetic).unwrap();
+        let d2 = build_tile(k14, 2, frame, &Payload::Synthetic, &p).unwrap();
         assert!(!d2.lights.is_empty() && !d2.mesh.is_empty());
         assert!(d2.lights.clustered_positions.len() < d2.lights.positions.len());
         let k13 = crate::geo::tile_for(54.6872, 25.2797, 13);
-        let d3 = build_tile(k13, 3, frame, &Payload::Synthetic).unwrap();
+        let d3 = build_tile(k13, 3, frame, &Payload::Synthetic, &p).unwrap();
         assert!(!d3.lights.is_empty() && d3.mesh.is_empty());
         // Ground for R0-R2 only (synthetic city has streets and districts everywhere).
         assert!(!d.ground.is_empty() && !d2.ground.is_empty() && d3.ground.is_empty());
         assert!(d.ground.uvs.is_empty());
-        assert_eq!(d.ground, build_tile(key, 0, frame, &Payload::Synthetic).unwrap().ground);
+        assert_eq!(d.ground, build_tile(key, 0, frame, &Payload::Synthetic, &p).unwrap().ground);
         // Deterministic.
-        assert_eq!(d3.lights, build_tile(k13, 3, frame, &Payload::Synthetic).unwrap().lights);
+        assert_eq!(d3.lights, build_tile(k13, 3, frame, &Payload::Synthetic, &p).unwrap().lights);
     }
 }
 
@@ -100,43 +102,56 @@ pub enum WorkerMsg {
     Fetched { key: TileKey, ring: usize, job: u64, result: Result<(Bytes, Source), String> },
     Decoded { key: TileKey, ring: usize, job: u64, result: Result<TileData, String> },
     Info(String),
+    /// A configuration problem (logged as an error on the main thread).
+    Error(String),
 }
 
 /// CPU stage: payload -> buildings, ground features (if `want_ground`) and projector
 /// (shared by real and synthetic tiles).
-pub fn decode_payload(key: TileKey, frame: Frame, payload: &Payload, want_ground: bool) -> Result<DecodedTile, String> {
+pub fn decode_payload(
+    key: TileKey,
+    frame: Frame,
+    payload: &Payload,
+    want_ground: bool,
+    profile: &Profile,
+) -> Result<DecodedTile, String> {
     match payload {
         Payload::Synthetic => Ok(DecodedTile {
             buildings: synthetic::generate(key, frame),
-            ground: if want_ground { synthetic::generate_ground(key, frame) } else { GroundFeatures::default() },
+            ground: if want_ground { synthetic::generate_ground(key, frame, profile) } else { GroundFeatures::default() },
             proj: TileProjector::new(key, frame, 4096.0),
         }),
-        Payload::Bytes(b) => decode_tile(b, key, frame, want_ground),
+        Payload::Bytes(b) => decode_tile(b, key, frame, want_ground, profile),
     }
 }
 
 /// CPU stage: payload -> buildings + projector.
-pub fn tile_buildings_proj(key: TileKey, frame: Frame, payload: &Payload) -> Result<(Vec<Building>, TileProjector), String> {
-    decode_payload(key, frame, payload, false).map(|t| (t.buildings, t.proj))
+pub fn tile_buildings_proj(
+    key: TileKey,
+    frame: Frame,
+    payload: &Payload,
+    profile: &Profile,
+) -> Result<(Vec<Building>, TileProjector), String> {
+    decode_payload(key, frame, payload, false, profile).map(|t| (t.buildings, t.proj))
 }
 
 /// CPU stage: payload -> buildings.
-pub fn tile_buildings(key: TileKey, frame: Frame, payload: &Payload) -> Result<Vec<Building>, String> {
-    tile_buildings_proj(key, frame, payload).map(|(b, _)| b)
+pub fn tile_buildings(key: TileKey, frame: Frame, payload: &Payload, profile: &Profile) -> Result<Vec<Building>, String> {
+    tile_buildings_proj(key, frame, payload, profile).map(|(b, _)| b)
 }
 
 /// CPU stage: payload -> flat per-tile output (building + ground meshes per ring, lights). The
 /// decoded structs are dropped here, on the worker; only flat buffers cross to the main thread.
-pub fn build_tile(key: TileKey, ring: usize, frame: Frame, payload: &Payload) -> Result<TileData, String> {
+pub fn build_tile(key: TileKey, ring: usize, frame: Frame, payload: &Payload, profile: &Profile) -> Result<TileData, String> {
     let t0 = std::time::Instant::now();
-    let want_ground = crate::ground::ground_params(ring).is_some();
-    let DecodedTile { buildings, ground: gf, proj } = decode_payload(key, frame, payload, want_ground)?;
-    let mesh = mesh_tile(&buildings, &proj, ring);
-    let ground = mesh_ground(&gf, &proj, ring);
+    let want_ground = profile.ground_params(ring).is_some();
+    let DecodedTile { buildings, ground: gf, proj } = decode_payload(key, frame, payload, want_ground, profile)?;
+    let mesh = mesh_tile(&buildings, &proj, ring, profile);
+    let ground = mesh_ground(&gf, &proj, ring, profile);
     drop(gf);
-    let lights = if ring >= 2 { LightSet::from_buildings(&buildings) } else { LightSet::default() };
+    let lights = if ring >= 2 { LightSet::from_buildings(&buildings, profile) } else { LightSet::default() };
     let building_count = buildings.len();
-    let max_height = buildings.iter().map(|b| crate::mesher::resolve(b).height).fold(0.0f32, f32::max);
+    let max_height = buildings.iter().map(|b| crate::mesher::resolve(b, profile).height).fold(0.0f32, f32::max);
     drop(buildings);
     Ok(TileData {
         building_count,
@@ -162,12 +177,13 @@ pub struct Worker {
     rx: Receiver<WorkerMsg>,
     fetcher: Option<Arc<Fetcher>>,
     frame: Frame,
+    profile: Arc<Profile>,
     cache_bytes: Arc<AtomicU64>,
 }
 
 impl Worker {
     /// `url` empty = synthetic city (no runtime / fetcher needed).
-    pub fn new(frame: Frame, url: &str, cache_dir: &str) -> Result<Self, String> {
+    pub fn new(frame: Frame, url: &str, cache_dir: &str, profile: Arc<Profile>) -> Result<Self, String> {
         let (tx, rx) = crossbeam_channel::unbounded();
         let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         let pool = rayon::ThreadPoolBuilder::new()
@@ -193,13 +209,17 @@ impl Worker {
                 url,
                 cache_dir,
                 cache_bytes.clone(),
-                Box::new(move |s| {
-                    let _ = info_tx.send(WorkerMsg::Info(s));
+                FetchParams::from_profile(&profile),
+                Box::new(move |n| {
+                    let _ = info_tx.send(match n {
+                        Note::Info(s) => WorkerMsg::Info(s),
+                        Note::Error(s) => WorkerMsg::Error(s),
+                    });
                 }),
             )?;
             (Some(rt), Some(Arc::new(f)))
         };
-        Ok(Self { rt, pool, tx, rx, fetcher, frame, cache_bytes })
+        Ok(Self { rt, pool, tx, rx, fetcher, frame, profile, cache_bytes })
     }
 
     pub fn is_synthetic(&self) -> bool {
@@ -240,8 +260,9 @@ impl Worker {
             Job::Decode { key, ring, job, payload } => {
                 let tx = self.tx.clone();
                 let frame = self.frame;
+                let profile = self.profile.clone();
                 self.pool.spawn(move || {
-                    let result = catch_unwind(AssertUnwindSafe(|| build_tile(key, ring, frame, &payload)))
+                    let result = catch_unwind(AssertUnwindSafe(|| build_tile(key, ring, frame, &payload, &profile)))
                         .unwrap_or_else(|p| Err(format!("decode panic: {}", panic_text(p))));
                     let _ = tx.send(WorkerMsg::Decoded { key, ring, job, result });
                 });

@@ -6,6 +6,7 @@
 
 use godot::prelude::*;
 
+mod convert;
 mod host;
 mod streamer;
 
@@ -55,6 +56,6 @@ mod tests {
             assert!(doc.contains(&format!("`{name}(")), "#[func] {name} is missing from docs/contract.md");
             n += 1;
         }
-        assert_eq!(n, 10, "WorldStreamer #[func] count changed: update docs/contract.md and this test");
+        assert_eq!(n, 12, "WorldStreamer #[func] count changed: update docs/contract.md and this test");
     }
 }

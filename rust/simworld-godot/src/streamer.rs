@@ -18,8 +18,9 @@ use godot::prelude::*;
 use simworld_core::geo::TileKey;
 use simworld_core::mesher::MeshData;
 use simworld_core::rings::RING_COUNT;
-use simworld_core::{World, API_MAJOR, API_MINOR};
+use simworld_core::{ConfigureResult, Log, World, API_MAJOR, API_MINOR};
 
+use crate::convert::{json_to_variant, options_from_dict};
 use crate::host::{diagnostics_from_env, GodotLog};
 use crate::version_string;
 
@@ -85,10 +86,44 @@ fn key_string(k: TileKey) -> GString {
 
 #[godot_api]
 impl WorldStreamer {
-    /// Set world origin and data source. Empty `tile_url` = synthetic city.
+    /// Set world origin and data source with the default world profile. Empty `tile_url` =
+    /// synthetic city. A wrapper over `configure_world` (errors are logged).
     #[func]
     fn configure(&mut self, origin_lat: f64, origin_lon: f64, tile_url: GString, cache_dir: GString) {
         self.world.configure(origin_lat, origin_lon, &tile_url.to_string(), &cache_dir.to_string());
+    }
+
+    /// Set origin, data source, world profile (`profile_path`, `profile_overrides`) and
+    /// diagnostics from one options Dictionary. Returns `{ ok, error, api_version,
+    /// attributions }`; on an error nothing changes.
+    #[func]
+    fn configure_world(&mut self, options: VarDictionary) -> VarDictionary {
+        let r = match options_from_dict(&options, self.world.diagnostics()) {
+            Ok((o, warns)) => {
+                for w in warns {
+                    GodotLog.warn(&format!("WorldStreamer: {w}"));
+                }
+                self.world.configure_world(o)
+            }
+            Err(e) => {
+                GodotLog.error(&format!("WorldStreamer: configure_world failed: {e}"));
+                ConfigureResult { ok: false, error: e, attributions: self.world.attributions().to_vec() }
+            }
+        };
+        let mut d = VarDictionary::new();
+        d.set("ok", r.ok);
+        d.set("error", &GString::from(r.error.as_str()));
+        d.set("api_version", self.api_version());
+        let attributions: PackedStringArray = r.attributions.iter().map(|s| GString::from(s.as_str())).collect();
+        d.set("attributions", &attributions);
+        d
+    }
+
+    /// The resolved world profile (defaults until a `configure_world` with a profile) as a
+    /// Dictionary with the keys of `addons/simworld/profiles/default.json`.
+    #[func]
+    fn world_profile(&self) -> VarDictionary {
+        json_to_variant(&self.world.profile().to_json()).try_to::<VarDictionary>().unwrap_or_default()
     }
 
     /// Call every frame. Recomputes the wanted set and queues jobs.

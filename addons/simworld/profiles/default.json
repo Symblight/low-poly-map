@@ -1,0 +1,175 @@
+{
+  "profile_version": 1,
+  "bands": {
+    "r0_edge_m": 600.0,
+    "r1_edge_m": 2500.0,
+    "r2_edge_m": 7000.0,
+    "r3_edge_m": 25000.0,
+    "hysteresis": 1.15,
+    "look_ahead_s": 20.0,
+    "look_ahead_clamp": 0.5,
+    "default_tile_height_m": 60.0
+  },
+  "buildings": {
+    "r0": {
+      "dp_m": 0.5,
+      "min_area_m2": 0.0
+    },
+    "r1": {
+      "dp_m": 2.0,
+      "min_area_m2": 20.0
+    },
+    "r2": {
+      "dp_m": 4.0,
+      "min_area_m2": 50.0
+    }
+  },
+  "ground": {
+    "r0": {
+      "area_dp_m": 0.5,
+      "min_area_m2": 0.0,
+      "road_dp_m": 0.5,
+      "max_road_class": "other",
+      "minor_paths": true,
+      "lift_step_m": 0.02
+    },
+    "r1": {
+      "area_dp_m": 2.0,
+      "min_area_m2": 200.0,
+      "road_dp_m": 2.0,
+      "max_road_class": "other",
+      "minor_paths": false,
+      "lift_step_m": 0.06
+    },
+    "r2": {
+      "area_dp_m": 6.0,
+      "min_area_m2": 2500.0,
+      "road_dp_m": 5.0,
+      "max_road_class": "residential",
+      "minor_paths": false,
+      "lift_step_m": 0.15
+    },
+    "roads": {
+      "motorway": {
+        "width_m": 14.0,
+        "highways": ["motorway"]
+      },
+      "primary": {
+        "width_m": 10.0,
+        "highways": ["trunk", "primary"]
+      },
+      "secondary": {
+        "width_m": 8.0,
+        "highways": ["secondary"]
+      },
+      "tertiary": {
+        "width_m": 6.0,
+        "highways": ["tertiary"]
+      },
+      "residential": {
+        "width_m": 6.0,
+        "highways": ["residential", "unclassified", "living_street"]
+      },
+      "other_width_m": 3.0,
+      "link_width_factor": 0.6,
+      "link_min_width_m": 3.0,
+      "minor_paths": ["footway", "path", "cycleway", "steps", "bridleway", "track", "corridor", "elevator", "via_ferrata", "escalator"],
+      "lit_values": ["yes", "24/7", "automatic", "sunset-sunrise", "dusk-dawn", "limited", "interval", "night"]
+    },
+    "areas": {
+      "commercial": {
+        "class": "commercial",
+        "level": 4,
+        "kinds": ["commercial", "retail"]
+      },
+      "forest": {
+        "class": "forest",
+        "level": 6,
+        "kinds": ["forest", "wood"]
+      },
+      "grass": {
+        "class": "grass",
+        "level": 5,
+        "kinds": ["park", "garden", "playground", "pitch", "golf_course", "recreation_ground", "grass", "meadow", "grassland", "scrub", "heath", "wetland", "village_green", "cemetery", "allotments", "orchard", "vineyard", "farmland", "plant_nursery", "flowerbed"]
+      },
+      "industrial": {
+        "class": "industrial",
+        "level": 3,
+        "kinds": ["industrial", "railway", "port", "depot", "garages", "quarry", "landfill"]
+      },
+      "nature_reserve": {
+        "class": "grass",
+        "level": 0,
+        "kinds": ["nature_reserve"]
+      },
+      "residential": {
+        "class": "residential",
+        "level": 2,
+        "kinds": ["residential"]
+      },
+      "water": {
+        "class": "water",
+        "level": 7,
+        "kinds": ["water", "riverbank", "reservoir", "basin", "salt_pond"]
+      }
+    },
+    "other_area_level": 1
+  },
+  "lights": {
+    "cluster_on_agl_m": 3300.0,
+    "cluster_off_agl_m": 2700.0,
+    "cluster_cell_m": 100.0,
+    "profiles": {
+      "residential": {
+        "color": [1.0, 0.655, 0.341],
+        "kinds": ["residential", "apartments", "house", "detached", "semidetached_house", "terrace", "dormitory", "bungalow", "cabin", "farm", "hut", "static_caravan", "houseboat", "flats", "hotel"]
+      },
+      "office": {
+        "color": [0.86, 0.9, 1.0],
+        "kinds": ["office", "commercial", "bank"]
+      },
+      "retail": {
+        "color": [1.0, 0.98, 0.95],
+        "kinds": ["retail", "supermarket", "kiosk", "shop", "mall", "store", "department_store", "restaurant"]
+      },
+      "industrial": {
+        "color": [1.0, 0.55, 0.15],
+        "kinds": ["industrial", "warehouse", "factory", "manufacture", "hangar", "storage_tank", "depot", "garage", "garages", "shed", "barn", "farm_auxiliary", "service", "transformer_tower", "boathouse", "greenhouse", "parking"]
+      },
+      "civic": {
+        "color": [1.0, 0.706, 0.42],
+        "kinds": ["church", "cathedral", "chapel", "mosque", "synagogue", "temple", "religious", "monastery", "shrine", "government", "university", "college", "school", "kindergarten", "hospital", "public", "civic", "townhall", "museum", "train_station", "transportation", "stadium", "sports_hall", "fire_station", "library", "theatre", "courthouse", "embassy"]
+      }
+    },
+    "landuse_fallback": {
+      "residential": "residential",
+      "commercial": "office",
+      "retail": "retail",
+      "industrial": "industrial",
+      "civic": "civic",
+      "other": "residential",
+      "none": "residential"
+    }
+  },
+  "streaming": {
+    "max_fetch_per_band": 4,
+    "max_mesh_per_band": 2,
+    "redeliveries_per_frame": 1,
+    "retry_base_s": 0.5,
+    "retry_max_s": 30.0
+  },
+  "fades": {
+    "cap_s": 3.0
+  },
+  "origin": {
+    "recenter_distance_m": 5000.0
+  },
+  "cache": {
+    "cap_mb": 300.0,
+    "connect_timeout_s": 5.0,
+    "request_timeout_s": 20.0,
+    "open_retry_s": 1.5,
+    "validate_retry_s": 30.0
+  }
+}
+

@@ -16,16 +16,16 @@
 //! * COLOR (contract): `r` = class / 16, `g` = lit (roads with lit=yes), `b` = road class / 8,
 //!   `a` = 1. NORMAL = +Y. No UV. Triangles are clockwise seen from above (Godot front face).
 //!
-//! Coarser bands are simplified more (`ground_params`): bigger DP tolerances, small areas
-//! dropped, minor paths dropped at R1, all "other" roads dropped at R2. R3 has no ground.
+//! Coarser bands are simplified more (world profile `ground.r0..r2`, `Profile::ground_params`):
+//! bigger DP tolerances, small areas dropped, minor paths dropped at R1, all "other" roads
+//! dropped at R2. R3 has no ground. Road widths and the kind -> class tables also come from the
+//! profile (`ground.roads`, `ground.areas`).
 
 use crate::mesher::{clip_ring, simplify_ring, ClipRect, MeshData};
-use crate::mvt::{
-    ring_area2, GroundFeatures, RoadLine, TileProjector, GROUND_ROAD, ROAD_MOTORWAY, ROAD_OTHER, ROAD_PRIMARY,
-    ROAD_RESIDENTIAL, ROAD_SECONDARY, ROAD_TERTIARY,
-};
+use crate::mvt::{ring_area2, GroundFeatures, RoadLine, TileProjector, GROUND_ROAD, ROAD_MOTORWAY, ROAD_OTHER};
+use crate::profile::Profile;
 
-/// Per-band ground meshing parameters.
+/// Per-band ground meshing parameters (world profile `ground.r0..r2`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GroundParams {
     /// DP tolerance for area outlines (m).
@@ -40,51 +40,6 @@ pub struct GroundParams {
     pub minor_paths: bool,
     /// Vertical lift per stacking level (m).
     pub step_m: f32,
-}
-
-pub const R0_GROUND: GroundParams =
-    GroundParams { area_dp_m: 0.5, min_area_m2: 0.0, road_dp_m: 0.5, max_road_class: ROAD_OTHER, minor_paths: true, step_m: 0.02 };
-pub const R1_GROUND: GroundParams = GroundParams {
-    area_dp_m: 2.0,
-    min_area_m2: 200.0,
-    road_dp_m: 2.0,
-    max_road_class: ROAD_OTHER,
-    minor_paths: false,
-    step_m: 0.06,
-};
-pub const R2_GROUND: GroundParams = GroundParams {
-    area_dp_m: 6.0,
-    min_area_m2: 2500.0,
-    road_dp_m: 5.0,
-    max_road_class: ROAD_RESIDENTIAL,
-    minor_paths: false,
-    step_m: 0.15,
-};
-
-/// Ground parameters per ring; `None` for R3 (no ground).
-pub fn ground_params(ring: usize) -> Option<GroundParams> {
-    match ring {
-        0 => Some(R0_GROUND),
-        1 => Some(R1_GROUND),
-        2 => Some(R2_GROUND),
-        _ => None,
-    }
-}
-
-/// Full strip width (m) per road class; `_link` roads get 60 % of it (0.1 m steps), at least 3 m.
-pub fn road_width_m(class: u8, link: bool) -> f64 {
-    let w = match class {
-        ROAD_MOTORWAY => 14.0,
-        ROAD_PRIMARY => 10.0,
-        ROAD_SECONDARY => 8.0,
-        ROAD_TERTIARY | ROAD_RESIDENTIAL => 6.0,
-        _ => 3.0,
-    };
-    if link {
-        ((w * 6.0f64).round() / 10.0).max(3.0)
-    } else {
-        w
-    }
 }
 
 /// Stacking level of a road strip: above every area level (0..7), major roads on top.
@@ -121,8 +76,8 @@ struct Scratch {
 }
 
 /// Mesh a tile's ground features for `ring` into one merged buffer (empty for R3).
-pub fn mesh_ground(g: &GroundFeatures, proj: &TileProjector, ring: usize) -> MeshData {
-    let Some(p) = ground_params(ring) else { return MeshData::default() };
+pub fn mesh_ground(g: &GroundFeatures, proj: &TileProjector, ring: usize, profile: &Profile) -> MeshData {
+    let Some(p) = profile.ground_params(ring) else { return MeshData::default() };
     let mut m = MeshData::default();
     let mut s = Scratch::default();
     let rect = ClipRect::tile(proj.extent());
@@ -145,7 +100,8 @@ pub fn mesh_ground(g: &GroundFeatures, proj: &TileProjector, ring: usize) -> Mes
         if r.class > p.max_road_class || (r.minor && !p.minor_paths) {
             continue;
         }
-        emit_road(&mut m, &mut s, r, proj, &rect, p.road_dp_m / m_per_px, road_level(r.class) as f32 * p.step_m);
+        let hw = profile.road_width_m(r.class, r.link) * 0.5;
+        emit_road(&mut m, &mut s, r, proj, &rect, p.road_dp_m / m_per_px, road_level(r.class) as f32 * p.step_m, hw);
     }
     m.positions.shrink_to_fit();
     m.normals.shrink_to_fit();
@@ -303,8 +259,9 @@ fn clip_segment(a: [f64; 2], b: [f64; 2], r: &ClipRect) -> Option<(f64, f64)> {
     (t1 > t0).then_some((t0, t1))
 }
 
-fn emit_road(m: &mut MeshData, s: &mut Scratch, r: &RoadLine, proj: &TileProjector, rect: &ClipRect, tol_px: f64, lift: f32) {
-    let hw = road_width_m(r.class, r.link) * 0.5;
+/// One road feature as strips of half-width `hw` (m).
+#[allow(clippy::too_many_arguments)]
+fn emit_road(m: &mut MeshData, s: &mut Scratch, r: &RoadLine, proj: &TileProjector, rect: &ClipRect, tol_px: f64, lift: f32, hw: f64) {
     let color = road_color(r.class, r.lit);
     for line in &r.lines {
         // Split into runs inside the tile.
@@ -426,7 +383,11 @@ pub(crate) fn strip(m: &mut MeshData, pts: &[[f64; 2]], hs: &[f64], hw: f64, col
 mod tests {
     use super::*;
     use crate::geo::{tile_for, Frame};
-    use crate::mvt::{GroundArea, GROUND_GRASS, GROUND_WATER};
+    use crate::mvt::{GroundArea, GROUND_GRASS, GROUND_WATER, ROAD_PRIMARY, ROAD_RESIDENTIAL, ROAD_SECONDARY, ROAD_TERTIARY};
+
+    fn dp() -> Profile {
+        Profile::default()
+    }
 
     const VILNIUS: (f64, f64) = (54.6872, 25.2797);
 
@@ -471,7 +432,7 @@ mod tests {
     fn triangulation_respects_holes() {
         let p = proj();
         let mpp = p.m_per_px();
-        let m = mesh_ground(&water_with_island(), &p, 0);
+        let m = mesh_ground(&water_with_island(), &p, 0, &dp());
         assert!(!m.is_empty() && all_up(&m));
         let expect = (2000.0f64.powi(2) - 1000.0f64.powi(2)) * mpp * mpp;
         assert!((area_m2(&m) - expect).abs() / expect < 0.01, "{} vs {expect}", area_m2(&m));
@@ -486,9 +447,9 @@ mod tests {
         assert!(!hit);
         // Water color + level lift.
         assert!(m.colors.iter().all(|c| *c == [2.0 / 16.0, 0.0, 0.0, 1.0]));
-        assert!(m.positions.iter().all(|v| (v[1] - 7.0 * R0_GROUND.step_m).abs() < 1e-6));
+        assert!(m.positions.iter().all(|v| (v[1] - 7.0 * dp().ground_params(0).unwrap().step_m).abs() < 1e-6));
         // R3: nothing.
-        assert!(mesh_ground(&water_with_island(), &p, 3).is_empty());
+        assert!(mesh_ground(&water_with_island(), &p, 3, &dp()).is_empty());
     }
 
     #[test]
@@ -498,7 +459,7 @@ mod tests {
             areas: vec![GroundArea { class: GROUND_GRASS, level: 5, id: 2, rings: vec![sq(-1000.0, -1000.0, 6000.0)] }],
             roads: vec![],
         };
-        let m = mesh_ground(&g, &p, 0);
+        let m = mesh_ground(&g, &p, 0, &dp());
         let w = p.m_per_px() * 4096.0;
         assert!((area_m2(&m) - w * w).abs() / (w * w) < 0.01);
         let h = w / 2.0 + 0.5;
@@ -523,10 +484,10 @@ mod tests {
             (ROAD_PRIMARY, true, 6.0),
             (ROAD_RESIDENTIAL, true, 3.6),
         ] {
-            assert_eq!(road_width_m(class, link), w);
+            assert_eq!(dp().road_width_m(class, link), w);
             // Straight east-west road through the whole tile (clipped at both edges).
             let g = GroundFeatures { areas: vec![], roads: vec![road(class, link, false, vec![[-200.0, 2048.0], [4300.0, 2048.0]])] };
-            let m = mesh_ground(&g, &p, 0);
+            let m = mesh_ground(&g, &p, 0, &dp());
             assert!(all_up(&m));
             let zs: Vec<f32> = m.positions.iter().map(|v| v[2]).collect();
             let span = zs.iter().cloned().fold(f32::MIN, f32::max) - zs.iter().cloned().fold(f32::MAX, f32::min);
@@ -567,7 +528,9 @@ mod tests {
             assert_eq!(road_color(rc, false)[2] * 8.0, rc as f32);
         }
         // Classification tables.
-        use crate::mvt::{ground_area_class, is_lit, road_class};
+        let d = dp();
+        let (ground_area_class, road_class, is_lit) =
+            (|k: &str| d.ground_area_class(k), |h: &str| d.road_class(h), |v: &str| d.is_lit(v));
         assert_eq!(ground_area_class("park"), (GROUND_GRASS, 5));
         assert_eq!(ground_area_class("riverbank"), (GROUND_WATER, 7));
         assert_eq!(ground_area_class("wood").0, crate::mvt::GROUND_FOREST);
@@ -592,7 +555,7 @@ mod tests {
             areas: vec![GroundArea { class: GROUND_GRASS, level: 5, id: 3, rings: vec![sq(10.0, 10.0, 50.0)] }],
             roads: vec![minor, road(ROAD_OTHER, false, false, vec![[100.0, 900.0], [3000.0, 900.0]])],
         };
-        let t = |r| mesh_ground(&g, &p, r).triangle_count();
+        let t = |r| mesh_ground(&g, &p, r, &dp()).triangle_count();
         assert!(t(0) > t(1) && t(1) > t(2));
         assert_eq!(t(2), 0);
     }
@@ -602,7 +565,7 @@ mod tests {
         let p = proj();
         let mut g = water_with_island();
         g.roads.push(road(ROAD_SECONDARY, false, true, vec![[0.0, 0.0], [1200.0, 3000.0], [4096.0, 3500.0]]));
-        assert_eq!(mesh_ground(&g, &p, 0), mesh_ground(&g, &p, 0));
-        assert_eq!(mesh_ground(&g, &p, 1), mesh_ground(&g, &p, 1));
+        assert_eq!(mesh_ground(&g, &p, 0, &dp()), mesh_ground(&g, &p, 0, &dp()));
+        assert_eq!(mesh_ground(&g, &p, 1, &dp()), mesh_ground(&g, &p, 1, &dp()));
     }
 }

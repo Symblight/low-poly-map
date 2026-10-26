@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use crate::fetch::{Fetcher, Source};
 use crate::geo::{Frame, TileKey};
+use crate::profile::Profile;
 use crate::worker::{build_tile, tile_buildings, Payload};
 
 fn url() -> Option<String> {
@@ -28,7 +29,7 @@ fn fetch_decode_reference_tiles_and_cache_offline() {
 
     let mk = |u: &str| {
         let _g = rt.enter();
-        Fetcher::new(u, cache.to_str().unwrap(), Arc::new(AtomicU64::new(0)), Box::new(|s| eprintln!("info: {s}")))
+        Fetcher::new(u, cache.to_str().unwrap(), Arc::new(AtomicU64::new(0)), crate::fetch::FetchParams::default(), Box::new(|s| eprintln!("note: {s:?}")))
             .unwrap()
     };
     let f = mk(&url);
@@ -38,10 +39,10 @@ fn fetch_decode_reference_tiles_and_cache_offline() {
         let t_fetch = t0.elapsed();
         let t1 = Instant::now();
         let ring = crate::rings::ring_for_zoom(k.z).unwrap();
-        let data = build_tile(k, ring, frame, &Payload::Bytes(bytes.clone())).unwrap();
-        let lights = crate::lights::LightSet::from_buildings(&tile_buildings(k, frame, &Payload::Bytes(bytes.clone())).unwrap());
+        let data = build_tile(k, ring, frame, &Payload::Bytes(bytes.clone()), &Profile::default()).unwrap();
+        let lights = crate::lights::LightSet::from_buildings(&tile_buildings(k, frame, &Payload::Bytes(bytes.clone()), &Profile::default()).unwrap(), &Profile::default());
         let t_decode = t1.elapsed();
-        let buildings = tile_buildings(k, frame, &Payload::Bytes(bytes.clone())).unwrap();
+        let buildings = tile_buildings(k, frame, &Payload::Bytes(bytes.clone()), &Profile::default()).unwrap();
         let owned = buildings.iter().filter(|b| b.owned).count();
         eprintln!(
             "{k}: {} bytes from {src:?} in {t_fetch:?}; decode {:?}: {} features, {} owned, {} lights",
@@ -80,7 +81,7 @@ fn bench_update_camera_cost() {
     use crate::worker::{Job, WorkerMsg};
     let frame = Frame::new(54.6872, 25.2797);
     for (name, vel) in [("250 m/s @300 m", [250.0, 0.0, 0.0]), ("climb 60 m/s", [0.0, 0.0, 60.0])] {
-        let mut s = Scheduler::new(frame, false);
+        let mut s = Scheduler::new(frame, false, Arc::new(Profile::default()));
         let mut jobs = Vec::new();
         let mut times = Vec::new();
         let t_start = Instant::now();
@@ -102,7 +103,7 @@ fn bench_update_camera_cost() {
                         );
                     }
                     Job::Decode { key, ring, job, payload } => {
-                        let result = build_tile(key, ring, frame, &payload);
+                        let result = build_tile(key, ring, frame, &payload, &Profile::default());
                         let _ = s.handle(WorkerMsg::Decoded { key, ring, job, result }, t_start);
                     }
                 }
@@ -144,8 +145,8 @@ fn m4_budget() {
     };
     let cache = std::env::temp_dir().join("simplane-m4-budget-cache");
     let frame = Frame::new(54.6872, 25.2797);
-    let worker = Worker::new(frame, &url, cache.to_str().unwrap()).unwrap();
-    let mut s = Scheduler::new(frame, false);
+    let worker = Worker::new(frame, &url, cache.to_str().unwrap(), Arc::new(Profile::default())).unwrap();
+    let mut s = Scheduler::new(frame, false, Arc::new(Profile::default()));
     let mut g = GodotSim::default();
     let sequential = std::env::var("SIMPLANE_BUDGET_SEQ").is_ok_and(|v| v == "1");
     eprintln!("mode: {}", if sequential { "sequential climb (hysteresis carries over)" } else { "fresh cover per altitude" });
@@ -166,7 +167,7 @@ fn m4_budget() {
         let t0 = Instant::now();
         if !sequential {
             // Stale worker replies are ignored by job id.
-            s = Scheduler::new(frame, false);
+            s = Scheduler::new(frame, false, Arc::new(Profile::default()));
             g = GodotSim::default();
         }
         loop {

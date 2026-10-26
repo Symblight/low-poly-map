@@ -47,7 +47,7 @@ fn on_island(lx: u64, ly: u64) -> bool {
 
 /// Synthetic ground features (pixel space) for a tile; deterministic and seamless across
 /// zooms (global lot grid, like the buildings).
-pub fn generate_ground(key: TileKey, frame: Frame) -> GroundFeatures {
+pub fn generate_ground(key: TileKey, frame: Frame, profile: &crate::profile::Profile) -> GroundFeatures {
     let mut g = GroundFeatures::default();
     if key.z > LOT_ZOOM {
         return g;
@@ -83,7 +83,7 @@ pub fn generate_ground(key: TileKey, frame: Frame) -> GroundFeatures {
             } else {
                 GROUND_RESIDENTIAL
             };
-            let level = crate::mvt::ground_area_class(match class {
+            let level = profile.ground_area_class(match class {
                 GROUND_GRASS => "park",
                 GROUND_WATER => "water",
                 GROUND_INDUSTRIAL => "industrial",
@@ -242,13 +242,14 @@ mod tests {
         let c16 = f.tile_center(k16);
         let c13 = f.tile_center(k13);
         let rect = f.tile_rect(k16);
+        let dp = crate::profile::Profile::default();
         let mut matched = 0;
         for b in &z13 {
             let e = b.centroid[0] as f64 + c13[0];
             let n = b.centroid[1] as f64 + c13[1];
             if e > rect.min_e + 1.0 && e < rect.max_e - 1.0 && n > rect.min_n + 1.0 && n < rect.max_n - 1.0 {
                 let twin = z16.iter().find(|x| x.id == b.id).expect("twin at z16");
-                assert_eq!(crate::mesher::resolve(twin), crate::mesher::resolve(b));
+                assert_eq!(crate::mesher::resolve(twin, &dp), crate::mesher::resolve(b, &dp));
                 assert!((twin.centroid[0] as f64 + c16[0] - e).abs() < 0.5);
                 matched += 1;
             }
@@ -261,18 +262,18 @@ mod tests {
     fn ground_is_deterministic_with_streets_districts_and_lakes() {
         let f = Frame::new(VILNIUS.0, VILNIUS.1);
         let k16 = tile_for(VILNIUS.0, VILNIUS.1, 16);
-        let g = generate_ground(k16, f);
-        assert_eq!(g, generate_ground(k16, f));
+        let g = generate_ground(k16, f, &crate::profile::Profile::default());
+        assert_eq!(g, generate_ground(k16, f, &crate::profile::Profile::default()));
         assert_eq!(g.areas.len(), 1, "a z16 tile is a quarter district");
         assert_eq!(g.roads.len(), 4, "streets every 4th of 8 lot lines, two axes");
         let k13 = tile_for(VILNIUS.0, VILNIUS.1, 13);
-        let g13 = generate_ground(k13, f);
+        let g13 = generate_ground(k13, f, &crate::profile::Profile::default());
         assert_eq!(g13.areas.len(), 16);
         assert_eq!(g13.roads.len(), 32);
         // Somewhere near Vilnius there is a lake with an island hole.
         let lake = (0..64u32)
             .flat_map(|i| (0..64u32).map(move |j| TileKey::new(13, k13.x - 32 + i, k13.y - 32 + j)))
-            .flat_map(|k| generate_ground(k, f).areas)
+            .flat_map(|k| generate_ground(k, f, &crate::profile::Profile::default()).areas)
             .find(|a| a.class == GROUND_WATER)
             .expect("a lake");
         assert_eq!(lake.rings.len(), 2);

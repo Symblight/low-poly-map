@@ -1,12 +1,72 @@
-//! simworld-cli: headless runner for the SimWorld core (placeholder).
+//! simworld-cli: headless runner for the SimWorld core.
 //!
-//! Real commands (fly scripts, cache bake, tile dumps, benches) arrive in phase P6 of
-//! docs/spec-library-packaging.md. For now this only proves the core links without Godot.
+//! Commands today (P3):
+//! * `validate-profile <file>`: parse and validate a world profile JSON through the core
+//!   (`simworld_core::profile`); prints `OK` (exit 0) or the error (exit 1). Warnings (unknown
+//!   keys of a newer `profile_version`) go to stderr. This is the core's own parser and range
+//!   check, not a generic JSON Schema validator.
+//! * `default-profile`: print the compiled-in default world profile as JSON (the source of
+//!   `addons/simworld/profiles/default.json`).
+//!
+//! Fly scripts, cache bake, tile dumps and benches arrive in phase P6 of
+//! docs/spec-library-packaging.md.
 
-fn main() {
-    println!(
-        "simworld-cli {} (simworld-core {}): no commands yet (planned in P6: fly, bake, dump, bench)",
+use std::process::ExitCode;
+
+use simworld_core::{Log, Profile};
+
+/// Log sink for the CLI: everything to stderr.
+struct StderrLog;
+
+impl Log for StderrLog {
+    fn info(&self, msg: &str) {
+        eprintln!("info: {msg}");
+    }
+    fn warn(&self, msg: &str) {
+        eprintln!("warning: {msg}");
+    }
+    fn error(&self, msg: &str) {
+        eprintln!("error: {msg}");
+    }
+}
+
+fn usage() -> String {
+    format!(
+        "simworld-cli {} (simworld-core {}, world profile version {})\n\
+         usage:\n  simworld-cli validate-profile <file.json>   check a world profile (exit 0 = OK)\n  \
+         simworld-cli default-profile                print the default world profile\n\
+         planned (P6): fly, bake, tile, bench",
         env!("CARGO_PKG_VERSION"),
-        simworld_core::VERSION
-    );
+        simworld_core::VERSION,
+        simworld_core::PROFILE_VERSION
+    )
+}
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+        ["validate-profile", path] => match simworld_core::profile::load_file(path, None, &StderrLog) {
+            Ok(_) => {
+                println!("OK");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                println!("{e}");
+                ExitCode::FAILURE
+            }
+        },
+        ["default-profile"] => {
+            let json = serde_json::to_string_pretty(Profile::default().world()).unwrap_or_default();
+            println!("{json}");
+            ExitCode::SUCCESS
+        }
+        ["--version"] | ["-V"] => {
+            println!("{}", usage().lines().next().unwrap_or_default());
+            ExitCode::SUCCESS
+        }
+        _ => {
+            eprintln!("{}", usage());
+            ExitCode::FAILURE
+        }
+    }
 }

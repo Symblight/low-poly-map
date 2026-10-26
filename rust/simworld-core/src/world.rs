@@ -18,17 +18,52 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::diag::{thread_cpu_us, Diagnostics, Log, WarnLimiter};
-use crate::geo::{Frame, LocalSpace, TileKey};
+use crate::geo::{Frame, LocalSpace, TileKey, MERCATOR_MAX_LAT};
 use crate::mesher::MeshData;
+use crate::profile::Profile;
 use crate::rings::RING_COUNT;
 use crate::scheduler::Scheduler;
 use crate::worker::{Job, Worker, WorkerMsg};
 
-/// Re-center the floating origin when the camera is farther than this from it (m, horizontal).
-pub const RECENTER_DISTANCE_M: f64 = 5000.0;
-/// At most this many light-mode re-deliveries per frame (`update_camera` starts a frame; a host
-/// may call `pop_ready` several times per frame).
-const REDELIVERIES_PER_FRAME: usize = 1;
+// Tuning from the world profile: `origin.recenter_distance_m` (re-center the floating origin
+// when the camera is farther than this from it, horizontal) and `streaming.redeliveries_per_frame`
+// (light-mode re-deliveries per frame; `update_camera` starts a frame, a host may call
+// `pop_ready` several times per frame).
+
+/// Attribution required whenever OSM-derived map data is shown.
+pub const OSM_ATTRIBUTION: &str = "\u{a9} OpenStreetMap contributors";
+
+/// Options of [`World::configure_world`] (contract `configure_world(options)`; the host
+/// converts its own option format into this).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WorldOptions {
+    /// World origin (WGS84 degrees).
+    pub origin_lat: f64,
+    pub origin_lon: f64,
+    /// `http(s)://` URL of a `.pmtiles` archive; empty = the offline synthetic city.
+    pub tile_url: String,
+    /// Disk cache folder; empty = no disk cache.
+    pub cache_dir: String,
+    /// World profile file read from disk (Rust hosts, CLI). Ignored when `profile_json` is set.
+    pub profile_path: Option<String>,
+    /// World profile as JSON text: (label for messages, e.g. the path; text). Hosts with their
+    /// own virtual file system (Godot `res://`) read the file and pass it here.
+    pub profile_json: Option<(String, String)>,
+    /// Partial profile merged onto the file (or the defaults).
+    pub profile_overrides: Option<serde_json::Value>,
+    /// Replaces the diagnostics switches when set.
+    pub diagnostics: Option<Diagnostics>,
+}
+
+/// Result of [`World::configure_world`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ConfigureResult {
+    pub ok: bool,
+    /// Why it failed (empty when `ok`).
+    pub error: String,
+    /// Attribution strings the host must show while map data is visible.
+    pub attributions: Vec<String>,
+}
 
 /// One finished tile, borrowed for the duration of the `pop_ready` callback.
 pub struct ReadyTileView<'a> {
@@ -63,6 +98,9 @@ pub struct WorldStats {
 pub struct World {
     log: Arc<dyn Log>,
     diag: Diagnostics,
+    /// Resolved world profile of the current configuration (defaults before `configure`).
+    profile: Arc<Profile>,
+    attributions: Vec<String>,
     /// Host-supplied version label (shown in the `configure` log line).
     version: String,
 
@@ -93,6 +131,8 @@ impl World {
         Self {
             log,
             diag: diagnostics,
+            profile: Arc::new(Profile::default()),
+            attributions: Vec::new(),
             version: version.into(),
             origin_lat: 0.0,
             origin_lon: 0.0,
@@ -118,6 +158,16 @@ impl World {
         &self.diag
     }
 
+    /// The resolved world profile (the defaults until a `configure_world` with a profile).
+    pub fn profile(&self) -> &Arc<Profile> {
+        &self.profile
+    }
+
+    /// Attribution strings for the current data source (empty for the synthetic city).
+    pub fn attributions(&self) -> &[String] {
+        &self.attributions
+    }
+
     fn warn(&mut self, msg: &str) {
         self.warn_limiter.warn(&*self.log, self.diag.warnings_per_second, msg);
     }
@@ -131,6 +181,7 @@ impl World {
             let Some(msg) = worker.try_recv() else { break };
             match msg {
                 WorkerMsg::Info(s) => self.log.info(&format!("WorldStreamer: {s}")),
+                WorkerMsg::Error(s) => self.log.error(&format!("WorldStreamer: {s}")),
                 m => warns.extend(sched.handle(m, now)),
             }
         }
@@ -149,9 +200,67 @@ impl World {
         }
     }
 
-    /// Set world origin and data source. Empty `tile_url` = synthetic city. Re-configuring
-    /// drops the old workers; tiles delivered before are reported by the next `drain_unload`.
+    /// Set world origin and data source with the default profile (contract `configure`): a
+    /// wrapper over [`World::configure_world`]. Errors are logged.
     pub fn configure(&mut self, origin_lat: f64, origin_lon: f64, tile_url: &str, cache_dir: &str) {
+        self.configure_world(WorldOptions {
+            origin_lat,
+            origin_lon,
+            tile_url: tile_url.to_string(),
+            cache_dir: cache_dir.to_string(),
+            ..WorldOptions::default()
+        });
+    }
+
+    /// Check options and resolve the profile without touching the running world.
+    fn prepare(&self, o: &WorldOptions) -> Result<Profile, String> {
+        if !(o.origin_lat.is_finite() && o.origin_lat.abs() <= MERCATOR_MAX_LAT) {
+            return Err(format!("origin_lat = {} is out of range [-{MERCATOR_MAX_LAT:.4}, {MERCATOR_MAX_LAT:.4}]", o.origin_lat));
+        }
+        if !(o.origin_lon.is_finite() && o.origin_lon.abs() <= 180.0) {
+            return Err(format!("origin_lon = {} is out of range [-180, 180]", o.origin_lon));
+        }
+        let url = o.tile_url.trim();
+        let lower = url.to_ascii_lowercase();
+        if !url.is_empty() && !(lower.starts_with("http://") || lower.starts_with("https://")) {
+            return Err(format!("tile_url `{url}` must be an http:// or https:// URL of a .pmtiles archive (or empty for the synthetic city)"));
+        }
+        if let Some(d) = &o.diagnostics {
+            if d.warnings_per_second == 0 {
+                return Err("diagnostics.warnings_per_second = 0 is out of range [1, 1000]".into());
+            }
+        }
+        let file_text;
+        let file = match (&o.profile_json, &o.profile_path) {
+            (Some((label, text)), _) => Some((label.as_str(), text.as_str())),
+            (None, Some(path)) if !path.is_empty() => {
+                file_text = std::fs::read_to_string(path).map_err(|e| format!("profile_path {path}: {e}"))?;
+                Some((path.as_str(), file_text.as_str()))
+            }
+            _ => None,
+        };
+        crate::profile::resolve(file, o.profile_overrides.as_ref(), &*self.log)
+    }
+
+    /// Set world origin, data source, world profile and diagnostics (contract
+    /// `configure_world`). Everything is validated first: on an error nothing changes (the
+    /// previous configuration keeps running) and the error is returned and logged. On success
+    /// the old workers are dropped and tiles delivered before are reported by the next
+    /// `drain_unload` (teleport); the disk cache is kept.
+    pub fn configure_world(&mut self, o: WorldOptions) -> ConfigureResult {
+        let profile = match self.prepare(&o) {
+            Ok(p) => p,
+            Err(e) => {
+                self.log.error(&format!("WorldStreamer: configure_world failed: {e}"));
+                return ConfigureResult { ok: false, error: e, attributions: self.attributions.clone() };
+            }
+        };
+        let custom = profile != Profile::default();
+        self.profile = Arc::new(profile);
+        if let Some(d) = o.diagnostics.clone() {
+            self.diag = d;
+        }
+        let (origin_lat, origin_lon, cache_dir) = (o.origin_lat, o.origin_lon, o.cache_dir.as_str());
         // The host keeps whatever we handed out before: unload it with the next drain_unload.
         if let Some(s) = &self.scheduler {
             self.stale_unloads.extend(s.delivered_keys());
@@ -166,14 +275,17 @@ impl World {
         self.local = LocalSpace::default();
         self.pending_shift = [0.0; 3];
 
-        let url = tile_url.trim().to_string();
-        match Worker::new(frame, &url, cache_dir) {
+        let url = o.tile_url.trim().to_string();
+        self.attributions = if url.is_empty() { Vec::new() } else { vec![OSM_ATTRIBUTION.to_string()] };
+        let mut error = String::new();
+        match Worker::new(frame, &url, cache_dir, self.profile.clone()) {
             Ok(w) => {
-                self.scheduler = Some(Scheduler::new(frame, w.is_synthetic()));
+                self.scheduler = Some(Scheduler::new(frame, w.is_synthetic(), self.profile.clone()));
                 self.worker = Some(w);
             }
             Err(e) => {
-                self.log.error(&format!("WorldStreamer: cannot start workers: {e}"));
+                error = format!("cannot start workers: {e}");
+                self.log.error(&format!("WorldStreamer: {error}"));
             }
         }
         let source = if url.is_empty() { "synthetic city".to_string() } else { url };
@@ -181,6 +293,23 @@ impl World {
             "WorldStreamer configured origin=({:.6}, {:.6}) source={} cache_dir={} [{}]",
             origin_lat, origin_lon, source, cache_dir, self.version
         ));
+        if custom || o.profile_json.is_some() || o.profile_path.is_some() {
+            let label = match (&o.profile_json, &o.profile_path) {
+                (Some((l, _)), _) => l.clone(),
+                (None, Some(p)) => p.clone(),
+                _ => "defaults".to_string(),
+            };
+            let ov = if o.profile_overrides.as_ref().is_some_and(|v| v.as_object().is_none_or(|m| !m.is_empty())) {
+                " + profile_overrides"
+            } else {
+                ""
+            };
+            self.log.info(&format!(
+                "WorldStreamer world profile: {label}{ov}{}",
+                if custom { "" } else { " (equal to the defaults)" }
+            ));
+        }
+        ConfigureResult { ok: error.is_empty(), error, attributions: self.attributions.clone() }
     }
 
     /// Call every frame. `local_pos` and `velocity` are in the local frame (x east, y up,
@@ -204,7 +333,7 @@ impl World {
         let vel = [velocity[0], -velocity[2], velocity[1]];
 
         // Floating origin: translate (never rotate) the local frame onto the camera.
-        if x.hypot(z) > RECENTER_DISTANCE_M {
+        if x.hypot(z) > self.profile.origin.recenter_distance_m {
             self.local.offset_e += x;
             self.local.offset_n -= z;
             self.pending_shift[0] += x;
@@ -241,11 +370,12 @@ impl World {
         let t_drained = Instant::now();
         let mut tris = 0usize;
         let local = self.local;
+        let per_frame = self.profile.streaming.redeliveries_per_frame as usize;
         let Some(sched) = self.scheduler.as_mut() else { return 0 };
         let mut n = 0;
         while n < max {
             // Light-mode re-deliveries are rate-limited per frame, not per call.
-            let Some(t) = sched.pop_ready(self.redelivered_this_frame < REDELIVERIES_PER_FRAME) else { break };
+            let Some(t) = sched.pop_ready(self.redelivered_this_frame < per_frame) else { break };
             n += 1;
             if t.redelivery {
                 self.redelivered_this_frame += 1;

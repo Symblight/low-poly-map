@@ -19,6 +19,7 @@
 //! the front (Godot's front-face winding), i.e. `(c - a) x (b - a)` points along the normal.
 
 use crate::mvt::{ring_area2, Building, Landuse, TileProjector};
+use crate::profile::Profile;
 
 /// Merged mesh in `Mesh.ARRAY_MAX` order (VERTEX, NORMAL, COLOR, TEX_UV, INDEX), positions
 /// relative to the tile origin (tile center, y = 0).
@@ -54,7 +55,7 @@ impl MeshData {
     }
 }
 
-/// Per-ring meshing parameters.
+/// Per-ring meshing parameters (world profile `buildings.r0..r2`; `Profile::lod`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LodParams {
     /// Douglas–Peucker tolerance (m).
@@ -62,11 +63,6 @@ pub struct LodParams {
     /// Drop buildings whose (unclipped) footprint is smaller than this (m²).
     pub min_area_m2: f64,
 }
-
-pub const R0_PARAMS: LodParams = LodParams { dp_m: 0.5, min_area_m2: 0.0 };
-pub const R1_PARAMS: LodParams = LodParams { dp_m: 2.0, min_area_m2: 20.0 };
-/// R2 (z14, 2.5–7 km): merged blocks seen from far away; small sheds vanish.
-pub const R2_PARAMS: LodParams = LodParams { dp_m: 4.0, min_area_m2: 50.0 };
 
 // ---------------------------------------------------------------------------------------------
 // Attributes: profile + heights
@@ -81,37 +77,8 @@ pub const PROFILE_UNKNOWN: u8 = 5;
 pub const FLOOR_H_DEFAULT: f32 = 3.0;
 pub const MAX_HEIGHT_M: f32 = 400.0;
 
-/// Profile from the OSM `building` value (`None` = unknown, resolve via landuse).
-pub fn profile_for_kind(kind: &str) -> Option<u8> {
-    Some(match kind {
-        "residential" | "apartments" | "house" | "detached" | "semidetached_house" | "terrace"
-        | "dormitory" | "bungalow" | "cabin" | "farm" | "hut" | "static_caravan" | "houseboat"
-        | "flats" | "hotel" => PROFILE_RESIDENTIAL,
-        "office" | "commercial" | "bank" => PROFILE_OFFICE,
-        "retail" | "supermarket" | "kiosk" | "shop" | "mall" | "store" | "department_store"
-        | "restaurant" => PROFILE_RETAIL,
-        "industrial" | "warehouse" | "factory" | "manufacture" | "hangar" | "storage_tank"
-        | "depot" | "garage" | "garages" | "shed" | "barn" | "farm_auxiliary" | "service"
-        | "transformer_tower" | "boathouse" | "greenhouse" | "parking" => PROFILE_INDUSTRIAL,
-        "church" | "cathedral" | "chapel" | "mosque" | "synagogue" | "temple" | "religious"
-        | "monastery" | "shrine" | "government" | "university" | "college" | "school"
-        | "kindergarten" | "hospital" | "public" | "civic" | "townhall" | "museum"
-        | "train_station" | "transportation" | "stadium" | "sports_hall" | "fire_station"
-        | "library" | "theatre" | "courthouse" | "embassy" => PROFILE_CIVIC,
-        _ => return None,
-    })
-}
-
-pub fn landuse_profile(l: Option<Landuse>) -> u8 {
-    match l {
-        Some(Landuse::Commercial) => PROFILE_OFFICE,
-        Some(Landuse::Retail) => PROFILE_RETAIL,
-        Some(Landuse::Industrial) => PROFILE_INDUSTRIAL,
-        Some(Landuse::Civic) => PROFILE_CIVIC,
-        // Unknown with no (or an unmapped) landuse -> residential, per the design doc table.
-        Some(Landuse::Residential) | Some(Landuse::Other) | None => PROFILE_RESIDENTIAL,
-    }
-}
+// Kind -> profile and the landuse fallback come from the world profile (`lights.profiles.*.kinds`,
+// `lights.landuse_fallback`; `Profile::profile_for_kind` / `Profile::landuse_profile`).
 
 /// Fallback level count when neither `height` nor `levels` is tagged.
 pub fn fallback_levels(kind: &str, l: Option<Landuse>) -> f32 {
@@ -145,8 +112,8 @@ pub struct Resolved {
     pub seed: f32,
 }
 
-pub fn resolve(b: &Building) -> Resolved {
-    let profile = profile_for_kind(&b.kind).unwrap_or_else(|| landuse_profile(b.landuse));
+pub fn resolve(b: &Building, p: &Profile) -> Resolved {
+    let profile = p.profile_for_kind(&b.kind).unwrap_or_else(|| p.landuse_profile(b.landuse));
     let min_h = if b.min_height.is_finite() { b.min_height.clamp(0.0, MAX_HEIGHT_M) } else { 0.0 };
     let h = b.height.filter(|h| h.is_finite() && *h > 0.0);
     let l = b.levels.filter(|l| l.is_finite() && *l > 0.0);
@@ -344,7 +311,7 @@ struct Scratch {
 }
 
 /// Mesh every building fragment inside `rect` (tile pixels) into one merged buffer.
-pub fn mesh_buildings(buildings: &[Building], proj: &TileProjector, rect: ClipRect, params: LodParams) -> MeshData {
+pub fn mesh_buildings(buildings: &[Building], proj: &TileProjector, rect: ClipRect, params: LodParams, profile: &Profile) -> MeshData {
     let mut m = MeshData::default();
     let mut s = Scratch::default();
     let m_per_px = proj.m_per_px();
@@ -355,7 +322,7 @@ pub fn mesh_buildings(buildings: &[Building], proj: &TileProjector, rect: ClipRe
         if bb[2] <= rect.x0 || bb[0] >= rect.x1 || bb[3] <= rect.y0 || bb[1] >= rect.y1 {
             continue;
         }
-        let res = resolve(b);
+        let res = resolve(b, profile);
         if res.height < res.min_height + 0.5 {
             continue;
         }
@@ -533,21 +500,11 @@ fn emit_polygon(m: &mut MeshData, s: &mut Scratch, res: &Resolved, color: [f32; 
     }
 }
 
-/// Meshing parameters per ring; `None` for R3 (light points only).
-pub fn lod_params(ring: usize) -> Option<LodParams> {
-    match ring {
-        0 => Some(R0_PARAMS),
-        1 => Some(R1_PARAMS),
-        2 => Some(R2_PARAMS),
-        _ => None,
-    }
-}
-
 /// Ring-dependent meshing: one merged mesh per tile, clipped exactly to the tile rectangle
 /// (R0 full detail, R1 boxes, R2 coarse merged blocks); R3 has no mesh.
-pub fn mesh_tile(buildings: &[Building], proj: &TileProjector, ring: usize) -> MeshData {
-    match lod_params(ring) {
-        Some(p) => mesh_buildings(buildings, proj, ClipRect::tile(proj.extent()), p),
+pub fn mesh_tile(buildings: &[Building], proj: &TileProjector, ring: usize, profile: &Profile) -> MeshData {
+    match profile.lod(ring) {
+        Some(p) => mesh_buildings(buildings, proj, ClipRect::tile(proj.extent()), p, profile),
         None => MeshData::default(),
     }
 }
@@ -559,6 +516,16 @@ mod tests {
     use crate::mvt::OsmType;
 
     const VILNIUS: (f64, f64) = (54.6872, 25.2797);
+
+    fn dp() -> Profile {
+        Profile::default()
+    }
+    fn lod0() -> LodParams {
+        dp().lod(0).unwrap()
+    }
+    fn lod1() -> LodParams {
+        dp().lod(1).unwrap()
+    }
 
     fn bld(kind: &str, height: Option<f32>, levels: Option<f32>, polys: Vec<Vec<Vec<[f64; 2]>>>) -> Building {
         Building {
@@ -627,7 +594,7 @@ mod tests {
     fn box_triangle_count_normals_outward_and_uvs() {
         let (p, mpp) = setup();
         let b = bld("office", Some(30.0), None, vec![vec![sq(1000.0, 1000.0, 200.0)]]);
-        let m = mesh_buildings(&[b], &p, ClipRect::tile(4096.0), R0_PARAMS);
+        let m = mesh_buildings(&[b], &p, ClipRect::tile(4096.0), lod0(), &dp());
         // 4 walls x 2 + roof 2 = 10 triangles; 4 x 4 + 4 vertices.
         assert_eq!(m.triangle_count(), 10);
         assert_eq!(m.vertex_count(), 20);
@@ -667,7 +634,7 @@ mod tests {
         let (p, _) = setup();
         let mut ring = sq(1000.0, 1000.0, 200.0);
         ring.reverse();
-        let m = mesh_buildings(&[bld("yes", Some(10.0), None, vec![vec![ring]])], &p, ClipRect::tile(4096.0), R0_PARAMS);
+        let m = mesh_buildings(&[bld("yes", Some(10.0), None, vec![vec![ring]])], &p, ClipRect::tile(4096.0), lod0(), &dp());
         assert_eq!(m.triangle_count(), 10);
         assert_winding(&m);
         let c = mesh_centroid(&m);
@@ -683,7 +650,7 @@ mod tests {
         let outer = sq(1000.0, 1000.0, 300.0);
         let mut hole = sq(1100.0, 1100.0, 100.0);
         hole.reverse();
-        let m = mesh_buildings(&[bld("apartments", None, Some(5.0), vec![vec![outer, hole]])], &p, ClipRect::tile(4096.0), R0_PARAMS);
+        let m = mesh_buildings(&[bld("apartments", None, Some(5.0), vec![vec![outer, hole]])], &p, ClipRect::tile(4096.0), lod0(), &dp());
         // Walls: 8 edges x 2; roof of a square with a square hole: 8 vertices -> 8 triangles.
         assert_eq!(m.triangle_count(), 16 + 8);
         assert_winding(&m);
@@ -718,7 +685,7 @@ mod tests {
         let (p, _) = setup();
         let mut b = bld("yes", Some(20.0), None, vec![vec![sq(100.0, 100.0, 100.0)], vec![sq(400.0, 100.0, 100.0)]]);
         b.min_height = 8.0;
-        let m = mesh_buildings(&[b], &p, ClipRect::tile(4096.0), R0_PARAMS);
+        let m = mesh_buildings(&[b], &p, ClipRect::tile(4096.0), lod0(), &dp());
         // Two boxes, each: 8 wall + 2 roof + 2 bottom.
         assert_eq!(m.triangle_count(), 24);
         assert_winding(&m);
@@ -735,15 +702,15 @@ mod tests {
         let bump = 1.0 / mpp;
         let ring = vec![[1000.0, 1000.0], [1100.0, 1000.0 - bump], [1200.0, 1000.0], [1200.0, 1200.0], [1000.0, 1200.0]];
         let b = bld("yes", Some(10.0), None, vec![vec![ring]]);
-        let r0 = mesh_buildings(std::slice::from_ref(&b), &p, ClipRect::tile(4096.0), R0_PARAMS);
-        let r1 = mesh_buildings(std::slice::from_ref(&b), &p, ClipRect::tile(4096.0), R1_PARAMS);
+        let r0 = mesh_buildings(std::slice::from_ref(&b), &p, ClipRect::tile(4096.0), lod0(), &dp());
+        let r1 = mesh_buildings(std::slice::from_ref(&b), &p, ClipRect::tile(4096.0), lod1(), &dp());
         assert_eq!(r0.triangle_count(), 5 * 2 + 3, "0.5 m keeps the 1 m bump");
         assert_eq!(r1.triangle_count(), 4 * 2 + 2, "2 m removes it");
         // < 20 m2 dropped at R1 only.
         let side = (16.0f64).sqrt() / mpp;
         let tiny = bld("yes", Some(10.0), None, vec![vec![sq(2000.0, 2000.0, side)]]);
-        assert_eq!(mesh_buildings(std::slice::from_ref(&tiny), &p, ClipRect::tile(4096.0), R1_PARAMS).triangle_count(), 0);
-        assert_eq!(mesh_buildings(&[tiny], &p, ClipRect::tile(4096.0), R0_PARAMS).triangle_count(), 10);
+        assert_eq!(mesh_buildings(std::slice::from_ref(&tiny), &p, ClipRect::tile(4096.0), lod1(), &dp()).triangle_count(), 0);
+        assert_eq!(mesh_buildings(&[tiny], &p, ClipRect::tile(4096.0), lod0(), &dp()).triangle_count(), 10);
     }
 
     #[test]
@@ -751,10 +718,10 @@ mod tests {
         let (p, _) = setup();
         // Straddles the vertical child seam at x = 2048.
         let b = bld("yes", Some(10.0), None, vec![vec![sq(1948.0, 1000.0, 200.0)]]);
-        let whole = mesh_buildings(std::slice::from_ref(&b), &p, ClipRect::tile(4096.0), R0_PARAMS);
-        let nw = mesh_buildings(std::slice::from_ref(&b), &p, ClipRect::quadrant(4096.0, 0), R0_PARAMS);
-        let ne = mesh_buildings(std::slice::from_ref(&b), &p, ClipRect::quadrant(4096.0, 1), R0_PARAMS);
-        let sw = mesh_buildings(std::slice::from_ref(&b), &p, ClipRect::quadrant(4096.0, 2), R0_PARAMS);
+        let whole = mesh_buildings(std::slice::from_ref(&b), &p, ClipRect::tile(4096.0), lod0(), &dp());
+        let nw = mesh_buildings(std::slice::from_ref(&b), &p, ClipRect::quadrant(4096.0, 0), lod0(), &dp());
+        let ne = mesh_buildings(std::slice::from_ref(&b), &p, ClipRect::quadrant(4096.0, 1), lod0(), &dp());
+        let sw = mesh_buildings(std::slice::from_ref(&b), &p, ClipRect::quadrant(4096.0, 2), lod0(), &dp());
         assert!(sw.is_empty());
         // Each half: 3 outer walls (seam wall skipped) + 2 roof triangles.
         assert_eq!(nw.triangle_count(), 8);
@@ -781,7 +748,7 @@ mod tests {
         let r = |kind: &str, h, l, lu| {
             let mut b = bld(kind, h, l, vec![]);
             b.landuse = lu;
-            resolve(&b)
+            resolve(&b, &dp())
         };
         // height wins; floor = height / levels clamped.
         let a = r("office", Some(40.0), Some(10.0), None);
@@ -814,7 +781,7 @@ mod tests {
         // Raised part with levels only.
         let mut raised = bld("yes", None, Some(2.0), vec![]);
         raised.min_height = 9.0;
-        assert_eq!(resolve(&raised).height, 15.0);
+        assert_eq!(resolve(&raised, &dp()).height, 15.0);
     }
 
     #[test]
@@ -824,14 +791,14 @@ mod tests {
         let p15 = TileProjector::new(k15, frame, 4096.0);
         let b15 = crate::synthetic::generate(k15, frame);
         let c15 = frame.tile_center(k15);
-        let whole = mesh_tile(&b15, &p15, 1);
+        let whole = mesh_tile(&b15, &p15, 1, &dp());
         let mut sum = 0;
         for (i, child) in crate::rings::children(k15).into_iter().enumerate() {
             // The parent's quarter i, clipped exactly, equals the child tile meshed alone.
-            let q = mesh_buildings(&b15, &p15, ClipRect::quadrant(4096.0, i), R1_PARAMS);
+            let q = mesh_buildings(&b15, &p15, ClipRect::quadrant(4096.0, i), lod1(), &dp());
             let p16 = TileProjector::new(child, frame, 4096.0);
             let b16 = crate::synthetic::generate(child, frame);
-            let t16 = mesh_tile(&b16, &p16, 0);
+            let t16 = mesh_tile(&b16, &p16, 0, &dp());
             // Same buildings, same triangles (synthetic footprints are rectangles: DP 0.5 and
             // 2 m agree, nothing < 20 m2).
             assert_eq!(q.triangle_count(), t16.triangle_count(), "quarter {i} vs {child}");
@@ -863,17 +830,17 @@ mod tests {
                 .chain(m.indices.iter().map(|&i| i as u32))
                 .collect()
         };
-        let again = mesh_tile(&crate::synthetic::generate(k15, frame), &p15, 1);
+        let again = mesh_tile(&crate::synthetic::generate(k15, frame), &p15, 1, &dp());
         assert_eq!(bits(&whole), bits(&again));
         // R2 meshes (coarser, still non-empty); R3 has no mesh.
         let k14 = tile_for(VILNIUS.0, VILNIUS.1, 14);
         let p14 = TileProjector::new(k14, frame, 4096.0);
         let b14 = crate::synthetic::generate(k14, frame);
-        let r2 = mesh_tile(&b14, &p14, 2);
+        let r2 = mesh_tile(&b14, &p14, 2, &dp());
         assert!(!r2.is_empty());
         assert_winding(&r2);
-        assert_eq!(bits(&r2), bits(&mesh_tile(&b14, &p14, 2)));
-        assert!(mesh_tile(&b14, &p14, 3).is_empty());
+        assert_eq!(bits(&r2), bits(&mesh_tile(&b14, &p14, 2, &dp())));
+        assert!(mesh_tile(&b14, &p14, 3, &dp()).is_empty());
     }
 
     #[test]
@@ -882,15 +849,15 @@ mod tests {
         // 6 x 6 m shed (36 m2): kept at R1, dropped at R2.
         let side = 6.0 / m;
         let shed = bld("yes", Some(4.0), None, vec![vec![sq(100.0, 100.0, side)]]);
-        assert_eq!(mesh_tile(std::slice::from_ref(&shed), &p, 1).triangle_count(), 10);
-        assert!(mesh_tile(std::slice::from_ref(&shed), &p, 2).is_empty());
+        assert_eq!(mesh_tile(std::slice::from_ref(&shed), &p, 1, &dp()).triangle_count(), 10);
+        assert!(mesh_tile(std::slice::from_ref(&shed), &p, 2, &dp()).is_empty());
         // A 3 m bump on a 40 m wall: kept at R1 (DP 2 m), removed at R2 (DP 4 m).
         let s = 40.0 / m;
         let bump = 3.0 / m;
         let ring = vec![[0.0, 0.0], [s * 0.5, -bump], [s, 0.0], [s, s], [0.0, s]];
         let b = bld("yes", Some(10.0), None, vec![vec![ring.into_iter().map(|q| [q[0] + 500.0, q[1] + 500.0]).collect()]]);
-        let r1 = mesh_tile(std::slice::from_ref(&b), &p, 1).triangle_count();
-        let r2 = mesh_tile(std::slice::from_ref(&b), &p, 2).triangle_count();
+        let r1 = mesh_tile(std::slice::from_ref(&b), &p, 1, &dp()).triangle_count();
+        let r2 = mesh_tile(std::slice::from_ref(&b), &p, 2, &dp()).triangle_count();
         assert_eq!(r1, 13); // 5 walls + 3 roof triangles
         assert_eq!(r2, 10); // box
     }

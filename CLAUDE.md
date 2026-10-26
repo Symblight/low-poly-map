@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-"SimWorld" (working name; the repo folder is still `lowpolymap`, the Rust crates are `simworld-core` / `simworld-godot` / `simworld-cli`) is a streamed low-poly OSM city for the SimPlane flight game: a Rust GDExtension (`WorldStreamer`) streams PMTiles around a camera and generates everything; a Godot 4.7 (.NET/C#) project displays it. It started as a spike and is being turned into a reusable library with a test bench. The packaging plan is in `docs/spec-library-packaging.md` (phases P0-P7); this repo has finished P0 (baseline) and P1 (core split: Cargo workspace, `World`, `Log`, `Diagnostics`), and P2 (contract: `docs/contract.md`, `api_version`) is in progress. Contract version: `api_version` 0.5 (`docs/contract.md`); crate version 0.5.0 (`CHANGELOG.md`).
+"SimWorld" (working name; the repo folder is still `lowpolymap`, the Rust crates are `simworld-core` / `simworld-godot` / `simworld-cli`) is a streamed low-poly OSM city for the SimPlane flight game: a Rust GDExtension (`WorldStreamer`) streams PMTiles around a camera and generates everything; a Godot 4.7 (.NET/C#) project displays it. It started as a spike and is being turned into a reusable library with a test bench. The packaging plan is in `docs/spec-library-packaging.md` (phases P0-P7); this repo has finished P0 (baseline), P1 (core split: Cargo workspace, `World`, `Log`, `Diagnostics`), P2 (contract: `docs/contract.md`, `api_version`) and P3 (config: world profile JSON + schema, `configure_world`, `world_profile()`, golden determinism hashes). Contract version: `api_version` 0.6 (`docs/contract.md`); crate version 0.5.0 (`CHANGELOG.md`).
 
 Milestones (`docs/spike-streamed-osm-city.md`, "Milestones, acceptance and risks"):
 
@@ -12,7 +12,7 @@ Milestones (`docs/spike-streamed-osm-city.md`, "Milestones, acceptance and risks
 - **M6 Night: partway.** Built: dithered LOD fades (`poll_fades`, `shaders/lod_dither.gdshaderinc`), glow/fog/tone map/eye adaptation (`NightRenderController`), light sprites and lit roads with a `night_factor`, and an interim C# daylight clock (`TimeOfDay`, `DaylightMenu`; NOAA sun math in C#). **Not built:** the window shader with light profiles (`building_windows.gdshader`; `building_day.gdshader` is still the daytime placeholder and there is no `hour` uniform), sprite/window cross-fade, and `set_clock` / `daylight()` in Rust.
 - **M7 Imagery, M8 Measure: not started.** `ground_height_at` returns 0 (no DEM).
 
-The Rust side has a `cargo test` baseline of 68 passed, 0 failed, 3 ignored (P2: 66 in `simworld-core` + 2 in `simworld-godot`; the two P2 tests pin `api_version` and the `#[func]` list to `docs/contract.md`). `scheduler::tests::GodotSim` mirrors the C# visibility rule.
+The Rust side has a `cargo test` baseline of 80 passed, 0 failed, 3 ignored (P3: 78 in `simworld-core` + 2 in `simworld-godot`; two tests pin `api_version` and the `#[func]` list to `docs/contract.md`, `profile::tests` pin `addons/simworld/profiles/default.json` and the schema to the code, `golden_tests` pin per-tile output hashes and the cover). `scheduler::tests::GodotSim` mirrors the C# visibility rule.
 
 ## Commands
 
@@ -39,11 +39,12 @@ lowpolymap/                  # repo root (git); the future library repo is calle
   CHANGELOG.md
   docs/                      # contract.md (the WorldStreamer contract), specs and the design doc
   .claude/agents/            # rust-world-streamer.md, godot-csharp-integrator.md (point to docs/contract.md)
+  addons/simworld/profiles/  # world profile: default.json (all keys = compiled-in defaults) + world-profile.schema.json (P3)
   low-poly-map/              # Godot project root and test bench (project.godot, scenes/, scripts/, shaders/, textures/)
   rust/                      # Cargo workspace, OUTSIDE the Godot project:
     simworld-core/           #   pure Rust world (no godot), rlib; World, Log, Diagnostics, all modules
     simworld-godot/          #   gdext binding, WorldStreamer node only (cdylib + staticlib -> libsimworld_godot.*); build.rs (build marker)
-    simworld-cli/            #   headless runner (placeholder until P6)
+    simworld-cli/            #   headless runner: validate-profile, default-profile (fly/bake/tile/bench in P6)
   data/                      # tile build: planetiler schema, build_tiles.sh, serve.sh, out/vilnius.pmtiles
 ```
 
@@ -55,18 +56,19 @@ lowpolymap/                  # repo root (git); the future library repo is calle
 
 Not built yet; do not create these folders without the matching phase.
 
-- Done in P1: `rust/` is a Cargo workspace with `simworld-core`, `simworld-godot`, `simworld-cli` (see Layout). Still to come in the core: `daylight` (M6), `config` (P3); real CLI commands (P6).
-- `addons/simworld/` at the repo root: the Godot rendering addon (`plugin.cfg`, multi-platform `.gdextension`, C# runtime `WorldView`/`TilePool`/`TileCover`/`TileKey`/facade, shaders, textures, default JSON world profile). Phase P5.
+- Done in P1: `rust/` is a Cargo workspace with `simworld-core`, `simworld-godot`, `simworld-cli` (see Layout). Done in P3: the world profile (`simworld-core/src/profile.rs`; `addons/simworld/profiles/default.json` + `world-profile.schema.json`) and `simworld-cli validate-profile` / `default-profile`. Still to come in the core: `daylight` (M6); the other CLI commands (P6).
+- `addons/simworld/` at the repo root: the Godot rendering addon (`plugin.cfg`, multi-platform `.gdextension`, C# runtime `WorldView`/`TilePool`/`TileCover`/`TileKey`/facade, shaders, textures). Only `addons/simworld/profiles/` exists so far (P3); the rest is phase P5.
 - `low-poly-map/` stays as the test bench and demo host: `FreeFlyCamera`, `DebugOverlay`, `TimeOfDay`, `DaylightMenu`, test drivers.
 - Releases: git tag `vX.Y.Z` plus `simworld-addon-vX.Y.Z.zip` with prebuilt libraries; the SimPlane game vendors the zip and needs no Rust toolchain.
 
 ## Architecture
 
 - **Rust owns the world, Godot only displays it.** The `WorldStreamer` Node does the quadtree cover by 3D slant distance (R0 z16 < 0.6 km, R1 z15 < 2.5 km, R2 z14 < 7 km, R3 z13 < 25 km), PMTiles fetching over HTTPS range requests, disk LRU cache, MVT decoding, meshing, ground meshes and light points on worker threads (tokio for I/O, rayon for meshing, crossbeam channel back). C# drives the camera, uploads finished tiles (at most 2 per frame, at most 2 ms) and renders.
-- **The `WorldStreamer` API is a contract** shared by both sides: `api_version`, `configure`, `update_camera`, `poll_ready`, `poll_unload`, `poll_fades`, `take_origin_shift`, `debug_stats`, `debug_tiles`, `ground_height_at`, plus the ready-tile dictionary shape (incl. the quadtree sibling-swap visibility rule and dithered fades) and the vertex COLOR encodings. **The contract is `docs/contract.md`** (single source; the agent files only point to it). Any change updates that file, `api_version` (`API_MAJOR`/`API_MINOR` in `rust/simworld-core/src/lib.rs`) and `CHANGELOG.md` in the same commit. `api_version` = contract `major.minor`, independent of the crate version: a minor bump is additive only, a major bump is breaking. `cargo test` fails if the constants and the `api_version:` line of `docs/contract.md` disagree or a `#[func]` is missing from it.
+- **The `WorldStreamer` API is a contract** shared by both sides: `api_version`, `configure`, `configure_world`, `world_profile`, `update_camera`, `poll_ready`, `poll_unload`, `poll_fades`, `take_origin_shift`, `debug_stats`, `debug_tiles`, `ground_height_at`, plus the ready-tile dictionary shape (incl. the quadtree sibling-swap visibility rule and dithered fades) and the vertex COLOR encodings. **The contract is `docs/contract.md`** (single source; the agent files only point to it). Any change updates that file, `api_version` (`API_MAJOR`/`API_MINOR` in `rust/simworld-core/src/lib.rs`) and `CHANGELOG.md` in the same commit. `api_version` = contract `major.minor`, independent of the crate version: a minor bump is additive only, a major bump is breaking. `cargo test` fails if the constants and the `api_version:` line of `docs/contract.md` disagree or a `#[func]` is missing from it.
 - **Floating origin:** f64 ENU inside Rust, f32 relative to origin in Godot; re-center beyond 5 km and shift camera + all tile roots in the same frame.
 - **Coordinates:** Y-up, x = east, z = -north, meters.
-- **Determinism:** same tile gives the same mesh and the same lit windows (seeded by OSM id). Not yet pinned by tests (spec audit A16).
+- **Determinism:** same tile gives the same mesh and the same lit windows (seeded by OSM id). Pinned by `simworld-core` `golden_tests` (quantized per-tile hashes of the synthetic city, all bands; regenerate only for an intended change with `SIMWORLD_UPDATE_GOLDEN=1 cargo test -p simworld-core golden -- --nocapture`).
+- **Tuning is data:** band edges, DP tolerances, budgets, light profiles, road/area tables etc. live in the world profile (`docs/contract.md` 3.2), not in module constants. A changed default changes host-visible behaviour: update `default.json`, the schema (the tests enforce both) and `CHANGELOG.md`. Structural values (4 bands, zooms 13-16, layer names) stay constants.
 
 ## Constraints
 

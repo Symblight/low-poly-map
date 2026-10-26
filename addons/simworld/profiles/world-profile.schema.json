@@ -1,0 +1,762 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://simworld.local/world-profile.schema.json",
+  "title": "SimWorld world profile",
+  "description": "SimWorld world profile: every tuning value of the streamed world. All keys are optional in a file or in `profile_overrides` (omitted keys keep the defaults; objects merge deeply, arrays and scalars replace). Structural values (4 bands over zooms 13-16, layer names) are not tunable. Defaults = addons/simworld/profiles/default.json = the compiled-in defaults.",
+  "type": "object",
+  "properties": {
+    "profile_version": {
+      "description": "Profile schema version (integer). A file with the library's version or older is strict (an unknown key is an error); a newer file loads and unknown keys are ignored with a warning. The library reads version 1.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000000
+    },
+    "bands": {
+      "description": "LOD bands as a quadtree cover by 3D slant distance (camera to the nearest point of a tile's box). R0 = z16 ... R3 = z13.",
+      "type": "object",
+      "properties": {
+        "r0_edge_m": {
+          "description": "Outer slant-distance edge of R0 (z16, full extrusion), meters. Must be below r1_edge_m.",
+          "type": "number",
+          "minimum": 50,
+          "maximum": 100000
+        },
+        "r1_edge_m": {
+          "description": "Outer slant-distance edge of R1 (z15), meters. Must be below r2_edge_m.",
+          "type": "number",
+          "minimum": 50,
+          "maximum": 100000
+        },
+        "r2_edge_m": {
+          "description": "Outer slant-distance edge of R2 (z14), meters. Must be below r3_edge_m.",
+          "type": "number",
+          "minimum": 50,
+          "maximum": 100000
+        },
+        "r3_edge_m": {
+          "description": "Outer slant-distance edge of R3 (z13, light points only) and of the whole cover, meters. Nothing is requested beyond it (times hysteresis for tiles already in).",
+          "type": "number",
+          "minimum": 50,
+          "maximum": 100000
+        },
+        "hysteresis": {
+          "description": "Factor: a tile changes band only once its slant distance is this far past the band edge (1.15 = 15 %). The gap edge x (hysteresis - 1) also drives the dithered LOD fade.",
+          "type": "number",
+          "minimum": 1.01,
+          "maximum": 2
+        },
+        "look_ahead_s": {
+          "description": "Look-ahead horizon, seconds: each band's view point is camera + velocity x this (vertical speed included).",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 120
+        },
+        "look_ahead_clamp": {
+          "description": "Look-ahead offset clamp as a fraction of the band's edge (0.5 = half the band radius).",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "default_tile_height_m": {
+          "description": "Box height (meters) assumed for a tile whose own and ancestors' building heights are not known yet.",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 400
+        }
+      },
+      "additionalProperties": false
+    },
+    "buildings": {
+      "description": "Building meshing per band (R3 has no buildings).",
+      "type": "object",
+      "properties": {
+        "r0": {
+          "description": "Building meshing at R0 (z16, nearest band).",
+          "type": "object",
+          "properties": {
+            "dp_m": {
+              "description": "Douglas-Peucker tolerance for footprints, meters.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 50
+            },
+            "min_area_m2": {
+              "description": "Drop buildings whose footprint is smaller, square meters (0 = keep all).",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 100000
+            }
+          },
+          "additionalProperties": false
+        },
+        "r1": {
+          "description": "Building meshing at R1 (z15).",
+          "type": "object",
+          "properties": {
+            "dp_m": {
+              "description": "Douglas-Peucker tolerance for footprints, meters.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 50
+            },
+            "min_area_m2": {
+              "description": "Drop buildings whose footprint is smaller, square meters (0 = keep all).",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 100000
+            }
+          },
+          "additionalProperties": false
+        },
+        "r2": {
+          "description": "Building meshing at R2 (z14).",
+          "type": "object",
+          "properties": {
+            "dp_m": {
+              "description": "Douglas-Peucker tolerance for footprints, meters.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 50
+            },
+            "min_area_m2": {
+              "description": "Drop buildings whose footprint is smaller, square meters (0 = keep all).",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 100000
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "ground": {
+      "description": "Ground meshing (landuse areas and road strips) per band, road classes and widths, area classes and stacking levels. R3 has no ground.",
+      "type": "object",
+      "properties": {
+        "r0": {
+          "description": "Ground meshing at R0 (z16, nearest band).",
+          "type": "object",
+          "properties": {
+            "area_dp_m": {
+              "description": "Douglas-Peucker tolerance for area outlines, meters.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 50
+            },
+            "min_area_m2": {
+              "description": "Drop areas smaller than this, square meters (0 = keep all).",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1000000
+            },
+            "road_dp_m": {
+              "description": "Douglas-Peucker tolerance for road centerlines, meters.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 50
+            },
+            "max_road_class": {
+              "description": "Keep roads of this class and every more important one (other = all roads).",
+              "enum": ["motorway", "primary", "secondary", "tertiary", "residential", "other"],
+              "type": "string"
+            },
+            "minor_paths": {
+              "description": "Keep minor paths (ground.roads.minor_paths).",
+              "type": "boolean"
+            },
+            "lift_step_m": {
+              "description": "Vertical lift per stacking level, meters (against z-fighting; level up to 13 for roads).",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 0.5
+            }
+          },
+          "additionalProperties": false
+        },
+        "r1": {
+          "description": "Ground meshing at R1 (z15).",
+          "type": "object",
+          "properties": {
+            "area_dp_m": {
+              "description": "Douglas-Peucker tolerance for area outlines, meters.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 50
+            },
+            "min_area_m2": {
+              "description": "Drop areas smaller than this, square meters (0 = keep all).",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1000000
+            },
+            "road_dp_m": {
+              "description": "Douglas-Peucker tolerance for road centerlines, meters.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 50
+            },
+            "max_road_class": {
+              "description": "Keep roads of this class and every more important one (other = all roads).",
+              "enum": ["motorway", "primary", "secondary", "tertiary", "residential", "other"],
+              "type": "string"
+            },
+            "minor_paths": {
+              "description": "Keep minor paths (ground.roads.minor_paths).",
+              "type": "boolean"
+            },
+            "lift_step_m": {
+              "description": "Vertical lift per stacking level, meters (against z-fighting; level up to 13 for roads).",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 0.5
+            }
+          },
+          "additionalProperties": false
+        },
+        "r2": {
+          "description": "Ground meshing at R2 (z14).",
+          "type": "object",
+          "properties": {
+            "area_dp_m": {
+              "description": "Douglas-Peucker tolerance for area outlines, meters.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 50
+            },
+            "min_area_m2": {
+              "description": "Drop areas smaller than this, square meters (0 = keep all).",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1000000
+            },
+            "road_dp_m": {
+              "description": "Douglas-Peucker tolerance for road centerlines, meters.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 50
+            },
+            "max_road_class": {
+              "description": "Keep roads of this class and every more important one (other = all roads).",
+              "enum": ["motorway", "primary", "secondary", "tertiary", "residential", "other"],
+              "type": "string"
+            },
+            "minor_paths": {
+              "description": "Keep minor paths (ground.roads.minor_paths).",
+              "type": "boolean"
+            },
+            "lift_step_m": {
+              "description": "Vertical lift per stacking level, meters (against z-fighting; level up to 13 for roads).",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 0.5
+            }
+          },
+          "additionalProperties": false
+        },
+        "roads": {
+          "description": "Road classes (contract ground COLOR b = class / 8: 1 motorway, 2 primary, 3 secondary, 4 tertiary, 5 residential, 6 other) and full strip widths.",
+          "type": "object",
+          "properties": {
+            "motorway": {
+              "description": "Road class motorway.",
+              "type": "object",
+              "properties": {
+                "width_m": {
+                  "description": "Full strip width, meters.",
+                  "type": "number",
+                  "minimum": 0.5,
+                  "maximum": 100
+                },
+                "highways": {
+                  "description": "OSM highway values of this class (base values; the `_link` variants are included automatically).",
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "uniqueItems": true
+                }
+              },
+              "additionalProperties": false
+            },
+            "primary": {
+              "description": "Road class primary.",
+              "type": "object",
+              "properties": {
+                "width_m": {
+                  "description": "Full strip width, meters.",
+                  "type": "number",
+                  "minimum": 0.5,
+                  "maximum": 100
+                },
+                "highways": {
+                  "description": "OSM highway values of this class (base values; the `_link` variants are included automatically).",
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "uniqueItems": true
+                }
+              },
+              "additionalProperties": false
+            },
+            "secondary": {
+              "description": "Road class secondary.",
+              "type": "object",
+              "properties": {
+                "width_m": {
+                  "description": "Full strip width, meters.",
+                  "type": "number",
+                  "minimum": 0.5,
+                  "maximum": 100
+                },
+                "highways": {
+                  "description": "OSM highway values of this class (base values; the `_link` variants are included automatically).",
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "uniqueItems": true
+                }
+              },
+              "additionalProperties": false
+            },
+            "tertiary": {
+              "description": "Road class tertiary.",
+              "type": "object",
+              "properties": {
+                "width_m": {
+                  "description": "Full strip width, meters.",
+                  "type": "number",
+                  "minimum": 0.5,
+                  "maximum": 100
+                },
+                "highways": {
+                  "description": "OSM highway values of this class (base values; the `_link` variants are included automatically).",
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "uniqueItems": true
+                }
+              },
+              "additionalProperties": false
+            },
+            "residential": {
+              "description": "Road class residential.",
+              "type": "object",
+              "properties": {
+                "width_m": {
+                  "description": "Full strip width, meters.",
+                  "type": "number",
+                  "minimum": 0.5,
+                  "maximum": 100
+                },
+                "highways": {
+                  "description": "OSM highway values of this class (base values; the `_link` variants are included automatically).",
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "uniqueItems": true
+                }
+              },
+              "additionalProperties": false
+            },
+            "other_width_m": {
+              "description": "Full strip width (meters) of class 6: every highway value not listed in another class (service, pedestrian, footway, path, ...).",
+              "type": "number",
+              "minimum": 0.5,
+              "maximum": 100
+            },
+            "link_width_factor": {
+              "description": "`_link` roads keep their class at this fraction of its width, rounded to 0.1 m.",
+              "type": "number",
+              "minimum": 0.1,
+              "maximum": 1
+            },
+            "link_min_width_m": {
+              "description": "Minimum full width (meters) of a `_link` road.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 100
+            },
+            "minor_paths": {
+              "description": "Class-6 highway values that count as minor paths: kept at R0 only (ground.r1/r2 minor_paths = false drops them).",
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "uniqueItems": true
+            },
+            "lit_values": {
+              "description": "OSM `lit` values (trimmed) that mark a road as lit (ground COLOR g = 1).",
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "uniqueItems": true
+            }
+          },
+          "additionalProperties": false
+        },
+        "areas": {
+          "description": "Area groups by free name: each maps `landuse` layer kinds to a ground class and a stacking level. Add a group to classify more kinds; a kind may appear in one group only.",
+          "type": "object",
+          "additionalProperties": {
+            "description": "One area group.",
+            "type": "object",
+            "properties": {
+              "class": {
+                "description": "Ground class (contract ground COLOR r = id / 16): grass 0, forest 1, water 2, residential 3, commercial 4, industrial 5, other 6.",
+                "enum": ["grass", "forest", "water", "residential", "commercial", "industrial", "other"],
+                "type": "string"
+              },
+              "level": {
+                "description": "Stacking level against z-fighting, 0..7 (higher draws on top; roads use 8..13). Lift = level x the band's lift_step_m.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 7
+              },
+              "kinds": {
+                "description": "`landuse` layer `kind` values of this group.",
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "uniqueItems": true
+              }
+            },
+            "additionalProperties": false,
+            "required": ["class", "level", "kinds"]
+          }
+        },
+        "other_area_level": {
+          "description": "Stacking level of landuse kinds listed in no group (class other).",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 7
+        }
+      },
+      "additionalProperties": false
+    },
+    "lights": {
+      "description": "Light sprites (R2/R3) and building light profiles.",
+      "type": "object",
+      "properties": {
+        "cluster_on_agl_m": {
+          "description": "Above this height above ground (meters) each tile's lights are clustered into cells (the light carpet); already delivered R2/R3 tiles are re-delivered.",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100000
+        },
+        "cluster_off_agl_m": {
+          "description": "Below this height above ground (meters) clustering switches off again (hysteresis). Must not exceed cluster_on_agl_m.",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100000
+        },
+        "cluster_cell_m": {
+          "description": "Cell size (meters) of the clustered light carpet.",
+          "type": "number",
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "profiles": {
+          "description": "Light profiles (contract vertex COLOR r = id / 8: residential 0, office 1, retail 2, industrial 3, civic 4): which OSM building values belong to each, and the sprite color.",
+          "type": "object",
+          "properties": {
+            "residential": {
+              "description": "Light profile residential.",
+              "type": "object",
+              "properties": {
+                "color": {
+                  "description": "Light sprite color, linear rgb 0..1.",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "minItems": 3,
+                  "maxItems": 3
+                },
+                "kinds": {
+                  "description": "OSM `building` values of this profile (a value may appear in one profile only).",
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "uniqueItems": true
+                }
+              },
+              "additionalProperties": false
+            },
+            "office": {
+              "description": "Light profile office.",
+              "type": "object",
+              "properties": {
+                "color": {
+                  "description": "Light sprite color, linear rgb 0..1.",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "minItems": 3,
+                  "maxItems": 3
+                },
+                "kinds": {
+                  "description": "OSM `building` values of this profile (a value may appear in one profile only).",
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "uniqueItems": true
+                }
+              },
+              "additionalProperties": false
+            },
+            "retail": {
+              "description": "Light profile retail.",
+              "type": "object",
+              "properties": {
+                "color": {
+                  "description": "Light sprite color, linear rgb 0..1.",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "minItems": 3,
+                  "maxItems": 3
+                },
+                "kinds": {
+                  "description": "OSM `building` values of this profile (a value may appear in one profile only).",
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "uniqueItems": true
+                }
+              },
+              "additionalProperties": false
+            },
+            "industrial": {
+              "description": "Light profile industrial.",
+              "type": "object",
+              "properties": {
+                "color": {
+                  "description": "Light sprite color, linear rgb 0..1.",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "minItems": 3,
+                  "maxItems": 3
+                },
+                "kinds": {
+                  "description": "OSM `building` values of this profile (a value may appear in one profile only).",
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "uniqueItems": true
+                }
+              },
+              "additionalProperties": false
+            },
+            "civic": {
+              "description": "Light profile civic.",
+              "type": "object",
+              "properties": {
+                "color": {
+                  "description": "Light sprite color, linear rgb 0..1.",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "minItems": 3,
+                  "maxItems": 3
+                },
+                "kinds": {
+                  "description": "OSM `building` values of this profile (a value may appear in one profile only).",
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "uniqueItems": true
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "landuse_fallback": {
+          "description": "Profile of buildings whose kind is in no profile, by the landuse polygon around them.",
+          "type": "object",
+          "properties": {
+            "residential": {
+              "description": "Profile for landuse residential.",
+              "enum": ["residential", "office", "retail", "industrial", "civic"],
+              "type": "string"
+            },
+            "commercial": {
+              "description": "Profile for landuse commercial.",
+              "enum": ["residential", "office", "retail", "industrial", "civic"],
+              "type": "string"
+            },
+            "retail": {
+              "description": "Profile for landuse retail.",
+              "enum": ["residential", "office", "retail", "industrial", "civic"],
+              "type": "string"
+            },
+            "industrial": {
+              "description": "Profile for landuse industrial (and railway, port, depot, garages, quarry).",
+              "enum": ["residential", "office", "retail", "industrial", "civic"],
+              "type": "string"
+            },
+            "civic": {
+              "description": "Profile for landuse religious, education, institutional, civic, military.",
+              "enum": ["residential", "office", "retail", "industrial", "civic"],
+              "type": "string"
+            },
+            "other": {
+              "description": "Profile for any other landuse.",
+              "enum": ["residential", "office", "retail", "industrial", "civic"],
+              "type": "string"
+            },
+            "none": {
+              "description": "Profile when no landuse polygon contains the building.",
+              "enum": ["residential", "office", "retail", "industrial", "civic"],
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "streaming": {
+      "description": "Work budgets and retries.",
+      "type": "object",
+      "properties": {
+        "max_fetch_per_band": {
+          "description": "Tile fetches in flight per band (count).",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64
+        },
+        "max_mesh_per_band": {
+          "description": "Decode and mesh jobs in flight per band (count).",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64
+        },
+        "redeliveries_per_frame": {
+          "description": "Light-mode re-deliveries handed out per frame (count).",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64
+        },
+        "retry_base_s": {
+          "description": "Retry backoff after a failed fetch or decode: first wait, seconds; doubled per attempt (at most 64x).",
+          "type": "number",
+          "minimum": 0.05,
+          "maximum": 60
+        },
+        "retry_max_s": {
+          "description": "Retry backoff cap, seconds. Must not be below retry_base_s.",
+          "type": "number",
+          "minimum": 0.05,
+          "maximum": 3600
+        }
+      },
+      "additionalProperties": false
+    },
+    "fades": {
+      "description": "Dithered LOD fades.",
+      "type": "object",
+      "properties": {
+        "cap_s": {
+          "description": "Safety cap, seconds: a LOD fade is force-completed this long after it started.",
+          "type": "number",
+          "minimum": 0.1,
+          "maximum": 60
+        }
+      },
+      "additionalProperties": false
+    },
+    "origin": {
+      "description": "Floating origin.",
+      "type": "object",
+      "properties": {
+        "recenter_distance_m": {
+          "description": "Re-center the floating origin when the camera is farther than this (meters, horizontal) from it.",
+          "type": "number",
+          "minimum": 500,
+          "maximum": 50000
+        }
+      },
+      "additionalProperties": false
+    },
+    "cache": {
+      "description": "Disk tile cache and HTTP.",
+      "type": "object",
+      "properties": {
+        "cap_mb": {
+          "description": "Disk cache LRU cap, MiB (raw tile bytes; meshes are never cached).",
+          "type": "number",
+          "minimum": 1,
+          "maximum": 1000000
+        },
+        "connect_timeout_s": {
+          "description": "HTTP connect timeout, seconds.",
+          "type": "number",
+          "minimum": 0.1,
+          "maximum": 600
+        },
+        "request_timeout_s": {
+          "description": "HTTP request timeout, seconds.",
+          "type": "number",
+          "minimum": 0.1,
+          "maximum": 3600
+        },
+        "open_retry_s": {
+          "description": "Minimum wait (seconds) before re-opening an archive that failed to open.",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 3600
+        },
+        "validate_retry_s": {
+          "description": "While the archive is unreachable, re-validate the disk cache against it this often (seconds).",
+          "type": "number",
+          "minimum": 1,
+          "maximum": 86400
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

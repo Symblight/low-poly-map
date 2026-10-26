@@ -22,6 +22,7 @@ use std::io::Read;
 use mvt_reader::feature::Value;
 
 use crate::geo::{Frame, TileKey};
+use crate::profile::Profile;
 
 pub const BUILDINGS_LAYER: &str = "buildings";
 pub const LANDUSE_LAYER: &str = "landuse";
@@ -105,27 +106,13 @@ pub const ROAD_TERTIARY: u8 = 4;
 pub const ROAD_RESIDENTIAL: u8 = 5;
 pub const ROAD_OTHER: u8 = 6;
 
-/// `landuse` layer `kind` -> (ground class, stacking level). Levels stack bottom to top so the
-/// more specific cover wins where polygons overlap: 0 nature_reserve (a protection boundary,
-/// often spanning forest, water and houses), 1 other landuse, 2 residential, 3 industrial,
-/// 4 commercial, 5 grass/park, 6 forest, 7 water (ponds in parks, rivers in reserves). Roads
-/// use levels 8..13 above all areas (`ground::road_level`).
-pub fn ground_area_class(kind: &str) -> (u8, u8) {
-    match kind {
-        "nature_reserve" => (GROUND_GRASS, 0),
-        "park" | "garden" | "playground" | "pitch" | "golf_course" | "recreation_ground" | "grass"
-        | "meadow" | "grassland" | "scrub" | "heath" | "wetland" | "village_green" | "cemetery"
-        | "allotments" | "orchard" | "vineyard" | "farmland" | "plant_nursery" | "flowerbed" => {
-            (GROUND_GRASS, 5)
-        }
-        "forest" | "wood" => (GROUND_FOREST, 6),
-        "water" | "riverbank" | "reservoir" | "basin" | "salt_pond" => (GROUND_WATER, 7),
-        "residential" => (GROUND_RESIDENTIAL, 2),
-        "commercial" | "retail" => (GROUND_COMMERCIAL, 4),
-        "industrial" | "railway" | "port" | "depot" | "garages" | "quarry" | "landfill" => (GROUND_INDUSTRIAL, 3),
-        _ => (GROUND_OTHER, 1),
-    }
-}
+// `landuse` kind -> (ground class, stacking level), `highway` -> road class and the `lit`
+// values come from the world profile (`ground.areas`, `ground.roads`; `Profile::ground_area_class`,
+// `Profile::road_class`, `Profile::is_lit`). Default levels stack bottom to top so the more
+// specific cover wins where polygons overlap: 0 nature_reserve (a protection boundary, often
+// spanning forest, water and houses), 1 other landuse, 2 residential, 3 industrial,
+// 4 commercial, 5 grass/park, 6 forest, 7 water (ponds in parks, rivers in reserves). Roads use
+// levels 8..13 above all areas (`ground::road_level`).
 
 /// Whether a `landuse` layer kind takes part in the building kind / levels fallback. The
 /// leisure / natural / riverbank kinds added for the ground mesh do not: before M5 the layer
@@ -139,38 +126,11 @@ pub fn feeds_building_fallback(kind: &str) -> bool {
     )
 }
 
-/// `highway` value -> (road class, is a `_link`, is a minor path). Minor paths (footways,
-/// cycleways, tracks, ...) are dropped first at coarser bands.
-pub fn road_class(highway: &str) -> (u8, bool, bool) {
-    let link = highway.ends_with("_link");
-    let base = highway.strip_suffix("_link").unwrap_or(highway);
-    let class = match base {
-        "motorway" => ROAD_MOTORWAY,
-        "trunk" | "primary" => ROAD_PRIMARY,
-        "secondary" => ROAD_SECONDARY,
-        "tertiary" => ROAD_TERTIARY,
-        "residential" | "unclassified" | "living_street" => ROAD_RESIDENTIAL,
-        _ => ROAD_OTHER,
-    };
-    let minor = class == ROAD_OTHER
-        && matches!(
-            base,
-            "footway" | "path" | "cycleway" | "steps" | "bridleway" | "track" | "corridor" | "elevator"
-                | "via_ferrata" | "escalator"
-        );
-    (class, link, minor)
-}
-
-/// OSM `lit` value -> lit. `yes` plus the time-limited variants count as lit.
-pub fn is_lit(v: &str) -> bool {
-    matches!(v.trim(), "yes" | "24/7" | "automatic" | "sunset-sunrise" | "dusk-dawn" | "limited" | "interval" | "night")
-}
-
 /// One area polygon (exterior + holes) in tile pixels.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GroundArea {
     pub class: u8,
-    /// Stacking level (see `ground_area_class`).
+    /// Stacking level (see `Profile::ground_area_class`).
     pub level: u8,
     pub id: u64,
     pub rings: Vec<Vec<[f64; 2]>>,
@@ -593,6 +553,7 @@ fn decode_landuse(
     reader: &mvt_reader::Reader,
     layers: &[mvt_reader::layer::Layer],
     ground: Option<&mut Vec<GroundArea>>,
+    profile: &Profile,
 ) -> Result<LanduseIndex, String> {
     let Some(layer) = layers.iter().find(|l| l.name == LANDUSE_LAYER) else {
         return Ok(LanduseIndex::empty());
@@ -611,7 +572,7 @@ fn decode_landuse(
         let id = props.get("id").and_then(num).filter(|v| *v >= 0.0).map(|v| v as u64).or(f.id).unwrap_or(0);
         let fallback = feeds_building_fallback(&kind);
         let class = Landuse::parse(&kind);
-        let (gclass, level) = ground_area_class(&kind);
+        let (gclass, level) = profile.ground_area_class(&kind);
         for rings in pp {
             if rings.is_empty() || rings[0].len() < 3 {
                 continue;
@@ -632,7 +593,12 @@ fn decode_landuse(
 }
 
 /// `roads` layer -> road polylines.
-fn decode_roads(reader: &mvt_reader::Reader, layers: &[mvt_reader::layer::Layer], out: &mut Vec<RoadLine>) -> Result<(), String> {
+fn decode_roads(
+    reader: &mvt_reader::Reader,
+    layers: &[mvt_reader::layer::Layer],
+    out: &mut Vec<RoadLine>,
+    profile: &Profile,
+) -> Result<(), String> {
     let Some(layer) = layers.iter().find(|l| l.name == ROADS_LAYER) else {
         return Ok(());
     };
@@ -648,8 +614,8 @@ fn decode_roads(reader: &mvt_reader::Reader, layers: &[mvt_reader::layer::Layer]
         }
         let props = f.properties.as_ref().unwrap_or(&empty);
         let kind = props.get("kind").and_then(text).unwrap_or_default();
-        let (class, link, minor) = road_class(&kind);
-        let lit = props.get("lit").and_then(text).is_some_and(|v| is_lit(&v));
+        let (class, link, minor) = profile.road_class(&kind);
+        let lit = props.get("lit").and_then(text).is_some_and(|v| profile.is_lit(&v));
         let id = props.get("id").and_then(num).filter(|v| *v >= 0.0).map(|v| v as u64).or(f.id).unwrap_or(0);
         out.push(RoadLine { class, link, minor, lit, id, lines });
     }
@@ -658,8 +624,8 @@ fn decode_roads(reader: &mvt_reader::Reader, layers: &[mvt_reader::layer::Layer]
 
 /// Decode the `buildings` layer of an MVT tile (gzip or raw) into buildings; each building's
 /// landuse is resolved from the tile's `landuse` layer at its centroid.
-pub fn decode_buildings(bytes: &[u8], key: TileKey, frame: Frame) -> Result<Vec<Building>, String> {
-    decode_tile(bytes, key, frame, false).map(|t| t.buildings)
+pub fn decode_buildings(bytes: &[u8], key: TileKey, frame: Frame, profile: &Profile) -> Result<Vec<Building>, String> {
+    decode_tile(bytes, key, frame, false, profile).map(|t| t.buildings)
 }
 
 /// One decoded tile: buildings, ground features (only when requested) and the projector.
@@ -671,7 +637,7 @@ pub struct DecodedTile {
 }
 
 /// Decode buildings (always) and, with `want_ground`, the `landuse` areas and `roads` lines.
-pub fn decode_tile(bytes: &[u8], key: TileKey, frame: Frame, want_ground: bool) -> Result<DecodedTile, String> {
+pub fn decode_tile(bytes: &[u8], key: TileKey, frame: Frame, want_ground: bool, profile: &Profile) -> Result<DecodedTile, String> {
     let empty_tile = || DecodedTile {
         buildings: Vec::new(),
         ground: GroundFeatures::default(),
@@ -684,9 +650,9 @@ pub fn decode_tile(bytes: &[u8], key: TileKey, frame: Frame, want_ground: bool) 
     let reader = mvt_reader::Reader::new(data).map_err(|e| format!("mvt: {e:?}"))?;
     let layers = reader.get_layer_metadata().map_err(|e| format!("mvt layers: {e:?}"))?;
     let mut ground = GroundFeatures::default();
-    let landuse = decode_landuse(&reader, &layers, want_ground.then_some(&mut ground.areas))?;
+    let landuse = decode_landuse(&reader, &layers, want_ground.then_some(&mut ground.areas), profile)?;
     if want_ground {
-        decode_roads(&reader, &layers, &mut ground.roads)?;
+        decode_roads(&reader, &layers, &mut ground.roads, profile)?;
         ground.sort();
     }
     // All layers share the tile's extent (4096 in our archive); take it from whichever exists.
@@ -914,14 +880,14 @@ mod tests {
         let key = TileKey::new(16, 37370, 20827);
         let (lat, lon) = key.center_lat_lon();
         let frame = Frame::new(lat, lon);
-        let bs = decode_buildings(&fixture(), key, frame).unwrap();
+        let bs = decode_buildings(&fixture(), key, frame, &Profile::default()).unwrap();
         assert_eq!(bs.len(), 3);
         let a = bs.iter().find(|b| b.id == 123456789).unwrap();
         assert_eq!(a.osm_type, OsmType::Way);
         assert_eq!(a.kind, "apartments");
         assert_eq!(a.levels, Some(2.5));
         assert_eq!(a.height, None);
-        assert!((crate::mesher::resolve(a).height - 7.5).abs() < 1e-6);
+        assert!((crate::mesher::resolve(a, &Profile::default()).height - 7.5).abs() < 1e-6);
         assert!(a.owned);
         assert_eq!(a.polygons[0][0].len(), 4);
         assert_eq!(a.centroid_px, [1200.0, 1200.0]);
@@ -931,11 +897,11 @@ mod tests {
         assert_eq!(a.landuse, Some(Landuse::Residential));
         let y = bs.iter().find(|b| b.id == 9).unwrap();
         assert_eq!(y.landuse, Some(Landuse::Industrial));
-        assert_eq!(crate::mesher::resolve(y).profile, crate::mesher::PROFILE_INDUSTRIAL);
+        assert_eq!(crate::mesher::resolve(y, &Profile::default()).profile, crate::mesher::PROFILE_INDUSTRIAL);
 
         let b = bs.iter().find(|b| b.id == 7).unwrap();
         assert_eq!(b.osm_type, OsmType::Relation);
-        assert_eq!(crate::mesher::resolve(b).height, 42.0);
+        assert_eq!(crate::mesher::resolve(b, &Profile::default()).height, 42.0);
         assert!(!b.owned);
     }
 
@@ -948,14 +914,14 @@ mod tests {
         let gz = enc.finish().unwrap();
         let key = TileKey::new(16, 37370, 20827);
         let frame = Frame::new(54.6872, 25.2797);
-        let a = decode_buildings(&raw, key, frame).unwrap();
-        let b = decode_buildings(&gz, key, frame).unwrap();
+        let a = decode_buildings(&raw, key, frame, &Profile::default()).unwrap();
+        let b = decode_buildings(&gz, key, frame, &Profile::default()).unwrap();
         assert_eq!(a, b);
         assert_eq!(a[0].seed01(), b[0].seed01());
-        assert!(decode_buildings(&[], key, frame).unwrap().is_empty());
-        assert!(decode_buildings(b"garbage!", key, frame).is_err());
+        assert!(decode_buildings(&[], key, frame, &Profile::default()).unwrap().is_empty());
+        assert!(decode_buildings(b"garbage!", key, frame, &Profile::default()).is_err());
         // No landuse layer -> None.
-        let nolu = decode_buildings(&buildings_layer(), key, frame).unwrap();
+        let nolu = decode_buildings(&buildings_layer(), key, frame, &Profile::default()).unwrap();
         assert!(nolu.iter().all(|b| b.landuse.is_none()));
     }
 
@@ -963,7 +929,7 @@ mod tests {
     fn missing_layer_is_empty_and_seed_distinguishes_type() {
         let t = encode_layer("roads", &[]);
         let frame = Frame::new(54.6872, 25.2797);
-        assert!(decode_buildings(&t, TileKey::new(16, 1, 1), frame).unwrap().is_empty());
+        assert!(decode_buildings(&t, TileKey::new(16, 1, 1), frame, &Profile::default()).unwrap().is_empty());
         let mk = |t| Building {
             osm_type: t,
             id: 42,
@@ -1023,7 +989,7 @@ mod tests {
         ));
         let key = TileKey::new(16, 37370, 20827);
         let frame = Frame::new(54.6872, 25.2797);
-        let d = decode_tile(&t, key, frame, true).unwrap();
+        let d = decode_tile(&t, key, frame, true, &Profile::default()).unwrap();
         assert_eq!(d.buildings.len(), 1);
         assert_eq!(d.buildings[0].landuse, Some(Landuse::Residential));
         assert_eq!(d.buildings[0].base_m, 0.0);
@@ -1038,12 +1004,12 @@ mod tests {
         assert_eq!((g.roads[1].class, g.roads[1].lit), (ROAD_PRIMARY, true));
         assert_eq!(g.roads[1].lines[0].len(), 3);
         // Without ground: same buildings, no ground.
-        let nb = decode_tile(&t, key, frame, false).unwrap();
+        let nb = decode_tile(&t, key, frame, false, &Profile::default()).unwrap();
         assert!(nb.ground.is_empty());
         assert_eq!(nb.buildings, d.buildings);
         // Meshes: R0 has the footway, R1 not.
-        let m0 = crate::ground::mesh_ground(g, &d.proj, 0);
-        let m1 = crate::ground::mesh_ground(g, &d.proj, 1);
+        let m0 = crate::ground::mesh_ground(g, &d.proj, 0, &Profile::default());
+        let m1 = crate::ground::mesh_ground(g, &d.proj, 1, &Profile::default());
         assert!(m0.triangle_count() > m1.triangle_count() && !m1.is_empty());
         assert!(m0.colors.iter().any(|c| *c == crate::ground::road_color(ROAD_PRIMARY, true)));
     }

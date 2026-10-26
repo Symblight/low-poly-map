@@ -16,11 +16,16 @@ lowpolymap/rust/
   Cargo.toml              # [workspace] members + shared [workspace.package] and profiles
   simworld-core/          # rlib, NO godot dependency (cargo tree -p simworld-core | grep -i godot = empty)
     src/
-      lib.rs              # module list, re-exports World / Log / Diagnostics, VERSION, API_MAJOR / API_MINOR
-      world.rs            # World: frame, LocalSpace, scheduler, worker; re-center (RECENTER_DISTANCE_M)
-                          #   and pending origin shift, re-delivery pacing, warning limit, profiling.
-                          #   update_camera, pop_ready, drain_fades, drain_unload, take_origin_shift,
-                          #   stats, ground_height_at, debug_tiles, configure
+      lib.rs              # module list, re-exports World / Log / Diagnostics / Profile, VERSION, API_MAJOR / API_MINOR
+      world.rs            # World: frame, LocalSpace, scheduler, worker, Arc<Profile>; re-center and pending
+                          #   origin shift, re-delivery pacing, warning limit, profiling. configure_world
+                          #   (WorldOptions -> ConfigureResult; validates first, nothing changes on error),
+                          #   configure (wrapper, default profile), update_camera, pop_ready, drain_fades,
+                          #   drain_unload, take_origin_shift, stats, ground_height_at, debug_tiles
+      profile.rs          # world profile: WorldProfile (serde data tree, Default = the spike constants),
+                          #   Profile (validated + lookup tables, shared as Arc), resolve(file, overrides),
+                          #   RANGES (single source of the allowed ranges), PROFILE_VERSION
+      golden_tests.rs     # determinism: quantized per-tile hashes (synthetic city, all bands) + cover golden
       diag.rs             # Log trait (info/warn/error), Diagnostics (profile, warnings_per_second)
       geo.rs              # Web Mercator, z/x/y, f64 ENU, floating origin
       rings.rs            # wanted set, look-ahead, hysteresis, priorities
@@ -38,15 +43,17 @@ lowpolymap/rust/
     src/
       lib.rs              # #[gdextension] entry (entry_symbol gdext_rust_init), version_string()
       streamer.rs         # #[derive(GodotClass)] WorldStreamer (Node): type conversion over World only
+      convert.rs          # Variant <-> serde_json::Value, configure_world options Dictionary -> WorldOptions
       host.rs             # GodotLog (Log -> godot_print!/godot_warn!/godot_error!), SIMPLANE_PROFILE -> Diagnostics
-  simworld-cli/           # headless runner binary (placeholder until P6)
+  simworld-cli/           # headless runner: validate-profile <file>, default-profile (fly/bake/tile/bench in P6)
+addons/simworld/profiles/ # default.json (every key = WorldProfile::default()) + world-profile.schema.json
 ```
 
 Core rules: the core never depends on `godot`, never reads environment variables, and logs only through the `Log` passed to `World::new`. `streamer.rs` holds no constants or state beyond type conversion; new logic goes into the core.
 
 ## Dependencies (verify current versions on crates.io before pinning)
 
-`godot` (gdext), `tokio` (rt-multi-thread), `reqwest` with `rustls-tls` and no default features, `pmtiles`, `mvt-reader` or `geozero`, `earcutr`, `geo` (Douglas–Peucker), `rayon`, `crossbeam-channel`, `lru`, `ahash`. No OpenSSL, no desktop-only crates.
+`godot` (gdext), `tokio` (rt-multi-thread), `reqwest` with `rustls-tls` and no default features, `pmtiles`, `mvt-reader` or `geozero`, `earcutr`, `geo` (Douglas–Peucker), `rayon`, `crossbeam-channel`, `lru`, `ahash`, `serde` + `serde_json` (`float_roundtrip`, so JSON reproduces the f64 defaults exactly). No OpenSSL, no desktop-only crates.
 
 ## Contract
 
@@ -57,8 +64,9 @@ The contract is `docs/contract.md`; read it before changing either side; any cha
 ## Implementation notes (not contract)
 
 - Keep all world math in f64 inside Rust; convert to f32 relative to the current origin only when building arrays (`poll_ready`).
-- Band tuning (`rings.rs`, `scheduler.rs`, `mesher.rs`, `ground.rs`, `lights.rs`): the values in contract.md section 5 are today's compiled-in defaults (`BAND_EDGE_M`, `HYSTERESIS`, `LOOK_AHEAD_S`, `R*_PARAMS`, `R*_GROUND`, `MAX_FETCH_PER_RING` = 4, `MAX_DECODE_PER_RING` = 2, `CLUSTER_ON/OFF_AGL_M`, `CLUSTER_CELL_M`, `FADE_CAP`). They move into the world profile in P3; changing a default changes behavior hosts see, so log it in `CHANGELOG.md`.
-- Structural constants (`RING_COUNT`, `ROOT_ZOOM`, `LEAF_ZOOM`) must match the tileset (`data/schema`) and are part of the contract (zooms 13–16).
+- Tuning lives in the world profile (`profile.rs`, contract 3.2), never in module constants: band edges / hysteresis / look-ahead (`Profile::bands()` -> `rings::BandParams`), DP tolerances and minimum areas (`Profile::lod`, `Profile::ground_params`), concurrency, re-delivery pacing, backoff, cluster altitudes and cell, fade cap, re-center distance, cache cap and HTTP timeouts (`fetch::FetchParams`), light profiles and colors, road/area tables. Functions take `&Profile` / `Arc<Profile>`; tests use `profile::test_default()`. To add a key: add the field + default, a `RANGES` entry for numbers, the key in `addons/simworld/profiles/default.json` (`cargo run -p simworld-cli -- default-profile`) and in the schema (the tests compare all three), bump `PROFILE_VERSION` and note it in `CHANGELOG.md`. Changing a default changes behaviour hosts see.
+- Golden hashes (`golden_tests.rs`) must stay unchanged by refactors. Regenerate only for an intended output change: `SIMWORLD_UPDATE_GOLDEN=1 cargo test -p simworld-core golden -- --nocapture`, and say why in the commit.
+- Structural constants (`RING_COUNT`, `ROOT_ZOOM`, `LEAF_ZOOM`, layer names) must match the tileset (`data/schema`), are part of the contract (zooms 13–16) and are not in the profile; `fetch::check_tileset` verifies an opened archive against them.
 
 ## Rules
 

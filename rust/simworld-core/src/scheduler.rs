@@ -35,7 +35,7 @@
 //! look-ahead point, which jumps by up to half a band radius when the velocity changes)
 //! across the band's hysteresis gap `0.15 * edge`: refine `t = max(t, t0 + (d0 - d) / gap)` (approaching), coarsen
 //! `t = min(t, t0 - (d - d0) / gap)` (receding), anchored where the fade started or last
-//! changed direction. It only moves forward, so hovering freezes it; after `FADE_CAP` it is
+//! changed direction. It only moves forward, so hovering freezes it; after `fades.cap_s` it is
 //! force-completed in its current direction. If the split decision flips during a fade, the
 //! fade reverses from its current `t` (no pop). Coarsening is bottom-up: a node merges only
 //! once none of its children is split, so the two sides of a fade always differ by one zoom
@@ -58,20 +58,14 @@ use bytes::Bytes;
 use crate::geo::{Frame, RectEn, TileKey};
 use crate::lights::LightSet;
 use crate::mesher::MeshData;
-use crate::rings::{
-    children, inside_with_hysteresis, look_ahead, look_ahead_clamp_m, parent, ring_for_zoom, root_wanted, siblings,
-    ViewPoint, BAND_EDGE_M, DEFAULT_TILE_HEIGHT_M, HYSTERESIS, RING_COUNT, ROOT_ZOOM,
-};
+use crate::profile::Profile;
+use crate::rings::{children, look_ahead, parent, ring_for_zoom, root_wanted, siblings, BandParams, ViewPoint, RING_COUNT, ROOT_ZOOM};
 use crate::worker::{Job, Payload, TileData, WorkerMsg};
 
-pub const MAX_FETCH_PER_RING: u32 = 4;
-pub const MAX_DECODE_PER_RING: u32 = 2;
-/// Light clustering switches on above this AGL (m) ...
-pub const CLUSTER_ON_AGL_M: f64 = 3300.0;
-/// ... and off below this one.
-pub const CLUSTER_OFF_AGL_M: f64 = 2700.0;
-/// Safety cap: a LOD fade is force-completed this long after it started.
-pub const FADE_CAP: Duration = Duration::from_secs(3);
+// Tuning (world profile): `streaming.max_fetch_per_band` / `max_mesh_per_band` (jobs in flight
+// per band), `lights.cluster_on_agl_m` / `cluster_off_agl_m` (light carpet switch),
+// `fades.cap_s` (fade safety cap), `streaming.retry_*` (backoff), `bands.*` (cover).
+
 /// Reported fade values are quantized to 1/256 so `fade` and `1 - fade` are exact in f32 and
 /// the two sides of a swap always sum to exactly 1.
 const FADE_QUANTUM: f64 = 256.0;
@@ -105,8 +99,8 @@ impl Fade {
     }
 
     /// Advance with the current slant distance `d` over the hysteresis gap `gap` (m).
-    /// Returns true when the fade has completed (target reached or safety cap).
-    fn advance(&mut self, d: f64, gap: f64, now: Instant) -> bool {
+    /// Returns true when the fade has completed (target reached or the safety cap `cap`).
+    fn advance(&mut self, d: f64, gap: f64, now: Instant, cap: Duration) -> bool {
         if d.is_finite() && gap > 0.0 {
             if self.refine {
                 self.t = self.t.max((self.t0 + (self.d0 - d) / gap).min(1.0));
@@ -115,7 +109,7 @@ impl Fade {
             }
         }
         let target = if self.refine { self.t >= 1.0 } else { self.t <= 0.0 };
-        target || now.saturating_duration_since(self.started) >= FADE_CAP
+        target || now.saturating_duration_since(self.started) >= cap
     }
 
     /// Quantized children fraction as reported to Godot. While active, the outgoing side
@@ -128,13 +122,8 @@ impl Fade {
 }
 
 /// The hysteresis gap (m) that drives the fade of a coarse tile of `ring` (>= 1).
-pub fn fade_gap_m(ring: usize) -> f64 {
-    BAND_EDGE_M[ring.max(1) - 1] * (HYSTERESIS - 1.0)
-}
-
-pub fn backoff(attempts: u32) -> Duration {
-    let ms = 500u64.saturating_mul(1u64 << attempts.saturating_sub(1).min(6));
-    Duration::from_millis(ms.min(30_000))
+pub fn fade_gap_m(b: &BandParams, ring: usize) -> f64 {
+    b.edge_m[ring.max(1) - 1] * (b.hysteresis - 1.0)
 }
 
 #[derive(Debug)]
@@ -228,6 +217,10 @@ impl ReadyTile {
 pub struct Scheduler {
     frame: Frame,
     synthetic: bool,
+    profile: Arc<Profile>,
+    /// Copies of profile values used per tile per frame.
+    bands: BandParams,
+    fade_cap: Duration,
     entries: AHashMap<TileKey, Entry>,
     ready: Vec<TileKey>,
     unloading: Vec<Entry>,
@@ -252,10 +245,13 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    pub fn new(frame: Frame, synthetic: bool) -> Self {
+    pub fn new(frame: Frame, synthetic: bool, profile: Arc<Profile>) -> Self {
         Self {
             frame,
             synthetic,
+            bands: *profile.bands(),
+            fade_cap: Duration::from_secs_f64(profile.fades.cap_s),
+            profile,
             entries: AHashMap::with_capacity(1024),
             ready: Vec::with_capacity(64),
             unloading: Vec::new(),
@@ -279,10 +275,15 @@ impl Scheduler {
         self.clustered
     }
 
+    pub fn profile(&self) -> &Arc<Profile> {
+        &self.profile
+    }
+
     /// Look-ahead view point per band. `cam` = (east, north, AGL), `vel` = (east, north, up).
     pub fn views(&self, cam: [f64; 3], vel: [f64; 3]) -> [ViewPoint; RING_COUNT] {
+        let b = &self.bands;
         std::array::from_fn(|r| {
-            let la = look_ahead(cam, vel, look_ahead_clamp_m(r));
+            let la = look_ahead(cam, vel, b.look_ahead_clamp_m(r), b.look_ahead_s);
             let (lat, lon) = self.frame.lat_lon(la[0], la[1]);
             // AGL -> the terrain scale of the tile boxes (terrain hook; 0 while flat).
             ViewPoint::new(lat, lon, la[2] + crate::geo::ground_height(lat, lon))
@@ -294,6 +295,8 @@ impl Scheduler {
     pub fn update(&mut self, cam: [f64; 3], vel: [f64; 3], now: Instant, jobs: &mut Vec<Job>) {
         self.epoch += 1;
         self.now = now;
+        let b = self.bands;
+        let default_h = b.default_tile_height_m;
         // Final fade values are reported once, by the `poll_fades` of the frame they completed in.
         self.fade_final.clear();
         self.update_light_mode(cam[2]);
@@ -302,15 +305,15 @@ impl Scheduler {
 
         // 1. Roots and the tree below them (hysteresis on both).
         self.roots.clear();
-        views[RING_COUNT - 1].root_candidates(&mut self.roots);
+        views[RING_COUNT - 1].root_candidates(&b, &mut self.roots);
         for i in 0..self.roots.len() {
             let k = self.roots[i];
             let (existing, h) = match self.entries.get(&k) {
-                Some(e) => (true, e.height.map_or(DEFAULT_TILE_HEIGHT_M, |h| h as f64)),
-                None => (false, DEFAULT_TILE_HEIGHT_M),
+                Some(e) => (true, e.height.map_or(default_h, |h| h as f64)),
+                None => (false, default_h),
             };
-            if root_wanted(&views[RING_COUNT - 1], k, h, existing) {
-                self.stack.push((k, DEFAULT_TILE_HEIGHT_M, false));
+            if root_wanted(&b, &views[RING_COUNT - 1], k, h, existing) {
+                self.stack.push((k, default_h, false));
             }
         }
         while let Some((k, inherited_h, frozen)) = self.stack.pop() {
@@ -342,7 +345,7 @@ impl Scheduler {
                 e.box_h = h;
                 e.prio_m = views[ring].slant_m(k, h);
                 e.split_d = if ring > 0 { views[ring - 1].slant_m(k, h) } else { 0.0 };
-                let want = ring > 0 && inside_with_hysteresis(e.split_d, BAND_EDGE_M[ring - 1], e.split);
+                let want = ring > 0 && b.inside(e.split_d, b.edge_m[ring - 1], e.split);
                 let mut freeze = false;
                 if want {
                     if e.coarsening {
@@ -415,7 +418,7 @@ impl Scheduler {
                 return true;
             }
             if e.held {
-                let mut u = std::mem::replace(e, Entry::blank(e.key, e.ring, e.rect, e.center));
+                let mut u = std::mem::replace(e, Entry::blank(e.key, e.ring, e.rect, e.center, default_h));
                 u.state = TileState::Idle;
                 u.split = false;
                 u.relight = false;
@@ -461,9 +464,10 @@ impl Scheduler {
     }
 
     fn update_light_mode(&mut self, agl: f64) {
-        let want = if agl > CLUSTER_ON_AGL_M {
+        let (on, off) = (self.profile.lights.cluster_on_agl_m, self.profile.lights.cluster_off_agl_m);
+        let want = if agl > on {
             true
-        } else if agl < CLUSTER_OFF_AGL_M {
+        } else if agl < off {
             false
         } else {
             self.clustered
@@ -505,7 +509,13 @@ impl Scheduler {
                     }
                     e
                 }
-                None => Entry::blank(k, ring, self.frame.tile_rect(k), self.frame.tile_center(k)),
+                None => Entry::blank(
+                    k,
+                    ring,
+                    self.frame.tile_rect(k),
+                    self.frame.tile_center(k),
+                    self.bands.default_tile_height_m,
+                ),
             };
             self.entries.insert(k, e);
         }
@@ -515,9 +525,10 @@ impl Scheduler {
     }
 
     fn dispatch(&mut self, jobs: &mut Vec<Job>) {
-        let full = (0..RING_COUNT).all(|r| {
-            self.decode_inflight[r] >= MAX_DECODE_PER_RING && (self.synthetic || self.fetch_inflight[r] >= MAX_FETCH_PER_RING)
-        });
+        let max_fetch = self.profile.streaming.max_fetch_per_band;
+        let max_decode = self.profile.streaming.max_mesh_per_band;
+        let full = (0..RING_COUNT)
+            .all(|r| self.decode_inflight[r] >= max_decode && (self.synthetic || self.fetch_inflight[r] >= max_fetch));
         if full {
             return;
         }
@@ -538,7 +549,7 @@ impl Scheduler {
             let Some(e) = self.entries.get_mut(&key) else { continue };
             let decode_stage = self.synthetic || matches!(e.state, TileState::Fetched(_));
             if decode_stage {
-                if self.decode_inflight[ring] >= MAX_DECODE_PER_RING {
+                if self.decode_inflight[ring] >= max_decode {
                     continue;
                 }
                 let payload = match std::mem::replace(&mut e.state, TileState::Decoding) {
@@ -550,7 +561,7 @@ impl Scheduler {
                 self.decode_inflight[ring] += 1;
                 jobs.push(Job::Decode { key, ring, job: e.job, payload });
             } else {
-                if self.fetch_inflight[ring] >= MAX_FETCH_PER_RING {
+                if self.fetch_inflight[ring] >= max_fetch {
                     continue;
                 }
                 e.state = TileState::Fetching;
@@ -565,7 +576,7 @@ impl Scheduler {
     /// Apply a worker result. Returns a warning to log (main thread) on failure.
     pub fn handle(&mut self, msg: WorkerMsg, now: Instant) -> Option<String> {
         match msg {
-            WorkerMsg::Info(_) => None,
+            WorkerMsg::Info(_) | WorkerMsg::Error(_) => None,
             WorkerMsg::Fetched { key, ring, job, result } => {
                 self.fetch_inflight[ring] = self.fetch_inflight[ring].saturating_sub(1);
                 let e = self.entries.get_mut(&key).filter(|e| e.job == job)?;
@@ -577,7 +588,7 @@ impl Scheduler {
                         e.state = TileState::Fetched(bytes);
                         None
                     }
-                    Err(err) => Some(Self::fail(e, now, "fetch", &err)),
+                    Err(err) => Some(Self::fail(e, now, "fetch", &err, &self.profile)),
                 }
             }
             WorkerMsg::Decoded { key, ring, job, result } => {
@@ -594,15 +605,15 @@ impl Scheduler {
                         self.ready.push(key);
                         None
                     }
-                    Err(err) => Some(Self::fail(e, now, "decode", &err)),
+                    Err(err) => Some(Self::fail(e, now, "decode", &err, &self.profile)),
                 }
             }
         }
     }
 
-    fn fail(e: &mut Entry, now: Instant, stage: &str, err: &str) -> String {
+    fn fail(e: &mut Entry, now: Instant, stage: &str, err: &str, profile: &Profile) -> String {
         e.attempts += 1;
-        let wait = backoff(e.attempts);
+        let wait = profile.backoff(e.attempts);
         e.state = TileState::Failed { retry_at: now + wait };
         format!(
             "WorldStreamer: {stage} {} failed (attempt {}, retry in {:.1}s): {err}",
@@ -675,10 +686,10 @@ impl Scheduler {
     /// Advance every fade with its coarse tile's slant distance; complete the finished ones.
     fn advance_fades(&mut self, now: Instant) {
         let mut done: Vec<(TileKey, bool)> = Vec::new();
-        let (entries, cam) = (&self.entries, &self.cam_view);
+        let (entries, cam, bands, cap) = (&self.entries, &self.cam_view, &self.bands, self.fade_cap);
         for (k, f) in self.fades.iter_mut() {
             let (Some(e), Some(v)) = (entries.get(k), cam) else { continue };
-            if f.advance(v.slant_m(*k, e.box_h), fade_gap_m(e.ring), now) {
+            if f.advance(v.slant_m(*k, e.box_h), fade_gap_m(bands, e.ring), now, cap) {
                 done.push((*k, f.refine));
             }
         }
@@ -937,7 +948,7 @@ impl Scheduler {
 }
 
 impl Entry {
-    fn blank(key: TileKey, ring: usize, rect: RectEn, center: [f64; 2]) -> Self {
+    fn blank(key: TileKey, ring: usize, rect: RectEn, center: [f64; 2], box_h: f64) -> Self {
         Self {
             key,
             ring,
@@ -955,7 +966,7 @@ impl Entry {
             coarsening: false,
             frozen: false,
             split_d: 0.0,
-            box_h: DEFAULT_TILE_HEIGHT_M,
+            box_h,
             rect,
             center,
         }
@@ -1099,11 +1110,22 @@ mod tests {
     use super::sim::GodotSim;
     use super::*;
     use crate::fetch::Source;
-    use crate::rings::{BAND_EDGE_M, HYSTERESIS, LEAF_ZOOM};
+    use crate::rings::LEAF_ZOOM;
     use crate::worker::build_tile;
     use std::collections::{HashSet, VecDeque};
 
     const VILNIUS: (f64, f64) = (54.6872, 25.2797);
+
+    /// The default world profile (the spike's constants).
+    fn dp() -> Arc<Profile> {
+        Arc::new(crate::profile::test_default().clone())
+    }
+    fn bands() -> BandParams {
+        *crate::profile::test_default().bands()
+    }
+    fn fade_cap() -> Duration {
+        Duration::from_secs_f64(crate::profile::test_default().fades.cap_s)
+    }
 
     /// Box height of fake tiles: deterministic 20..110 m by key (exercises per-tile heights).
     fn fake_height(k: TileKey) -> f32 {
@@ -1150,7 +1172,7 @@ mod tests {
                     }
                     Job::Decode { key, ring, job, payload } => {
                         let result = match self.real {
-                            Some(f) => build_tile(key, ring, f, &payload),
+                            Some(f) => build_tile(key, ring, f, &payload, crate::profile::test_default()),
                             None => Ok(fake_data(key, ring)),
                         };
                         (2, WorkerMsg::Decoded { key, ring, job, result })
@@ -1205,7 +1227,7 @@ mod tests {
         fn new() -> Self {
             let frame = Frame::new(VILNIUS.0, VILNIUS.1);
             Self {
-                s: Scheduler::new(frame, false),
+                s: Scheduler::new(frame, false, dp()),
                 w: FakeWorker::new(),
                 g: GodotSim::default(),
                 jobs: Vec::new(),
@@ -1407,9 +1429,9 @@ mod tests {
         assert_eq!(held, h.g.uploaded.iter().copied().collect::<HashSet<_>>());
         // Every z13 tile with slant < 25 km (box height known) is an uploaded root.
         let mut cands = Vec::new();
-        v.root_candidates(&mut cands);
+        v.root_candidates(&bands(), &mut cands);
         for k in cands {
-            if v.slant_m(k, fake_height(k) as f64) < BAND_EDGE_M[3] {
+            if v.slant_m(k, fake_height(k) as f64) < bands().edge_m[3] {
                 assert!(h.g.present(k), "missing root {k}");
             }
         }
@@ -1421,11 +1443,11 @@ mod tests {
             per[ring] += 1;
             let d = v.slant_m(k, fake_height(k) as f64);
             if ring > 0 {
-                assert!(d >= BAND_EDGE_M[ring - 1], "{k} at {d:.0} m should be finer");
+                assert!(d >= bands().edge_m[ring - 1], "{k} at {d:.0} m should be finer");
             }
             if let Some(p) = parent(k) {
                 let dp = v.slant_m(p, fake_height(p) as f64);
-                assert!(dp < BAND_EDGE_M[ring] * HYSTERESIS, "{k}: parent {p} at {dp:.0} m");
+                assert!(dp < bands().edge_m[ring] * bands().hysteresis, "{k}: parent {p} at {dp:.0} m");
             }
         }
         // The point under the camera is covered exactly once, by the band its distance says.
@@ -1550,8 +1572,8 @@ mod tests {
                 h.check_frame(&un, "hold");
                 let views = h.s.views(pos(t), [0.0; 3]);
                 for e in h.s.entries().filter(|e| e.split) {
-                    let d = views[e.ring - 1].slant_m(e.key, e.height.map_or(DEFAULT_TILE_HEIGHT_M, |x| x as f64));
-                    if d >= BAND_EDGE_M[e.ring - 1] {
+                    let d = views[e.ring - 1].slant_m(e.key, e.height.map_or(bands().default_tile_height_m, |x| x as f64));
+                    if d >= bands().edge_m[e.ring - 1] {
                         held_by_hysteresis += 1;
                     }
                 }
@@ -1616,7 +1638,7 @@ mod tests {
     fn synthetic_city_streams_real_meshes_and_lights() {
         let mut h = Harness::new();
         let frame = Frame::new(VILNIUS.0, VILNIUS.1);
-        h.s = Scheduler::new(frame, true);
+        h.s = Scheduler::new(frame, true, dp());
         h.w.real = Some(frame);
         let mut tris = [0usize; RING_COUNT];
         let mut ground = [0usize; RING_COUNT];
@@ -1655,7 +1677,7 @@ mod tests {
     #[test]
     fn failures_back_off_and_retry_and_block_only_their_group() {
         let frame = Frame::new(VILNIUS.0, VILNIUS.1);
-        let mut s = Scheduler::new(frame, false);
+        let mut s = Scheduler::new(frame, false, dp());
         let t0 = Instant::now();
         let mut jobs = Vec::new();
         s.update([0.0, 0.0, 8000.0], [0.0; 3], t0, &mut jobs);
@@ -1670,17 +1692,17 @@ mod tests {
         s.update([0.0, 0.0, 8000.0], [0.0; 3], t0, &mut jobs);
         assert_eq!(jobs.len(), 4, "next tiles go out while the failed ones wait");
         jobs.clear();
-        s.update([0.0, 0.0, 8000.0], [0.0; 3], t0 + backoff(1), &mut jobs);
+        s.update([0.0, 0.0, 8000.0], [0.0; 3], t0 + dp().backoff(1), &mut jobs);
         assert_eq!(s.stats().failed[3], 0);
-        assert_eq!(backoff(1), Duration::from_millis(500));
-        assert_eq!(backoff(3), Duration::from_millis(2000));
-        assert_eq!(backoff(20), Duration::from_secs(30));
+        assert_eq!(dp().backoff(1), Duration::from_millis(500));
+        assert_eq!(dp().backoff(3), Duration::from_millis(2000));
+        assert_eq!(dp().backoff(20), Duration::from_secs(30));
     }
 
     #[test]
     fn stale_results_are_ignored() {
         let frame = Frame::new(VILNIUS.0, VILNIUS.1);
-        let mut s = Scheduler::new(frame, false);
+        let mut s = Scheduler::new(frame, false, dp());
         let now = Instant::now();
         let mut jobs = Vec::new();
         s.update([0.0, 0.0, 300.0], [0.0; 3], now, &mut jobs);
@@ -1690,13 +1712,13 @@ mod tests {
         s.update([200_000.0, 0.0, 300.0], [0.0; 3], now, &mut more);
         assert!(s.handle(WorkerMsg::Fetched { key, ring, job, result: Ok((Bytes::new(), Source::Network)) }, now).is_none());
         assert!(s.pop_ready(true).is_none());
-        assert_eq!(s.inflight().0[ring], MAX_FETCH_PER_RING - 1);
+        assert_eq!(s.inflight().0[ring], dp().streaming.max_fetch_per_band - 1);
     }
 
     #[test]
     fn dropped_parent_forgets_pending_work() {
         for pending in [TileState::Queued, TileState::Failed { retry_at: Instant::now() }, TileState::Fetched(Bytes::new())] {
-            let mut s = Scheduler::new(Frame::new(VILNIUS.0, VILNIUS.1), false);
+            let mut s = Scheduler::new(Frame::new(VILNIUS.0, VILNIUS.1), false, dp());
             let k = TileKey::new(14, 9000, 5000);
             let e = s.touch(k, 2);
             e.held = true;
@@ -1784,41 +1806,41 @@ mod tests {
     #[test]
     fn fade_math_refine_coarsen_reverse_and_cap() {
         let t0 = Instant::now();
-        let gap = fade_gap_m(1); // 90 m (R0 edge 600 m)
+        let gap = fade_gap_m(&bands(), 1); // 90 m (R0 edge 600 m)
         assert!((gap - 90.0).abs() < 1e-9);
-        assert!((fade_gap_m(3) - 1050.0).abs() < 1e-9);
+        assert!((fade_gap_m(&bands(), 3) - 1050.0).abs() < 1e-9);
         // Refine: approaching by 45 m = half way; hovering keeps it; receding never undoes it.
         let mut f = Fade::new(true, 580.0, t0);
         assert_eq!((f.reported(), f.t), (0.0, 0.0));
-        assert!(!f.advance(535.0, gap, t0));
+        assert!(!f.advance(535.0, gap, t0, fade_cap()));
         assert!((f.t - 0.5).abs() < 1e-12);
-        assert!(!f.advance(535.0, gap, t0 + Duration::from_millis(500)));
-        assert!(!f.advance(560.0, gap, t0 + Duration::from_millis(600)));
+        assert!(!f.advance(535.0, gap, t0 + Duration::from_millis(500), fade_cap()));
+        assert!(!f.advance(560.0, gap, t0 + Duration::from_millis(600), fade_cap()));
         assert!((f.t - 0.5).abs() < 1e-12, "receding must not undo a refine fade");
         // Reverse at 560 m: coarsen continues from 0.5; 18 m farther = 0.2 down.
         f.retarget(false, 560.0);
-        assert!(!f.advance(578.0, gap, t0 + Duration::from_millis(700)));
+        assert!(!f.advance(578.0, gap, t0 + Duration::from_millis(700), fade_cap()));
         assert!((f.t - 0.3).abs() < 1e-12);
         // Done when the target is reached.
-        assert!(f.advance(700.0, gap, t0 + Duration::from_millis(800)));
+        assert!(f.advance(700.0, gap, t0 + Duration::from_millis(800), fade_cap()));
         assert_eq!(f.t, 0.0);
         // Coarsen from scratch: children 1 -> 0 with distance, parent the complement.
         let mut c = Fade::new(false, 700.0, t0);
         assert_eq!(c.reported(), 1.0);
-        assert!(!c.advance(745.0, gap, t0));
+        assert!(!c.advance(745.0, gap, t0, fade_cap()));
         assert!((c.reported() - 0.5).abs() < 1e-6);
-        // Safety cap: a frozen fade completes after FADE_CAP, not before.
+        // Safety cap: a frozen fade completes after the cap (fades.cap_s), not before.
         let mut h = Fade::new(true, 580.0, t0);
-        assert!(!h.advance(580.0, gap, t0 + FADE_CAP - Duration::from_millis(1)));
-        assert!(h.advance(580.0, gap, t0 + FADE_CAP));
+        assert!(!h.advance(580.0, gap, t0 + fade_cap() - Duration::from_millis(1), fade_cap()));
+        assert!(h.advance(580.0, gap, t0 + fade_cap(), fade_cap()));
         assert_eq!(h.t, 0.0, "the cap completes without inventing progress");
         // While active the outgoing side never reads 0; values are exact complements in f32.
         let mut a = Fade::new(true, 600.0, t0);
-        a.advance(600.0 - 0.9999 * gap, gap, t0);
+        a.advance(600.0 - 0.9999 * gap, gap, t0, fade_cap());
         let r = a.reported();
         assert!(r < 1.0 && (1.0 - r) > 0.0 && r + (1.0 - r) == 1.0);
         let mut b = Fade::new(false, 600.0, t0);
-        b.advance(600.0 + 0.9999 * gap, gap, t0);
+        b.advance(600.0 + 0.9999 * gap, gap, t0, fade_cap());
         assert!(b.reported() > 0.0);
     }
 
@@ -1999,7 +2021,7 @@ mod tests {
             }
         }
         let took = done.expect("cap never fired") - start;
-        let cap_frames = (FADE_CAP.as_secs_f64() / DT).round() as usize;
+        let cap_frames = (fade_cap().as_secs_f64() / DT).round() as usize;
         assert!((cap_frames..=cap_frames + 1).contains(&took), "cap after {took} frames");
     }
 
@@ -2031,7 +2053,7 @@ mod tests {
             }
         }
         assert!(h.s.settled() && !durations.is_empty());
-        let cap_frames = (FADE_CAP.as_secs_f64() / DT).round() as usize;
+        let cap_frames = (fade_cap().as_secs_f64() / DT).round() as usize;
         assert!(durations.iter().all(|d| (cap_frames..=cap_frames + 1).contains(d)), "{durations:?}");
         eprintln!("hover start: {} fades, all completed by the cap", durations.len());
     }
@@ -2088,7 +2110,7 @@ mod tests {
         // triangle wins, so the ground mesh must be emitted bottom stacking level first.
         let frame = Frame::new(VILNIUS.0, VILNIUS.1);
         let k = crate::geo::tile_for(VILNIUS.0, VILNIUS.1, 14);
-        let data = build_tile(k, 2, frame, &Payload::Synthetic).unwrap();
+        let data = build_tile(k, 2, frame, &Payload::Synthetic, &Profile::default()).unwrap();
         let m = &data.ground;
         assert!(m.triangle_count() > 0);
         let mut last = f32::NEG_INFINITY;

@@ -1,6 +1,6 @@
 # WorldStreamer contract
 
-api_version: 0.5
+api_version: 0.6
 
 This is the only full statement of the contract between the SimWorld library (the Rust `WorldStreamer` GDExtension node, crates `simworld-core` + `simworld-godot`) and any host that displays it (today the C# test bench in `low-poly-map/`, later the SimPlane game). Everything a host may rely on is here; everything else is an implementation detail.
 
@@ -21,7 +21,7 @@ Planned items (section 12) carry target versions. They are assigned in this orde
 | api_version | Content | Phase |
 |---|---|---|
 | 0.5 | Everything built today (sections 3–11), plus `api_version()` and `debug_stats` `api_major`/`api_minor` | baseline + P2 |
-| 0.6 | `configure_world(options)`, `world_profile()`; `configure(...)` becomes a wrapper | P3 Config |
+| 0.6 | `configure_world(options)`, `world_profile()`, the world profile (section 3.2); `configure(...)` becomes a wrapper (**built**) | P3 Config |
 | 0.7 | `update_camera_geodetic`, `geodetic_to_local`, `local_to_geodetic`, signal `origin_shifted`, `attributions()`, `shutdown()`, `status()` + signal `status_changed`, lifecycle rules (several instances, re-configure teleport, cache lock) | P4 Host API |
 | 0.8 | `set_clock`, `daylight()` | M6 Night |
 | 0.9 | `configure_imagery`, ready-tile key `imagery`, ground `TEX_UV`, R3 imagery ground quad | M7 Imagery |
@@ -38,12 +38,14 @@ Planned items (section 12) carry target versions. They are assigned in this orde
 
 ## 3. Methods [0.5]
 
-Class `WorldStreamer` extends `Node`, registered by the GDExtension (entry symbol `gdext_rust_init`). It is not a tool class (runs in-game only). Create it with `ClassDB.Instantiate("WorldStreamer")` and call it through `GodotObject.Call(...)`, from the **main thread only**. Every method is non-blocking; `update_camera` and `poll_*` target < 0.5 ms. Before `configure` every method is a harmless no-op returning an empty value (`api_version` works always). Errors never panic across FFI: they are logged (`godot_warn!` / `godot_error!`, rate-limited) and retried with backoff.
+Class `WorldStreamer` extends `Node`, registered by the GDExtension (entry symbol `gdext_rust_init`). It is not a tool class (runs in-game only). Create it with `ClassDB.Instantiate("WorldStreamer")` and call it through `GodotObject.Call(...)`, from the **main thread only**. Every method is non-blocking; `update_camera` and `poll_*` target < 0.5 ms. Before `configure` / `configure_world` every method is a harmless no-op returning an empty value (`api_version` works always; `world_profile` returns the defaults). Errors never panic across FFI: they are logged (`godot_warn!` / `godot_error!`, rate-limited) and retried with backoff.
 
 | Method | Since | Purpose |
 |---|---|---|
 | `api_version() -> Vector2i` | 0.5 | Contract version `(major, minor)`, see section 1. Constant; callable before `configure`. |
-| `configure(origin_lat: float, origin_lon: float, tile_url: String, cache_dir: String)` | 0.5 | Set the world origin (WGS84 degrees) and data source, (re)start the workers. `tile_url` (trimmed): an `http://` or `https://` URL of a `.pmtiles` v3 archive (section 10); **empty = the offline deterministic synthetic city**. `cache_dir`: absolute folder for the disk tile cache (empty = no disk cache). Calling it again drops the old workers and cover; every tile delivered before is returned by the next `poll_unload` (the cache is kept). |
+| `configure(origin_lat: float, origin_lon: float, tile_url: String, cache_dir: String)` | 0.5 | Set the world origin (WGS84 degrees) and data source, (re)start the workers. `tile_url` (trimmed): an `http://` or `https://` URL of a `.pmtiles` v3 archive (section 10); **empty = the offline deterministic synthetic city**. `cache_dir`: absolute folder for the disk tile cache (empty = no disk cache). Calling it again drops the old workers and cover; every tile delivered before is returned by the next `poll_unload` (the cache is kept). **[0.6]** A wrapper over `configure_world` with these four keys and the **default** world profile (a profile set by an earlier `configure_world` is not kept); errors (e.g. a non-http URL, an origin outside ±85.05° / ±180°) are logged and leave the previous configuration running. |
+| `configure_world(options: Dictionary) -> Dictionary` | 0.6 | Like `configure`, plus the world profile and diagnostics. Options and result: section 3.1. Validates everything first: on an error nothing changes and the result says why. |
+| `world_profile() -> Dictionary` | 0.6 | The resolved world profile (section 3.2) as a Dictionary with exactly the keys of `addons/simworld/profiles/default.json` (objects → Dictionary, arrays → Array, integers → int, other numbers → float, names → String). Defaults until a `configure_world` with a profile; a later `configure` resets it to the defaults. For shader globals and debug UI. |
 | `update_camera(local_pos: Vector3, velocity: Vector3, alt_agl_m: float)` | 0.5 | Call every frame first. `local_pos`: camera in the local frame — only **x and z** are used; `y` is ignored, the height comes from `alt_agl_m`. `velocity`: m/s in local axes (vertical speed included, it feeds the look-ahead). `alt_agl_m`: camera height above ground (m); negative or non-finite values count as 0. Applies worker results, re-centers if needed (section 2), recomputes the cover, advances fades and queues jobs. |
 | `take_origin_shift() -> Vector3` | 0.5 | Non-zero exactly once after a re-center (`(dx, 0, dz)`), else `Vector3.ZERO`. Subtract it from the camera and every tile root in the same frame. |
 | `poll_ready(max: int) -> Array[Dictionary]` | 0.5 | Up to `max` finished tiles (`max < 0` counts as 0), finer bands and nearer tiles first. Shape: section 4. At most 1 light-mode re-delivery per frame (section 8). |
@@ -69,6 +71,43 @@ Hosts must ignore unknown keys (new keys are additive).
 
 **`debug_tiles()` entry keys:** `key` (String `z/x/y`), `ring` (int 0–3), `state` (String: `queued`, `fetching`, `meshing`, `ready`, `failed`, `unloading`; `ready` also covers tiles delivered and held by the host), `min`, `max` (Vector2: tile rect corners in current local x/z meters).
 
+### 3.1 `configure_world` options and result [0.6]
+
+`options` keys (unknown keys are logged as a warning and ignored, so a host written for a later minor can pass newer keys):
+
+| Key | Type | Required | Meaning |
+|---|---|---|---|
+| `origin_lat`, `origin_lon` | float (int accepted) | yes | World origin, WGS84 degrees: latitude within ±85.0511 (Web Mercator), longitude within ±180 |
+| `tile_url` | String | no (default `""`) | As in `configure`: `http(s)://` `.pmtiles` URL, empty = synthetic city. Any other scheme is an error. |
+| `cache_dir` | String | no (default `""`) | As in `configure` |
+| `profile_path` | String | no | World profile JSON file (`res://`, `user://` or an OS path; read through Godot's file system). Partial files are fine. Omitted = the defaults. |
+| `profile_overrides` | Dictionary | no | Partial world profile merged onto the file (or the defaults): same keys and nesting as the JSON, objects merge deeply, arrays and scalars replace. Integral floats are accepted for integer keys (Godot's JSON parser yields floats); a `Color` is accepted for an rgb key (alpha ignored). |
+| `diagnostics` | Dictionary | no | `profile` (bool: log a phase breakdown for main-thread calls slower than 1 ms), `warnings_per_second` (int 1..1000, default 5). Omitted keys keep their current values (initially the host defaults, e.g. `SIMPLANE_PROFILE=1`). |
+
+Result Dictionary (always all keys):
+
+| Key | Type | Meaning |
+|---|---|---|
+| `ok` | bool | The configuration was applied |
+| `error` | String | Why not (empty when `ok`). Profile errors name the key, the value and the allowed range, e.g. ``profile: bands.hysteresis = 3 is out of range [1.01, 2]`` or ``profile_overrides: unknown key `bands.r0_edge` ``. |
+| `api_version` | Vector2i | Same as `api_version()` |
+| `attributions` | PackedStringArray | Attribution strings the host must show while map data is visible: `["© OpenStreetMap contributors"]` for a `tile_url` source, empty for the synthetic city. On failure, those of the configuration still running. |
+
+On success it behaves like `configure` (teleport): the old workers and cover are dropped, every tile delivered before is returned by the next `poll_unload`, the disk cache is kept. On failure nothing changes (the previous configuration keeps running, nothing is unloaded).
+
+**Tileset contract check [0.6]:** the archive is opened asynchronously (a warm cache works offline, so `configure_world` never waits for the network). When it opens, its header zoom range must cover 13..16 and its metadata `vector_layers` must contain `buildings`, `landuse` and `roads`. On a mismatch an error naming the problem is logged once (`godot_error!`) and every fetch from that archive fails (logged, rate-limited, retried with backoff); `configure_world` itself has already returned `ok`. The synthetic city is exempt.
+
+### 3.2 World profile [0.6]
+
+Every tuning value of the world is data: band edges, hysteresis and look-ahead; building and ground Douglas-Peucker tolerances and minimum areas; fetch and mesh concurrency, re-delivery pacing and retry backoff; light carpet altitudes and cell size; the fade safety cap; the re-center distance; cache cap and HTTP timeouts; light profiles (building kinds → profile, sprite colors, landuse fallback); road classes (highway values), widths and link rule; area groups (landuse kinds → class and stacking level) and the per-band lift step.
+
+- **Files:** `addons/simworld/profiles/default.json` lists every key with its default (= the compiled-in defaults, the values in sections 2, 5, 8, 9 and 10; pinned by `cargo test`). `addons/simworld/profiles/world-profile.schema.json` (JSON Schema 2020-12) documents every key with units and allowed range. The core checks values itself (`simworld-cli validate-profile <file>` runs that check); the schema is for editors and humans.
+- **Partial profiles:** every key is optional; omitted keys keep their defaults. Objects merge deeply (`profile_path` file first, then `profile_overrides`), arrays and scalars replace. `ground.areas` is a map with free group names (a new name adds a group).
+- **`profile_version`** (int, today **1**): a file (or overrides) with the library's version or older is strict, an unknown key is an error (a typo). A newer version loads: unknown keys are logged as warnings and ignored, known keys apply. The resolved profile (`world_profile()`) always carries the library's version.
+- **Validation:** out-of-range values, wrong types, `r0_edge_m < r1_edge_m < r2_edge_m < r3_edge_m` violations, `cluster_off_agl_m > cluster_on_agl_m`, `retry_max_s < retry_base_s`, a building kind in two light profiles, a landuse kind in two area groups or a highway value in two road classes are errors.
+- **Not in the profile (structural, part of the tileset contract):** 4 bands over zooms 13..16 (`ring = 16 − z`), the layer names, the COLOR encodings (section 7, 9), the fade quantum, the light intensity formula (section 8).
+- A profile change never serves stale geometry: only raw tile bytes are cached (section 10).
+
 ## 4. Ready-tile dictionary [0.5]
 
 Every entry of `poll_ready` has all of these keys, on first delivery and on every re-delivery:
@@ -89,7 +128,7 @@ Mesh Arrays (non-empty) have size `Mesh.ARRAY_MAX`; filled slots are `VERTEX` (P
 
 ## 5. LOD cover, guarantees and visibility rule [0.5]
 
-**Cover (informative; values become tunable in 0.6).** Rust selects tiles as a quadtree cover by 3D slant distance `d = √(horizontal² + (cam_alt − ground)²)` to the nearest point of the tile box (footprint × the tile's max building height):
+**Cover (default values; tunable through the world profile `bands`, `buildings`, `ground` since 0.6).** Rust selects tiles as a quadtree cover by 3D slant distance `d = √(horizontal² + (cam_alt − ground)²)` to the nearest point of the tile box (footprint × the tile's max building height):
 
 | Band | ring | Zoom | Slant distance | Buildings | Ground | Lights |
 |---|---|---|---|---|---|---|
@@ -180,26 +219,20 @@ One flat ground mesh per R0–R2 tile: landuse/park/water areas plus buffered ro
 ## 10. Data source, cache, attribution [0.5]
 
 - Tile source: a self-hosted PMTiles v3 archive (planetiler profile in `data/`) with layers `buildings` (keeping building `kind`), `landuse` and `roads`, zooms 13–16, fetched with HTTP range requests (rustls; no OpenSSL). Never public OSM tile servers.
-- Disk cache under `cache_dir` (per source URL), raw tile bytes keyed by `z/x/y`, LRU capped at 300 MB, survives restarts and works offline when warm. It is wiped when the archive's header fingerprint or the cache schema version changes. Meshes are never cached, so a meshing change never serves stale geometry.
-- Attribution "© OpenStreetMap contributors" must be shown by the host whenever map data is visible (exposed by `attributions()` from 0.7).
+- Disk cache under `cache_dir` (per source URL), raw tile bytes keyed by `z/x/y`, LRU capped at 300 MiB (profile `cache.cap_mb` since 0.6), survives restarts and works offline when warm. It is wiped when the archive's header fingerprint or the cache schema version changes. Meshes are never cached, so a meshing change never serves stale geometry.
+- Attribution "© OpenStreetMap contributors" must be shown by the host whenever map data is visible (returned by `configure_world` since 0.6; `attributions()` from 0.7).
+- The archive must match the tileset contract (zooms 13..16, layers `buildings`, `landuse`, `roads`); checked when it opens (section 3.1). **[0.6]**
 
 ## 11. Determinism and threading [0.5]
 
-- Same tile → same mesh, same ground, same lights and same lit windows: everything is seeded by OSM id, with no time-based or process-random state. Output order is deterministic. (Not yet pinned by golden hashes; planned in P6.)
+- Same tile → same mesh, same ground, same lights and same lit windows: everything is seeded by OSM id, with no time-based or process-random state. Output order is deterministic. Pinned since 0.6 by golden hashes in `cargo test` (`simworld-core` `golden_tests`: per-tile hashes of the synthetic city for all 4 bands, positions quantized to 1 mm, colors to 8 bits, per-building output sorted by OSM id; plus the cover for fixed cameras). P6 adds the real-data fixture and both CPU architectures.
 - The library never calls Godot APIs off the main thread; workers produce plain Rust structs and conversion to Packed arrays happens inside `poll_ready` on the calling thread.
 
-**Lifecycle today [0.5]:** one node = one world. Re-calling `configure` is a fresh start (see `configure`). Freeing the node stops the workers in the background (no wait, no cache flush). Several nodes in one process are not specified yet and must not share a `cache_dir` (rules arrive in 0.7).
+**Lifecycle today [0.5]:** one node = one world. Re-calling `configure` or (0.6) a successful `configure_world` is a fresh start (see `configure`); a failed `configure_world` changes nothing. Freeing the node stops the workers in the background (no wait, no cache flush). Several nodes in one process are not specified yet and must not share a `cache_dir` (rules arrive in 0.7).
 
 ## 12. Planned API (not built)
 
 Shapes below are targets from `docs/spec-library-packaging.md` (section 4) and `docs/spike-streamed-osm-city.md`. Until the stated `api_version` is reported, hosts must not call them. Details may still change before they land; once landed they follow section 1.
-
-### 0.6 — Configuration (P3)
-
-| Addition | Shape |
-|---|---|
-| `configure_world(options: Dictionary) -> Dictionary` | Keys: `origin_lat`, `origin_lon`, `tile_url`, `cache_dir`, `profile_path` (optional), `profile_overrides` (optional nested Dictionary, same keys as the JSON world profile), `diagnostics`. Result `{ ok: bool, error: String, api_version: Vector2i, attributions: PackedStringArray }`. The old `configure(...)` stays as a wrapper. Structural values (ring count, zooms 13–16) are not in the profile; the opened `.pmtiles` header (min/max zoom) and required layers are checked, and a mismatch fails with a clear error. |
-| `world_profile() -> Dictionary` | The resolved world profile (band distances and hysteresis, DP tolerances, minimum areas, concurrency, cluster altitudes and cell size, fade cap, re-center distance, cache caps, light profiles, road classes and widths, area classes and lifts) for shader globals and debug UI. The profile carries `profile_version`; unknown keys are an error for the library's own or older versions and a warning for newer ones. |
 
 ### 0.7 — Host API and lifecycle (P4)
 
@@ -216,7 +249,7 @@ Shapes below are targets from `docs/spec-library-packaging.md` (section 4) and `
 **Lifecycle rules (0.7):**
 
 - Several instances in one process are allowed (e.g. a main view plus a map viewport), each with its own world; they share nothing except optionally the tokio runtime. Two instances must not use the same `cache_dir`: the core takes an exclusive lock file and `configure_world` returns an error if the folder is in use.
-- **Teleport:** calling `configure_world` again with a new origin drops all tiles (every loaded key appears in `poll_unload`), resets the origin and keeps the cache. The host treats it as a fresh start. (The unload part already holds for `configure` in 0.5.)
+- **Teleport:** calling `configure_world` again with a new origin drops all tiles (every loaded key appears in `poll_unload`), resets the origin and keeps the cache. The host treats it as a fresh start. (Already holds for `configure` since 0.5 and `configure_world` since 0.6; 0.7 adds the cache lock and several instances.)
 - The cache key includes the tileset fingerprint and the cache schema version; raw bytes are cached, meshes are not, so a profile change never serves stale geometry. If meshes are ever cached, the profile hash joins the key.
 
 ### 0.8 — Daylight (M6)

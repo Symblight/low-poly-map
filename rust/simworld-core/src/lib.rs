@@ -9,6 +9,8 @@
 //! and R2/R3 light points with a clustered light carpet above ~3000 m AGL.
 //! Milestone 5 (Ground): one flat ground mesh per R0-R2 tile (landuse / park / water areas and
 //! buffered road strips) and the `ground_height` terrain hook (flat for now).
+//! P3 (Config): every tuning value lives in the world [`profile`] (JSON, compiled-in defaults
+//! equal to the spike's constants), resolved by [`World::configure_world`].
 
 pub mod diag;
 pub mod fetch;
@@ -17,6 +19,7 @@ pub mod ground;
 pub mod lights;
 pub mod mesher;
 pub mod mvt;
+pub mod profile;
 pub mod rings;
 pub mod scheduler;
 pub mod synthetic;
@@ -24,10 +27,13 @@ pub mod worker;
 pub mod world;
 
 #[cfg(test)]
+mod golden_tests;
+#[cfg(test)]
 mod integration_tests;
 
 pub use diag::{Diagnostics, Log, NullLog};
-pub use world::{ReadyTileView, World, WorldStats};
+pub use profile::{Profile, WorldProfile, PROFILE_VERSION};
+pub use world::{ConfigureResult, ReadyTileView, World, WorldOptions, WorldStats, OSM_ATTRIBUTION};
 
 /// Version of this crate (`simworld-core`).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -37,7 +43,7 @@ pub const API_MAJOR: u32 = 0;
 /// Contract (`docs/contract.md`) minor version. A minor bump is additive only.
 /// Independent of the crate version; must equal the `api_version:` line of `docs/contract.md`
 /// (pinned by `tests::api_version_matches_contract_doc`).
-pub const API_MINOR: u32 = 5;
+pub const API_MINOR: u32 = 6;
 
 #[cfg(test)]
 mod tests {

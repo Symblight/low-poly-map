@@ -5,12 +5,17 @@
 //!   then each tile is one range request. reqwest uses rustls only; plain http:// also works.
 //! * Disk: raw tile bytes exactly as stored in the archive (gzip MVT for planetiler) at
 //!   `{cache_dir}/{source-hash}/{z}/{x}/{y}.mvt`; a zero-length file records "no tile here".
-//!   LRU by file mtime (touched on hit), capped at 300 MB, survives restarts. The cache is
+//!   LRU by file mtime (touched on hit), capped (world profile `cache.cap_mb`, default 300 MiB),
+//!   survives restarts. The cache is
 //!   consulted before the archive is even opened, so a warm cache works fully offline.
 //! * Staleness: the cache folder holds a `fingerprint` file (hash of the archive header). Once
 //!   the archive has been opened, a different fingerprint wipes the cached tiles, so rebuilding
 //!   the archive at the same URL never serves old tiles. While the archive is unreachable the
 //!   cache is served as is (offline use) and validated as soon as it can be opened.
+//!
+//! * Tileset contract (audit A18): when the archive opens, its header zoom range must cover
+//!   13..16 and its metadata must list the `buildings`, `landuse` and `roads` layers; otherwise
+//!   every fetch fails with that error (reported once through [`Note::Error`]).
 //!
 //! Everything here runs on tokio / blocking threads and never touches Godot.
 
@@ -26,16 +31,78 @@ use lru::LruCache;
 use pmtiles::{AsyncPmTilesReader, Compression, HashMapCache, HttpBackend, TileCoord};
 
 use crate::geo::TileKey;
-use crate::mvt::splitmix64;
+use crate::mvt::{splitmix64, BUILDINGS_LAYER, LANDUSE_LAYER, ROADS_LAYER};
+use crate::profile::Profile;
+use crate::rings::{LEAF_ZOOM, ROOT_ZOOM};
 
-pub const CACHE_CAP_BYTES: u64 = 300 * 1024 * 1024;
-const OPEN_RETRY_MIN: Duration = Duration::from_millis(1500);
+/// Fetch / cache tuning (world profile `cache.*`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FetchParams {
+    /// Disk cache LRU cap (bytes).
+    pub cache_cap_bytes: u64,
+    pub connect_timeout: Duration,
+    pub request_timeout: Duration,
+    /// Minimum wait before re-opening an archive that failed to open.
+    pub open_retry: Duration,
+    /// While the archive cannot be opened, try validating the cache this often.
+    pub validate_retry: Duration,
+}
+
+impl FetchParams {
+    pub fn from_profile(p: &Profile) -> Self {
+        let c = &p.cache;
+        Self {
+            cache_cap_bytes: (c.cap_mb * 1024.0 * 1024.0).round() as u64,
+            connect_timeout: Duration::from_secs_f64(c.connect_timeout_s),
+            request_timeout: Duration::from_secs_f64(c.request_timeout_s),
+            open_retry: Duration::from_secs_f64(c.open_retry_s),
+            validate_retry: Duration::from_secs_f64(c.validate_retry_s),
+        }
+    }
+}
+
+impl Default for FetchParams {
+    fn default() -> Self {
+        Self::from_profile(&Profile::default())
+    }
+}
+
+/// Messages from the fetcher to the main thread (logged there).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Note {
+    Info(String),
+    /// Configuration problem that will not go away by retrying (e.g. a tileset mismatch).
+    Error(String),
+}
+
+/// Check an opened archive against the tileset contract: zooms 13..16 and the layers the
+/// decoder needs (`metadata` = the archive's JSON metadata).
+pub fn check_tileset(min_zoom: u8, max_zoom: u8, metadata: &str) -> Result<(), String> {
+    if min_zoom > ROOT_ZOOM || max_zoom < LEAF_ZOOM {
+        return Err(format!(
+            "tileset zoom range z{min_zoom}-{max_zoom} does not cover z{ROOT_ZOOM}-{LEAF_ZOOM} (the library's bands need every zoom from {ROOT_ZOOM} to {LEAF_ZOOM}; rebuild the archive with data/build_tiles.sh)"
+        ));
+    }
+    let meta: serde_json::Value = serde_json::from_str(metadata).map_err(|e| format!("tileset metadata is not JSON: {e}"))?;
+    let Some(layers) = meta.get("vector_layers").and_then(|v| v.as_array()) else {
+        return Err("tileset metadata has no `vector_layers`: cannot verify the required layers (buildings, landuse, roads)".into());
+    };
+    let ids: Vec<&str> = layers.iter().filter_map(|l| l.get("id").and_then(|i| i.as_str())).collect();
+    let missing: Vec<&str> =
+        [BUILDINGS_LAYER, LANDUSE_LAYER, ROADS_LAYER].into_iter().filter(|l| !ids.contains(l)).collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "tileset lacks required layer(s) {} (has: {}); build it with the planetiler profile in data/",
+            missing.join(", "),
+            ids.join(", ")
+        ));
+    }
+    Ok(())
+}
 /// Bump when the tile schema or the decoder's expectations change without a new archive URL.
 /// v2 (M5 Ground): `landuse` gained leisure/natural/riverbank kinds and `roads` is decoded;
 /// folders of older versions for the same URL are deleted when the cache opens.
 pub const CACHE_SCHEMA_VERSION: u32 = 2;
-/// While the archive cannot be opened, try validating the cache this often.
-const VALIDATE_RETRY: Duration = Duration::from_secs(30);
 const FINGERPRINT_FILE: &str = "fingerprint";
 
 // ---------------------------------------------------------------------------------------
@@ -223,6 +290,8 @@ pub enum Source {
 struct ReaderSlot {
     reader: Option<Arc<Reader>>,
     last_failure: Option<(Instant, String)>,
+    /// The archive does not match the tileset contract: permanent for this configuration.
+    fatal: Option<String>,
 }
 
 #[derive(Default)]
@@ -240,8 +309,9 @@ pub struct Fetcher {
     /// Whether the disk cache has been checked against the archive header.
     validation: tokio::sync::Mutex<Validation>,
     bytes: Arc<AtomicU64>,
-    /// Informational messages for the main thread (logged there).
-    info: Box<dyn Fn(String) + Send + Sync>,
+    params: FetchParams,
+    /// Messages for the main thread (logged there).
+    notify: Box<dyn Fn(Note) + Send + Sync>,
 }
 
 /// Per-source cache subfolder so different archives never mix.
@@ -290,11 +360,12 @@ impl Fetcher {
         url: &str,
         cache_dir: &str,
         bytes: Arc<AtomicU64>,
-        info: Box<dyn Fn(String) + Send + Sync>,
+        params: FetchParams,
+        notify: Box<dyn Fn(Note) + Send + Sync>,
     ) -> Result<Self, String> {
         let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(20))
+            .connect_timeout(params.connect_timeout)
+            .timeout(params.request_timeout)
             .user_agent(concat!("simplane_world/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| format!("http client: {e}"))?;
@@ -303,13 +374,18 @@ impl Fetcher {
         Ok(Self {
             url: url.to_string(),
             client,
-            reader: tokio::sync::Mutex::new(ReaderSlot { reader: None, last_failure: None }),
+            reader: tokio::sync::Mutex::new(ReaderSlot { reader: None, last_failure: None, fatal: None }),
             cache_root,
             disk: tokio::sync::OnceCell::new(),
             validation: tokio::sync::Mutex::new(Validation::default()),
             bytes,
-            info,
+            params,
+            notify,
         })
+    }
+
+    fn info(&self, s: String) {
+        (self.notify)(Note::Info(s));
     }
 
     async fn disk(&self) -> Option<Arc<DiskCache>> {
@@ -317,17 +393,18 @@ impl Fetcher {
             .get_or_init(|| async {
                 let root = self.cache_root.clone()?;
                 let bytes = self.bytes.clone();
+                let cap = self.params.cache_cap_bytes;
                 let r = tokio::task::spawn_blocking(move || {
                     let stale = remove_stale_versions(&root);
-                    DiskCache::open(root, CACHE_CAP_BYTES, bytes).map(|c| (c, stale))
+                    DiskCache::open(root, cap, bytes).map(|c| (c, stale))
                 })
                 .await;
                 match r {
                     Ok(Ok((c, stale))) => {
                         if stale > 0 {
-                            (self.info)(format!("disk cache: removed {stale} folder(s) of an older cache schema"));
+                            self.info(format!("disk cache: removed {stale} folder(s) of an older cache schema"));
                         }
-                        (self.info)(format!(
+                        self.info(format!(
                             "disk cache {} : {} tiles, {:.1} MB",
                             c.root().display(),
                             c.len(),
@@ -336,11 +413,11 @@ impl Fetcher {
                         Some(Arc::new(c))
                     }
                     Ok(Err(e)) => {
-                        (self.info)(format!("disk cache disabled: {e}"));
+                        self.info(format!("disk cache disabled: {e}"));
                         None
                     }
                     Err(e) => {
-                        (self.info)(format!("disk cache disabled: {e}"));
+                        self.info(format!("disk cache disabled: {e}"));
                         None
                     }
                 }
@@ -351,21 +428,41 @@ impl Fetcher {
 
     async fn reader(&self) -> Result<Arc<Reader>, String> {
         let mut slot = self.reader.lock().await;
+        if let Some(e) = &slot.fatal {
+            return Err(e.clone());
+        }
         if let Some(r) = &slot.reader {
             return Ok(r.clone());
         }
         if let Some((t, e)) = &slot.last_failure {
-            if t.elapsed() < OPEN_RETRY_MIN {
+            if t.elapsed() < self.params.open_retry {
                 return Err(e.clone());
             }
         }
         match Reader::new_with_cached_url(HashMapCache::default(), self.client.clone(), &self.url).await {
             Ok(r) => {
                 let h = r.get_header();
-                (self.info)(format!(
+                let (min_zoom, max_zoom) = (h.min_zoom, h.max_zoom);
+                self.info(format!(
                     "opened {} : z{}-{} tiles={:?} compression={:?}",
                     self.url, h.min_zoom, h.max_zoom, h.n_addressed_tiles(), h.tile_compression
                 ));
+                // Tileset contract (A18). A metadata read error is transient (retry); a
+                // mismatch is permanent for this configuration.
+                let meta = match r.get_metadata().await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        let msg = format!("open {}: metadata: {e}", self.url);
+                        slot.last_failure = Some((Instant::now(), msg.clone()));
+                        return Err(msg);
+                    }
+                };
+                if let Err(e) = check_tileset(min_zoom, max_zoom, &meta) {
+                    let msg = format!("{}: {e}", self.url);
+                    (self.notify)(Note::Error(msg.clone()));
+                    slot.fatal = Some(msg.clone());
+                    return Err(msg);
+                }
                 let r = Arc::new(r);
                 slot.reader = Some(r.clone());
                 slot.last_failure = None;
@@ -381,23 +478,23 @@ impl Fetcher {
 
     /// Compare the disk cache with the archive that is currently served and wipe it if they
     /// differ. Needs the archive open; when it is unreachable the cache is used as is and
-    /// the check is retried every `VALIDATE_RETRY`.
+    /// the check is retried every `FetchParams::validate_retry`.
     async fn validate_cache(&self, disk: &Arc<DiskCache>) {
         let mut v = self.validation.lock().await;
         if v.done || v.next_try.is_some_and(|t| Instant::now() < t) {
             return;
         }
         let Ok(reader) = self.reader().await else {
-            v.next_try = Some(Instant::now() + VALIDATE_RETRY);
+            v.next_try = Some(Instant::now() + self.params.validate_retry);
             return;
         };
         let fp = header_fingerprint(reader.get_header());
         let d = disk.clone();
         match tokio::task::spawn_blocking(move || d.sync_fingerprint(&fp)).await {
-            Ok(Ok(true)) => (self.info)("archive changed: disk cache cleared".to_string()),
+            Ok(Ok(true)) => self.info("archive changed: disk cache cleared".to_string()),
             Ok(Ok(false)) => {}
-            Ok(Err(e)) => (self.info)(format!("disk cache fingerprint: {e}")),
-            Err(e) => (self.info)(format!("disk cache fingerprint: {e}")),
+            Ok(Err(e)) => self.info(format!("disk cache fingerprint: {e}")),
+            Err(e) => self.info(format!("disk cache fingerprint: {e}")),
         }
         v.done = true;
     }
@@ -538,5 +635,21 @@ mod tests {
     fn source_dirs_differ_per_url() {
         assert_ne!(source_dir_name("http://a/x.pmtiles"), source_dir_name("http://a/y.pmtiles"));
         assert_eq!(source_dir_name("u"), source_dir_name("u"));
+    }
+
+    #[test]
+    fn tileset_contract_check() {
+        let meta = r#"{"vector_layers":[{"id":"buildings"},{"id":"landuse"},{"id":"roads"}],"name":"x"}"#;
+        assert!(check_tileset(13, 16, meta).is_ok());
+        assert!(check_tileset(0, 18, meta).is_ok());
+        let e = check_tileset(14, 16, meta).unwrap_err();
+        assert!(e.contains("z14-16") && e.contains("z13-16"), "{e}");
+        assert!(check_tileset(13, 15, meta).is_err());
+        let e = check_tileset(13, 16, r#"{"vector_layers":[{"id":"buildings"},{"id":"water"}]}"#).unwrap_err();
+        assert!(e.contains("landuse, roads") && e.contains("has: buildings, water"), "{e}");
+        assert!(check_tileset(13, 16, "{}").unwrap_err().contains("vector_layers"));
+        assert!(check_tileset(13, 16, "not json").is_err());
+        assert_eq!(FetchParams::default().cache_cap_bytes, 300 * 1024 * 1024);
+        assert_eq!(FetchParams::default().open_retry, Duration::from_millis(1500));
     }
 }

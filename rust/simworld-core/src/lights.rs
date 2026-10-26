@@ -2,39 +2,17 @@
 //!
 //! One point per *owned* building at its footprint centroid and roof height, in Godot axes
 //! (x = east, y = up, z = -north) relative to the tile origin (tile center, y = 0).
-//! Color by resolved light profile (see design doc "Light profiles").
+//! Color by resolved light profile (see design doc "Light profiles"; world profile
+//! `lights.profiles.*.color`, cell size `lights.cluster_cell_m`).
 //!
 //! Contract: `light_colors` rgb = average color of the lights in the point, a = intensity
 //! weight `clamp(sqrt(count) / 8, 0.125, 1)` (a single light has count 1). Above ~3000 m AGL
 //! the points are clustered into 100 m cells; a cluster sits at the mean position of its
 //! lights, at their mean roof height. Output order is deterministic (cells sorted by index).
 
-use crate::mesher::{resolve, PROFILE_CIVIC, PROFILE_INDUSTRIAL, PROFILE_OFFICE, PROFILE_RETAIL};
+use crate::mesher::resolve;
 use crate::mvt::Building;
-
-/// Warm 2700 K (residential).
-pub const WARM_2700K: [f32; 4] = [1.0, 0.655, 0.341, 1.0];
-/// Cool 4500 K (office).
-pub const COOL_4500K: [f32; 4] = [0.86, 0.9, 1.0, 1.0];
-/// Bright white (retail).
-pub const BRIGHT_WHITE: [f32; 4] = [1.0, 0.98, 0.95, 1.0];
-/// Sodium orange (industrial).
-pub const SODIUM: [f32; 4] = [1.0, 0.55, 0.15, 1.0];
-/// Warm floodlight ~3000 K (civic).
-pub const FLOOD_3000K: [f32; 4] = [1.0, 0.706, 0.42, 1.0];
-
-pub fn profile_color(profile: u8) -> [f32; 4] {
-    match profile {
-        PROFILE_OFFICE => COOL_4500K,
-        PROFILE_RETAIL => BRIGHT_WHITE,
-        PROFILE_INDUSTRIAL => SODIUM,
-        PROFILE_CIVIC => FLOOD_3000K,
-        _ => WARM_2700K,
-    }
-}
-
-/// Cell size (m) of the clustered light carpet.
-pub const CLUSTER_CELL_M: f32 = 100.0;
+use crate::profile::Profile;
 
 /// Intensity weight of a point that stands for `count` lights.
 pub fn intensity(count: u32) -> f32 {
@@ -51,9 +29,9 @@ pub struct LightSet {
 }
 
 impl LightSet {
-    pub fn from_buildings(buildings: &[Building]) -> Self {
-        let (positions, colors) = light_points(buildings);
-        let (clustered_positions, clustered_colors) = cluster(&positions, &colors, CLUSTER_CELL_M);
+    pub fn from_buildings(buildings: &[Building], profile: &Profile) -> Self {
+        let (positions, colors) = light_points(buildings, profile);
+        let (clustered_positions, clustered_colors) = cluster(&positions, &colors, profile.cluster_cell_m());
         Self { positions, colors, clustered_positions, clustered_colors }
     }
     pub fn is_empty(&self) -> bool {
@@ -73,14 +51,14 @@ impl LightSet {
 }
 
 /// One light per owned building (count 1 each).
-pub fn light_points(buildings: &[Building]) -> (Vec<[f32; 3]>, Vec<[f32; 4]>) {
+pub fn light_points(buildings: &[Building], profile: &Profile) -> (Vec<[f32; 3]>, Vec<[f32; 4]>) {
     let n = buildings.iter().filter(|b| b.owned).count();
     let mut pos = Vec::with_capacity(n);
     let mut col = Vec::with_capacity(n);
     for b in buildings.iter().filter(|b| b.owned) {
-        let r = resolve(b);
+        let r = resolve(b, profile);
         pos.push([b.centroid[0], b.base_m + r.height, -b.centroid[1]]);
-        let mut c = profile_color(r.profile);
+        let mut c = profile.profile_color(r.profile);
         c[3] = intensity(1);
         col.push(c);
     }
@@ -146,7 +124,7 @@ mod tests {
             mk(false, None, "yes", None),
             mk(true, None, "yes", None),
             mk(true, None, "yes", Some(Landuse::Industrial)),
-        ]);
+        ], &Profile::default());
         assert_eq!(p.len(), 3);
         assert_eq!(c.len(), 3);
         // 20 m north -> z = -20.
@@ -156,7 +134,8 @@ mod tests {
             c[3] = 0.125;
             c
         };
-        assert_eq!(c, vec![w(COOL_4500K), w(WARM_2700K), w(SODIUM)]);
+        // Cool 4500 K (office), warm 2700 K (residential), sodium (industrial).
+        assert_eq!(c, vec![w([0.86, 0.9, 1.0, 1.0]), w([1.0, 0.655, 0.341, 1.0]), w([1.0, 0.55, 0.15, 1.0])]);
     }
 
     #[test]

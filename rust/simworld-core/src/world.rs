@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::diag::{thread_cpu_us, Diagnostics, Log, WarnLimiter};
+use crate::fetch::{DiskCache, FetchParams};
 use crate::geo::{Frame, LocalSpace, TileKey, MERCATOR_MAX_LAT};
 use crate::lock::{canonical_dir, FolderLock, LockError};
 use crate::mesher::MeshData;
@@ -33,7 +34,8 @@ use crate::scheduler::Scheduler;
 use crate::status::{Health, Status, StatusState, MSG_NOT_CONFIGURED, MSG_SHUT_DOWN};
 use crate::worker::{Job, Worker, WorkerMsg};
 
-/// Bounded wait of `shutdown` and of a re-configure that replaces a worker using a disk cache.
+/// Bounded wait of `shutdown` and of a re-configure that replaces a worker using a disk cache
+/// (until the old cache thread has flushed and closed its file).
 pub const STOP_WAIT: Duration = Duration::from_secs(1);
 
 // Tuning from the world profile: `origin.recenter_distance_m` (re-center the floating origin
@@ -229,6 +231,11 @@ impl World {
             let Some(msg) = worker.try_recv() else { break };
             match msg {
                 WorkerMsg::Info(s) => self.log.info(&format!("WorldStreamer: {s}")),
+                WorkerMsg::Warn(s) => warns.push(format!("WorldStreamer: {s}")),
+                WorkerMsg::CacheDisabled(s) => {
+                    warns.push(format!("WorldStreamer: {s}"));
+                    self.health.set_cache_disabled(&s);
+                }
                 WorkerMsg::Error(s) => {
                     self.log.error(&format!("WorldStreamer: {s}"));
                     self.health.set_fatal(&s);
@@ -304,7 +311,8 @@ impl World {
     /// `configure_world`). Everything is validated first: on an error nothing changes (the
     /// previous configuration keeps running) and the error is returned and logged. On success
     /// the old workers are dropped and tiles delivered before are reported by the next
-    /// `drain_unload` (teleport); the disk cache is kept.
+    /// `drain_unload` (teleport); the disk cache is kept (the open file is reused when the tile
+    /// source, `cache_dir` and cap are unchanged, else closed with a bounded wait first).
     pub fn configure_world(&mut self, o: WorldOptions) -> ConfigureResult {
         let fail = |w: &Self, e: String| {
             w.log.error(&format!("WorldStreamer: configure_world failed: {e}"));
@@ -325,8 +333,10 @@ impl World {
             self.diag = d;
         }
         let (origin_lat, origin_lon, cache_dir) = (o.origin_lat, o.origin_lon, o.cache_dir.as_str());
+        let url = o.tile_url.trim().to_string();
         // Old workers stop before the new ones start (and before an old lock is released).
-        self.stop_running();
+        let cap = FetchParams::from_profile(&self.profile).cache_cap_bytes;
+        let (_, reuse) = self.stop_running(Some((&url, cache_dir, cap)));
         match lock {
             LockPlan::Keep => {}
             LockPlan::New(l) => self.folder_lock = Some(l),
@@ -340,12 +350,11 @@ impl World {
         self.local = LocalSpace::default();
         self.pending_shift = [0.0; 3];
 
-        let url = o.tile_url.trim().to_string();
         self.attributions = if url.is_empty() { Vec::new() } else { vec![OSM_ATTRIBUTION.to_string()] };
         let hold = Duration::from_secs_f64(self.profile.streaming.retry_max_s + 5.0);
         self.health = Health::running(hold);
         let mut error = String::new();
-        match Worker::new(frame, &url, cache_dir, self.profile.clone()) {
+        match Worker::with_cache(frame, &url, cache_dir, self.profile.clone(), reuse) {
             Ok(w) => {
                 self.scheduler = Some(Scheduler::new(frame, w.is_synthetic(), self.profile.clone()));
                 self.worker = Some(w);
@@ -413,10 +422,12 @@ impl World {
     }
 
     /// Stop the running configuration: delivered tiles go to the next `drain_unload`, the
-    /// worker stops (bounded wait if it may be writing to a cache folder, else in the
-    /// background: nothing to flush, and a blocked DNS lookup must not stall the frame). Keeps
-    /// the folder lock (the caller decides). Returns false if the bounded wait timed out.
-    fn stop_running(&mut self) -> bool {
+    /// worker stops (bounded wait if it uses a disk cache, else in the background: nothing to
+    /// flush, and a blocked DNS lookup must not stall the frame). The disk cache is closed
+    /// (bounded wait) unless `next` (url, cache_dir, cap of the configuration that follows)
+    /// can take it over open; then it is returned. Keeps the folder lock (the caller decides).
+    /// Returns false if the bounded wait timed out.
+    fn stop_running(&mut self, next: Option<(&str, &str, u64)>) -> (bool, Option<Arc<DiskCache>>) {
         // The host keeps whatever we handed out before: unload it with the next drain_unload.
         if let Some(s) = &self.scheduler {
             self.stale_unloads.extend(s.delivered_keys());
@@ -424,28 +435,29 @@ impl World {
         self.scheduler = None;
         self.jobs.clear();
         self.pending_shift = [0.0; 3];
-        let Some(w) = self.worker.take() else { return true };
+        let Some(w) = self.worker.take() else { return (true, None) };
         if !w.uses_disk_cache() {
             drop(w);
-            return true;
+            return (true, None);
         }
-        let done = w.shutdown(STOP_WAIT);
+        let keep = next.is_some_and(|(url, dir, cap)| w.can_reuse_cache(url, dir, cap));
+        let (done, kept) = w.shutdown(STOP_WAIT, keep);
         if !done {
             self.log.warn(&format!(
-                "WorldStreamer: workers still busy after {:.1} s; a cache write may finish late",
+                "WorldStreamer: disk cache still closing after {:.1} s; the next open may run without a disk cache",
                 STOP_WAIT.as_secs_f32()
             ));
         }
-        done
+        (done, kept)
     }
 
-    /// Stop the workers, wait (at most 1 s) for in-flight cache reads/writes to finish, release
-    /// the cache folder lock. Afterwards the world is inert (every call is a no-op returning
+    /// Stop the workers, wait (at most 1 s) until the disk cache has flushed its pending writes
+    /// and closed its file, release the cache folder lock. Afterwards the world is inert (every call is a no-op returning
     /// empty values) until the next `configure` / `configure_world`. The tiles delivered
     /// before are still reported once by the next `drain_unload`. Returns false if the wait
     /// timed out. Dropping a `World` instead stops in the background without waiting.
     pub fn shutdown(&mut self) -> bool {
-        let done = self.stop_running();
+        let (done, _) = self.stop_running(None);
         self.folder_lock = None;
         self.frame = None;
         self.local = LocalSpace::default();

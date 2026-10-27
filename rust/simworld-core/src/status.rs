@@ -9,9 +9,10 @@
 //!    the tileset contract; the workers could not start). Sticky until the next configure.
 //! 2. **offline**: the archive cannot be opened (latest network outcome) and no tile has been
 //!    served at all in this configuration, neither from the network nor from the disk cache.
-//! 3. **degraded**: the archive cannot be opened but cached tiles are being served, or any
-//!    fetch/decode failure happened within the hold window (`streaming.retry_max_s` + 5 s, so a
-//!    tile that keeps failing at the maximum backoff keeps the state steady).
+//! 3. **degraded**: the archive cannot be opened but cached tiles are being served, or the disk
+//!    cache was disabled for the session (repeated write failures), or any fetch/decode failure
+//!    happened within the hold window (`streaming.retry_max_s` + 5 s, so a tile that keeps
+//!    failing at the maximum backoff keeps the state steady).
 //! 4. **ok** otherwise (always for the synthetic city).
 //!
 //! The message is stable per state (details go to `last_error`), so `status_changed` fires
@@ -58,6 +59,7 @@ pub const MSG_SHUT_DOWN: &str = "shut down";
 pub const MSG_OFFLINE: &str = "tile server unreachable and no cached tiles";
 pub const MSG_CACHED_ONLY: &str = "tile server unreachable; showing cached tiles only";
 pub const MSG_FAILURES: &str = "some tiles failed to load; retrying";
+pub const MSG_CACHE_DISABLED: &str = "disk cache disabled after write failures; streaming without it";
 
 /// Accumulates outcomes for one configuration.
 #[derive(Clone, Debug)]
@@ -73,6 +75,8 @@ pub struct Health {
     unreachable: bool,
     last_failure: Option<Instant>,
     hold: Duration,
+    /// The disk cache was disabled for the session (sticky until the next configure).
+    cache_disabled: bool,
 }
 
 impl Health {
@@ -87,6 +91,7 @@ impl Health {
             unreachable: false,
             last_failure: None,
             hold: Duration::ZERO,
+            cache_disabled: false,
         }
     }
 
@@ -124,6 +129,12 @@ impl Health {
         }
     }
 
+    /// The disk cache was disabled for this configuration (details in `last_error`).
+    pub fn set_cache_disabled(&mut self, msg: &str) {
+        self.cache_disabled = true;
+        self.last_error = msg.to_string();
+    }
+
     pub fn record_decode_failure(&mut self, msg: &str, now: Instant) {
         self.last_error = msg.to_string();
         self.last_failure = Some(now);
@@ -138,6 +149,8 @@ impl Health {
             (StatusState::Offline, MSG_OFFLINE.to_string())
         } else if self.unreachable {
             (StatusState::Degraded, MSG_CACHED_ONLY.to_string())
+        } else if self.cache_disabled {
+            (StatusState::Degraded, MSG_CACHE_DISABLED.to_string())
         } else if self.last_failure.is_some_and(|t| now.saturating_duration_since(t) < self.hold) {
             (StatusState::Degraded, MSG_FAILURES.to_string())
         } else {
@@ -208,6 +221,18 @@ mod tests {
         h.record_decode_failure("decode panic: x", t0 + Duration::from_secs(40));
         let s = h.status_at(t0 + Duration::from_secs(41));
         assert_eq!((s.state, s.failed_fetches, s.last_error.as_str()), (StatusState::Degraded, 1, "decode panic: x"));
+    }
+
+    #[test]
+    fn disabled_disk_cache_degrades_until_reconfigured() {
+        let t0 = Instant::now();
+        let mut h = Health::running(Duration::from_secs(35));
+        h.record_fetch(&ok(Source::Network), t0);
+        h.set_cache_disabled("disk cache x disabled for this session after 3 failed writes: disk full");
+        let s = h.status_at(t0 + Duration::from_secs(3600));
+        assert_eq!((s.state, s.message.as_str()), (StatusState::Degraded, MSG_CACHE_DISABLED));
+        assert!(s.last_error.contains("disk full"));
+        assert_eq!(Health::running(Duration::from_secs(35)).status_at(t0).state, StatusState::Ok);
     }
 
     #[test]

@@ -62,6 +62,11 @@ pub struct LodParams {
     pub dp_m: f64,
     /// Drop buildings whose (unclipped) footprint is smaller than this (m²).
     pub min_area_m2: f64,
+    /// Drop buildings whose resolved roof height ([`Resolved::height`]: tagged `height`, else
+    /// levels x floor height, else the kind/landuse fallback; above ground, including any
+    /// `min_height`) is below this (m). Per feature, like `min_area_m2`. 0 = keep all. Mesh
+    /// only: light points are generated from all buildings.
+    pub min_height_m: f64,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -324,6 +329,9 @@ pub fn mesh_buildings(buildings: &[Building], proj: &TileProjector, rect: ClipRe
         }
         let res = resolve(b, profile);
         if res.height < res.min_height + 0.5 {
+            continue;
+        }
+        if params.min_height_m > 0.0 && (res.height as f64) < params.min_height_m {
             continue;
         }
         if min_area_px2 > 0.0 {

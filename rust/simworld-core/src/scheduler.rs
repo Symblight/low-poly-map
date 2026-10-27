@@ -576,7 +576,7 @@ impl Scheduler {
     /// Apply a worker result. Returns a warning to log (main thread) on failure.
     pub fn handle(&mut self, msg: WorkerMsg, now: Instant) -> Option<String> {
         match msg {
-            WorkerMsg::Info(_) | WorkerMsg::Error(_) => None,
+            WorkerMsg::Info(_) | WorkerMsg::Warn(_) | WorkerMsg::CacheDisabled(_) | WorkerMsg::Error(_) => None,
             WorkerMsg::Fetched { key, ring, job, result } => {
                 self.fetch_inflight[ring] = self.fetch_inflight[ring].saturating_sub(1);
                 let e = self.entries.get_mut(&key).filter(|e| e.job == job)?;
@@ -1910,8 +1910,9 @@ mod tests {
         h.settle([0.0, 0.0, 1000.0], 20_000);
         let p = r1_under(&h, [0.0, 0.0, 1000.0]);
         assert!(h.g.visible(p) && children(p).iter().all(|c| !h.g.uploaded.contains(c)));
-        // Descend at 90 m/s (3 m per frame) to 300 m.
-        let obs = fly(&mut h, p, 1000.0, 300.0, 3.0);
+        // Descend at 180 m/s (6 m per frame) to 300 m: fast enough that the distance-driven
+        // fade completes well inside the safety cap (fades.cap_s, 0.75 s by default).
+        let obs = fly(&mut h, p, 1000.0, 300.0, 6.0);
         let (s, e) = fade_span(&obs);
         // Start: the frame the 4th child arrives; children 0 (hidden), parent 1.
         assert_eq!(obs[s].active, Some(true));
@@ -1934,9 +1935,10 @@ mod tests {
         assert!(obs[e].kid_fades.iter().all(|f| *f == Some(1.0)));
         assert!(obs[e].p_unloaded && !obs[e].p_up);
         assert!(obs[e + 1].p_fade.is_none() && obs[e + 1].kid_fades.iter().all(|f| f.is_none()));
-        // Driven by distance: 90 m gap at 90 m/s = ~1 s, well before the 3 s cap.
+        // Driven by distance (~90 m gap at 180 m/s = ~0.5 s), so before the cap fires.
         let frames = e - s;
-        assert!((20..60).contains(&frames), "refine fade took {frames} frames");
+        let cap_frames = (fade_cap().as_secs_f64() / DT).round() as usize;
+        assert!((5..cap_frames).contains(&frames), "refine fade took {frames} frames (cap {cap_frames})");
         eprintln!("refine fade of {p}: {frames} frames");
     }
 
@@ -1946,7 +1948,8 @@ mod tests {
         h.settle([0.0, 0.0, 300.0], 20_000);
         let p = r1_under(&h, [0.0, 0.0, 300.0]);
         assert!(!h.g.uploaded.contains(&p) && children(p).iter().all(|c| h.g.visible(*c)));
-        let obs = fly(&mut h, p, 300.0, 1000.0, 3.0);
+        // Climb at 180 m/s so the distance-driven fade completes inside the safety cap.
+        let obs = fly(&mut h, p, 300.0, 1000.0, 6.0);
         let (s, e) = fade_span(&obs);
         assert_eq!(obs[s].active, Some(false));
         // Start: the parent's re-delivery frame; parent 0 (hidden), children 1.
@@ -1971,7 +1974,9 @@ mod tests {
         assert!(obs[e].kids_unloaded.iter().all(|u| *u) && obs[e].p_up);
         assert!(obs[e + 1].p_fade.is_none());
         let frames = e - s;
-        assert!((20..60).contains(&frames), "coarsen fade took {frames} frames");
+        let cap_frames = (fade_cap().as_secs_f64() / DT).round() as usize;
+        assert!((5..cap_frames).contains(&frames), "coarsen fade took {frames} frames (cap {cap_frames})");
+        eprintln!("coarsen fade of {p}: {frames} frames");
     }
 
     #[test]

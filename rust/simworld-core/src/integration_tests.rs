@@ -63,7 +63,10 @@ fn fetch_decode_reference_tiles_and_cache_offline() {
         assert!(buildings.iter().all(|b| b.osm_type != crate::mvt::OsmType::Unknown));
     }
     // A fresh fetcher (as after a restart) serves the same tiles from disk without opening
-    // the archive (no "opened" info line is printed for it).
+    // the archive (no "opened" info line is printed for it). The first one closes the cache
+    // file first (one open handle per file; this flushes the pending writes).
+    assert!(f.close_disk(std::time::Duration::from_secs(2)));
+    drop(f);
     let f2 = mk(&url);
     for k in keys {
         let (_, src) = rt.block_on(f2.fetch(k)).unwrap();

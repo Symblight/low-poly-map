@@ -6,7 +6,7 @@
   "type": "object",
   "properties": {
     "profile_version": {
-      "description": "Profile schema version (integer). A file with the library's version or older is strict (an unknown key is an error); a newer file loads and unknown keys are ignored with a warning. The library reads version 1.",
+      "description": "Profile schema version (integer). A file with the library's version or older is strict (an unknown key is an error); a newer file loads and unknown keys are ignored with a warning. The library reads version 2 (version 2 added buildings.r0..r2.min_height_m; a version 1 file loads with their defaults).",
       "type": "integer",
       "minimum": 1,
       "maximum": 1000000
@@ -85,6 +85,12 @@
               "type": "number",
               "minimum": 0,
               "maximum": 100000
+            },
+            "min_height_m": {
+              "description": "Drop buildings whose resolved roof height is lower, meters above ground (tagged height, else levels x floor height, else the kind/landuse fallback; per feature, like min_area_m2; 0 = keep all; profile_version 2). Building mesh only: lights, ground and roads are unaffected.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 500
             }
           },
           "additionalProperties": false
@@ -104,6 +110,12 @@
               "type": "number",
               "minimum": 0,
               "maximum": 100000
+            },
+            "min_height_m": {
+              "description": "Drop buildings whose resolved roof height is lower, meters above ground (tagged height, else levels x floor height, else the kind/landuse fallback; per feature, like min_area_m2; 0 = keep all; profile_version 2). Building mesh only: lights, ground and roads are unaffected.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 500
             }
           },
           "additionalProperties": false
@@ -123,6 +135,12 @@
               "type": "number",
               "minimum": 0,
               "maximum": 100000
+            },
+            "min_height_m": {
+              "description": "Drop buildings whose resolved roof height is lower, meters above ground (tagged height, else levels x floor height, else the kind/landuse fallback; per feature, like min_area_m2; 0 = keep all; profile_version 2). Building mesh only: lights, ground and roads are unaffected.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 500
             }
           },
           "additionalProperties": false
@@ -699,7 +717,7 @@
       "type": "object",
       "properties": {
         "cap_s": {
-          "description": "Safety cap, seconds: a LOD fade is force-completed this long after it started.",
+          "description": "Safety cap, seconds: a LOD fade is force-completed this long after it started (default 0.75; also bounds how long a stationary camera waits for a frozen fade before the next finer ring may refine).",
           "type": "number",
           "minimum": 0.1,
           "maximum": 60

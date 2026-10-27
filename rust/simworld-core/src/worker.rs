@@ -1,4 +1,5 @@
-//! Threads: a small tokio runtime for I/O (fetch + disk cache) and a dedicated rayon pool for
+//! Threads: a small tokio runtime for I/O (fetch; the disk cache has its own thread, owned by
+//! [`crate::fetch::DiskCache`]) and a dedicated rayon pool for
 //! CPU work (MVT decode / synthetic generation / meshing / lights). Results go back to
 //! the main thread over one crossbeam channel. Workers only produce plain Rust structs; they
 //! never call Godot APIs, and panics are caught and turned into error messages.
@@ -10,7 +11,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender};
 
-use crate::fetch::{FetchError, FetchParams, Fetcher, Note, Source};
+use crate::fetch::{DiskCache, FetchError, FetchParams, Fetcher, Note, Source};
 use crate::geo::{Frame, TileKey};
 use crate::lights::LightSet;
 use crate::mesher::{mesh_tile, MeshData};
@@ -83,6 +84,57 @@ mod tests {
         // Deterministic.
         assert_eq!(d3.lights, build_tile(k13, 3, frame, &Payload::Synthetic, &p).unwrap().lights);
     }
+
+    /// `buildings.rN.min_height_m` drops low buildings from that band's mesh only: the
+    /// remaining vertices all belong to buildings at least that tall (COLOR a = height / 400 m),
+    /// lights (single and clustered), ground, the decoded building count and the tile box height
+    /// are unchanged; R3 (lights only) is identical.
+    #[test]
+    fn min_height_filter_drops_low_buildings_from_the_mesh_only() {
+        let (lat, lon) = (54.6872, 25.2797);
+        let frame = Frame::new(lat, lon);
+        let def = Profile::default();
+        let over = |ring: usize, h: f64| {
+            let v = serde_json::json!({ "buildings": { format!("r{ring}"): { "min_height_m": h } } });
+            crate::profile::resolve(None, Some(&v), &crate::NullLog).unwrap()
+        };
+        let all = crate::profile::resolve(
+            None,
+            Some(&serde_json::json!({ "buildings": {
+                "r0": { "min_height_m": 15.0 }, "r1": { "min_height_m": 15.0 }, "r2": { "min_height_m": 15.0 } } })),
+            &crate::NullLog,
+        )
+        .unwrap();
+        for (ring, h) in [(0usize, 15.0f32), (1, 15.0), (2, 15.0)] {
+            let key = crate::geo::tile_for(lat, lon, 16 - ring as u8);
+            let a = build_tile(key, ring, frame, &Payload::Synthetic, &def).unwrap();
+            let b = build_tile(key, ring, frame, &Payload::Synthetic, &over(ring, h as f64)).unwrap();
+            let c = build_tile(key, ring, frame, &Payload::Synthetic, &all).unwrap();
+            assert!(b.triangle_count() > 0, "r{ring}: something taller than {h} m remains");
+            assert!(b.triangle_count() < a.triangle_count(), "r{ring}: the filter dropped nothing");
+            assert!(b.mesh.colors.iter().all(|c| c[3] * 400.0 >= h - 1e-3), "r{ring}: a building below {h} m was meshed");
+            assert_eq!(b.mesh, c.mesh, "r{ring}: the other bands' keys must not matter");
+            // Mesh only.
+            assert_eq!(b.lights, a.lights, "r{ring}: lights must not depend on the filter");
+            assert_eq!(b.ground, a.ground, "r{ring}: ground must not depend on the filter");
+            assert_eq!((b.building_count, b.max_height), (a.building_count, a.max_height));
+            // A filter on another band leaves this one byte-identical.
+            let other = build_tile(key, ring, frame, &Payload::Synthetic, &over((ring + 1) % 3, 100.0)).unwrap();
+            assert_eq!(other.mesh, a.mesh, "r{ring}: another band's key changed this band");
+            eprintln!("r{ring} {key}: {} -> {} triangles with min_height_m {h}", a.triangle_count(), b.triangle_count());
+        }
+        // R2 with real lights: identical single and clustered lights.
+        let k14 = crate::geo::tile_for(lat, lon, 14);
+        let l = build_tile(k14, 2, frame, &Payload::Synthetic, &all).unwrap().lights;
+        assert!(!l.is_empty() && !l.clustered_positions.is_empty());
+        // R3: no building mesh and no key; output identical.
+        let k13 = crate::geo::tile_for(lat, lon, 13);
+        let a3 = build_tile(k13, 3, frame, &Payload::Synthetic, &def).unwrap();
+        let b3 = build_tile(k13, 3, frame, &Payload::Synthetic, &all).unwrap();
+        assert!(b3.mesh.is_empty());
+        assert_eq!((a3.lights, a3.ground), (b3.lights, b3.ground));
+        assert!(all.lod(3).is_none());
+    }
 }
 
 #[derive(Debug)]
@@ -102,6 +154,10 @@ pub enum WorkerMsg {
     Fetched { key: TileKey, ring: usize, job: u64, result: Result<(Bytes, Source), FetchError> },
     Decoded { key: TileKey, ring: usize, job: u64, result: Result<TileData, String> },
     Info(String),
+    /// Logged as a (rate-limited) warning on the main thread.
+    Warn(String),
+    /// The disk cache was disabled for the session: logged as a warning, status degraded.
+    CacheDisabled(String),
     /// A configuration problem (logged as an error on the main thread).
     Error(String),
 }
@@ -181,11 +237,27 @@ pub struct Worker {
     cache_bytes: Arc<AtomicU64>,
     /// A disk cache folder is in use (tile source + non-empty `cache_dir`).
     disk_cache: bool,
+    /// Source and cache settings, to decide whether a re-configure may reuse the open cache.
+    url: String,
+    cache_dir: String,
+    cache_cap: u64,
 }
 
 impl Worker {
     /// `url` empty = synthetic city (no runtime / fetcher needed).
     pub fn new(frame: Frame, url: &str, cache_dir: &str, profile: Arc<Profile>) -> Result<Self, String> {
+        Self::with_cache(frame, url, cache_dir, profile, None)
+    }
+
+    /// [`Worker::new`], reusing a disk cache that is already open (from
+    /// [`Worker::shutdown`] with `keep_cache`; same source, folder and cap).
+    pub fn with_cache(
+        frame: Frame,
+        url: &str,
+        cache_dir: &str,
+        profile: Arc<Profile>,
+        reuse: Option<Arc<DiskCache>>,
+    ) -> Result<Self, String> {
         let (tx, rx) = crossbeam_channel::unbounded();
         let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         let pool = rayon::ThreadPoolBuilder::new()
@@ -194,7 +266,8 @@ impl Worker {
             .panic_handler(|_| {}) // jobs catch their own panics; never abort the host
             .build()
             .map_err(|e| format!("rayon pool: {e}"))?;
-        let cache_bytes = Arc::new(AtomicU64::new(0));
+        let cache_cap = FetchParams::from_profile(&profile).cache_cap_bytes;
+        let cache_bytes = reuse.as_ref().map_or_else(|| Arc::new(AtomicU64::new(0)), |c| c.bytes_counter());
         let (rt, fetcher) = if url.is_empty() {
             (None, None)
         } else {
@@ -215,14 +288,33 @@ impl Worker {
                 Box::new(move |n| {
                     let _ = info_tx.send(match n {
                         Note::Info(s) => WorkerMsg::Info(s),
+                        Note::Warn(s) => WorkerMsg::Warn(s),
+                        Note::CacheDisabled(s) => WorkerMsg::CacheDisabled(s),
                         Note::Error(s) => WorkerMsg::Error(s),
                     });
                 }),
             )?;
+            let f = match reuse {
+                Some(c) if !cache_dir.is_empty() => f.with_disk_cache(c),
+                _ => f,
+            };
             (Some(rt), Some(Arc::new(f)))
         };
         let disk_cache = fetcher.is_some() && !cache_dir.is_empty();
-        Ok(Self { rt, pool, tx, rx, fetcher, frame, profile, cache_bytes, disk_cache })
+        Ok(Self {
+            rt,
+            pool,
+            tx,
+            rx,
+            fetcher,
+            frame,
+            profile,
+            cache_bytes,
+            disk_cache,
+            url: url.to_string(),
+            cache_dir: cache_dir.to_string(),
+            cache_cap,
+        })
     }
 
     pub fn is_synthetic(&self) -> bool {
@@ -234,17 +326,36 @@ impl Worker {
         self.disk_cache
     }
 
-    /// Stop and wait (at most `wait`) until the I/O runtime has stopped: async tasks (HTTP
-    /// requests) are cancelled at their next await, blocking tasks (disk cache reads, writes,
-    /// the cache index scan) run to completion. Returns false if the wait timed out (a blocking
-    /// task may still be touching the cache folder). CPU jobs on the rayon pool are not waited
-    /// for; they never touch the disk and their results are discarded. Dropping a `Worker`
-    /// instead stops in the background without waiting.
-    pub fn shutdown(mut self, wait: std::time::Duration) -> bool {
-        let Some(rt) = self.rt.take() else { return true };
+    /// Whether a configuration with this source, cache folder and cap may take over this
+    /// worker's open disk cache (the file stays open; no close / reopen).
+    pub fn can_reuse_cache(&self, url: &str, cache_dir: &str, cap: u64) -> bool {
+        self.disk_cache
+            && self.url == url
+            && self.cache_dir == cache_dir
+            && self.cache_cap == cap
+            && self.fetcher.as_ref().and_then(|f| f.disk_handle()).is_some_and(|d| !d.is_disabled())
+    }
+
+    /// Stop with a bounded wait (`wait` in total): the I/O runtime stops first (async tasks
+    /// such as HTTP requests are cancelled at their next await; a cache open in progress
+    /// finishes), then the disk cache either is handed back open (`keep_cache`, for a
+    /// re-configure with the same source and folder) or is closed (pending writes flushed,
+    /// WAL checkpointed, file closed). Returns whether everything finished within `wait`, and
+    /// the kept cache. CPU jobs on the rayon pool are not waited for; they never touch the
+    /// disk and their results are discarded. Dropping a `Worker` instead only signals the
+    /// stop and the cache close, without waiting.
+    pub fn shutdown(mut self, wait: std::time::Duration, keep_cache: bool) -> (bool, Option<Arc<DiskCache>>) {
         let t0 = std::time::Instant::now();
-        rt.shutdown_timeout(wait);
-        t0.elapsed() < wait
+        if let Some(rt) = self.rt.take() {
+            rt.shutdown_timeout(wait);
+        }
+        let disk = self.fetcher.take().and_then(|f| f.disk_handle());
+        let Some(disk) = disk else { return (t0.elapsed() < wait, None) };
+        if keep_cache && !disk.is_disabled() {
+            return (t0.elapsed() < wait, Some(disk));
+        }
+        let closed = disk.close(wait.saturating_sub(t0.elapsed()));
+        (closed, None)
     }
 
     pub fn cache_bytes(&self) -> u64 {
@@ -298,6 +409,10 @@ impl Drop for Worker {
         // waiting stop).
         if let Some(rt) = self.rt.take() {
             rt.shutdown_background();
+        }
+        // Signal only: the cache thread flushes and closes the file on its own.
+        if let Some(d) = self.fetcher.take().and_then(|f| f.disk_handle()) {
+            d.signal_close();
         }
     }
 }

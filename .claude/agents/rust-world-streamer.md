@@ -35,7 +35,7 @@ lowpolymap/rust/
       geo.rs              # Web Mercator, z/x/y, f64 ENU, floating origin
       rings.rs            # wanted set, look-ahead, hysteresis, priorities
       scheduler.rs        # quadtree cover, sibling swap, fades, delivery guarantees
-      fetch.rs            # PMTiles over HTTPS range requests + disk LRU cache
+      fetch.rs            # PMTiles over HTTPS range requests + SQLite disk cache (own cache thread; docs/spec-tile-cache.md)
       mvt.rs              # vector tile decode -> Building structs
       mesher.rs           # simplify, extrude walls, earcut roofs, merge per tile
       ground.rs           # ground areas + road strips per tile
@@ -70,7 +70,7 @@ The contract is `docs/contract.md`; read it before changing either side; any cha
 ## Implementation notes (not contract)
 
 - Keep all world math in f64 inside Rust; convert to f32 relative to the current origin only when building arrays (`poll_ready`).
-- Tuning lives in the world profile (`profile.rs`, contract 3.2), never in module constants: band edges / hysteresis / look-ahead (`Profile::bands()` -> `rings::BandParams`), DP tolerances and minimum areas (`Profile::lod`, `Profile::ground_params`), concurrency, re-delivery pacing, backoff, cluster altitudes and cell, fade cap, re-center distance, cache cap and HTTP timeouts (`fetch::FetchParams`), light profiles and colors, road/area tables. Functions take `&Profile` / `Arc<Profile>`; tests use `profile::test_default()`. To add a key: add the field + default, a `RANGES` entry for numbers, the key in `addons/simworld/profiles/default.json` (`cargo run -p simworld-cli -- default-profile`) and in the schema (the tests compare all three), bump `PROFILE_VERSION` and note it in `CHANGELOG.md`. Changing a default changes behaviour hosts see.
+- Tuning lives in the world profile (`profile.rs`, contract 3.2), never in module constants: band edges / hysteresis / look-ahead (`Profile::bands()` -> `rings::BandParams`), DP tolerances, minimum areas and minimum building heights (`Profile::lod`, `Profile::ground_params`; `min_height_m` filters the building mesh only, never lights), concurrency, re-delivery pacing, backoff, cluster altitudes and cell, fade cap, re-center distance, cache cap and HTTP timeouts (`fetch::FetchParams`), light profiles and colors, road/area tables. Functions take `&Profile` / `Arc<Profile>`; tests use `profile::test_default()`. To add a key: add the field + default, a `RANGES` entry for numbers, the key in `addons/simworld/profiles/default.json` (`cargo run -p simworld-cli -- default-profile`) and in the schema (the tests compare all three), bump `PROFILE_VERSION` and note it in `CHANGELOG.md`. Changing a default changes behaviour hosts see.
 - Golden hashes (`golden_tests.rs`) must stay unchanged by refactors. Regenerate only for an intended output change: `SIMWORLD_UPDATE_GOLDEN=1 cargo test -p simworld-core golden -- --nocapture`, and say why in the commit.
 - Structural constants (`RING_COUNT`, `ROOT_ZOOM`, `LEAF_ZOOM`, layer names) must match the tileset (`data/schema`), are part of the contract (zooms 13–16) and are not in the profile; `fetch::check_tileset` verifies an opened archive against them.
 
@@ -80,7 +80,7 @@ The contract is `docs/contract.md`; read it before changing either side; any cha
 - No process-global state in the core (several `World`s per process are part of the contract); one world per cache folder (`lock.rs`).
 - `update_camera` and `poll_*` must stay under 0.5 ms; no blocking, no allocation storms.
 - Deterministic output: the same tile always yields the same mesh and lit windows (seeded by OSM id, no time-based randomness).
-- Disk cache in `cache_dir`, LRU cap 300 MB, raw MVT bytes keyed by `z/x/y`.
+- Disk cache in `cache_dir`: one SQLite file per source (`tiles-{hash}.sqlite`), LRU by bytes (cap from profile `cache.cap_mb`, default 300 MB), raw MVT bytes keyed by `z/x/y`; the connection lives on its own cache thread, reads never write, writes are batched. `CACHE_SCHEMA_VERSION` = 3. Spec and measurements: `docs/spec-tile-cache.md`.
 - Errors never panic across FFI: log through `Log::warn` (the binding maps it to `godot_warn!`) and retry with backoff.
 - Run `cargo check` and `cargo test` before reporting done; unit-test tile math, ring selection and extrusion.
 

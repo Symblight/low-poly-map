@@ -35,7 +35,7 @@ use crate::rings::{BandParams, RING_COUNT};
 
 /// Profile schema version this library reads. Bump when keys are added (and update
 /// `default.json`, the JSON Schema and `CHANGELOG.md`).
-pub const PROFILE_VERSION: u32 = 1;
+pub const PROFILE_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------------------------
 // Data tree
@@ -91,6 +91,11 @@ pub struct BuildingLod {
     pub dp_m: f64,
     /// Drop buildings with a smaller footprint (m^2).
     pub min_area_m2: f64,
+    /// Drop buildings whose resolved roof height (m above ground: tagged height, else levels
+    /// heuristic, else fallback) is lower. Mesh only; lights keep every building. 0 = keep all.
+    /// Added in profile_version 2 (a version 1 file without it keeps the default).
+    #[serde(default)]
+    pub min_height_m: f64,
 }
 
 /// Ground meshing: per-band parameters, road classes and widths, area classes and levels.
@@ -364,10 +369,10 @@ impl Default for Bands {
 impl Default for Buildings {
     fn default() -> Self {
         Self {
-            r0: BuildingLod { dp_m: 0.5, min_area_m2: 0.0 },
-            r1: BuildingLod { dp_m: 2.0, min_area_m2: 20.0 },
+            r0: BuildingLod { dp_m: 0.5, min_area_m2: 0.0, min_height_m: 0.0 },
+            r1: BuildingLod { dp_m: 2.0, min_area_m2: 20.0, min_height_m: 0.0 },
             // R2 (z14, 2.5-7 km): merged blocks seen from far away; small sheds vanish.
-            r2: BuildingLod { dp_m: 4.0, min_area_m2: 50.0 },
+            r2: BuildingLod { dp_m: 4.0, min_area_m2: 50.0, min_height_m: 0.0 },
         }
     }
 }
@@ -621,7 +626,7 @@ impl Default for Streaming {
 
 impl Default for Fades {
     fn default() -> Self {
-        Self { cap_s: 3.0 }
+        Self { cap_s: 0.75 }
     }
 }
 
@@ -654,6 +659,7 @@ pub const RANGES: &[(&str, f64, f64)] = &[
     ("bands.default_tile_height_m", 0.0, 400.0),
     ("buildings.*.dp_m", 0.0, 50.0),
     ("buildings.*.min_area_m2", 0.0, 100_000.0),
+    ("buildings.*.min_height_m", 0.0, 500.0),
     ("ground.r0.area_dp_m", 0.0, 50.0),
     ("ground.r1.area_dp_m", 0.0, 50.0),
     ("ground.r2.area_dp_m", 0.0, 50.0),
@@ -907,7 +913,7 @@ impl Profile {
             return Err(errs.join("; "));
         }
 
-        let lod_of = |b: &BuildingLod| LodParams { dp_m: b.dp_m, min_area_m2: b.min_area_m2 };
+        let lod_of = |b: &BuildingLod| LodParams { dp_m: b.dp_m, min_area_m2: b.min_area_m2, min_height_m: b.min_height_m };
         let ground_of = |p: &GroundLod| GroundParams {
             area_dp_m: p.area_dp_m,
             min_area_m2: p.min_area_m2,
@@ -1245,9 +1251,9 @@ mod tests {
         let b = p.bands();
         assert_eq!(b.edge_m, [600.0, 2500.0, 7000.0, 25_000.0]);
         assert_eq!((b.hysteresis, b.look_ahead_s, b.look_ahead_clamp, b.default_tile_height_m), (1.15, 20.0, 0.5, 60.0));
-        assert_eq!(p.lod(0), Some(LodParams { dp_m: 0.5, min_area_m2: 0.0 }));
-        assert_eq!(p.lod(1), Some(LodParams { dp_m: 2.0, min_area_m2: 20.0 }));
-        assert_eq!(p.lod(2), Some(LodParams { dp_m: 4.0, min_area_m2: 50.0 }));
+        assert_eq!(p.lod(0), Some(LodParams { dp_m: 0.5, min_area_m2: 0.0, min_height_m: 0.0 }));
+        assert_eq!(p.lod(1), Some(LodParams { dp_m: 2.0, min_area_m2: 20.0, min_height_m: 0.0 }));
+        assert_eq!(p.lod(2), Some(LodParams { dp_m: 4.0, min_area_m2: 50.0, min_height_m: 0.0 }));
         assert_eq!(p.lod(3), None);
         let gp = |a, m, r, c, minor, s| Some(GroundParams { area_dp_m: a, min_area_m2: m, road_dp_m: r, max_road_class: c, minor_paths: minor, step_m: s });
         assert_eq!(p.ground_params(0), gp(0.5, 0.0, 0.5, ROAD_OTHER, true, 0.02f32));
@@ -1264,7 +1270,7 @@ mod tests {
         let w = p.world();
         assert_eq!((w.lights.cluster_on_agl_m, w.lights.cluster_off_agl_m), (3300.0, 2700.0));
         assert_eq!((w.streaming.max_fetch_per_band, w.streaming.max_mesh_per_band, w.streaming.redeliveries_per_frame), (4, 2, 1));
-        assert_eq!(w.fades.cap_s, 3.0);
+        assert_eq!(w.fades.cap_s, 0.75);
         assert_eq!(w.origin.recenter_distance_m, 5000.0);
         assert_eq!((w.cache.cap_mb * 1024.0 * 1024.0) as u64, 300 * 1024 * 1024);
         assert_eq!(p.backoff(1), std::time::Duration::from_millis(500));
@@ -1385,6 +1391,32 @@ mod tests {
         assert_eq!(p.bands.r0_edge_m, 500.0);
         // Empty sources = defaults.
         assert_eq!(resolve(Some(("e", "{}")), Some(&empty_object()), &NullLog).unwrap(), Profile::default());
+    }
+
+    /// profile_version 2 added `buildings.r0..r2.min_height_m` (default 0 = keep all); a
+    /// version 1 file without them still loads strictly and keeps the defaults.
+    #[test]
+    fn version_1_files_load_with_the_version_2_defaults() {
+        assert_eq!(PROFILE_VERSION, 2);
+        let v1 = r#"{ "profile_version": 1, "buildings": { "r1": { "dp_m": 3.0, "min_area_m2": 25.0 } } }"#;
+        let p = resolve(Some(("v1", v1)), None, &NullLog).unwrap();
+        assert_eq!(p.profile_version, PROFILE_VERSION);
+        assert_eq!(p.lod(1), Some(LodParams { dp_m: 3.0, min_area_m2: 25.0, min_height_m: 0.0 }));
+        for r in 0..3 {
+            assert_eq!(p.lod(r).unwrap().min_height_m, 0.0);
+        }
+        // A version 1 file is still strict.
+        assert!(resolve(Some(("v1", r#"{ "profile_version": 1, "buildings": { "r1": { "min_heigth_m": 6 } } }"#)), None, &NullLog).is_err());
+        // The new key per band, and its range.
+        let o = serde_json::json!({ "buildings": { "r1": { "min_height_m": 6.0 }, "r2": { "min_height_m": 12.0 } } });
+        let p = resolve(None, Some(&o), &NullLog).unwrap();
+        assert_eq!([0, 1, 2].map(|r| p.lod(r).unwrap().min_height_m), [0.0, 6.0, 12.0]);
+        assert_eq!(range_of("buildings.r0.min_height_m"), Some((0.0, 500.0)));
+        let bad = serde_json::json!({ "buildings": { "r0": { "min_height_m": 500.5 } } });
+        let e = resolve(None, Some(&bad), &NullLog).unwrap_err();
+        assert!(e.contains("buildings.r0.min_height_m"), "{e}");
+        // Fade safety cap default (profile_version 2 era).
+        assert_eq!(Profile::default().fades.cap_s, 0.75);
     }
 
     #[test]

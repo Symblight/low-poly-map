@@ -19,6 +19,10 @@ reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] 
 pmtiles = { version = "0.25.0", default-features = false, features = ["http-async", "reqwest-rustls"] }
 bytes = "1.12"
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+# Disk tile cache: one SQLite file per source (docs/spec-tile-cache.md). `bundled` compiles the
+# SQLite amalgamation with `cc`: no system library, works for iOS static builds. `cache` (pure
+# Rust) gives `prepare_cached`, so the cache thread prepares each statement once.
+rusqlite = { version = "0.41.0", default-features = false, features = ["bundled", "cache"] }
 
 # Decode / CPU work.
 mvt-reader = "2.5.0"
@@ -33,9 +37,14 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
 
 # Containers / hashing.
-lru = "0.19"
 ahash = "0.8.12"
 
 # Profiling only (Diagnostics::profile): per-thread CPU time to tell work from preemption.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Disk cache benchmark, old file-per-tile cache vs SQLite (docs/spec-tile-cache.md): plain `main`,
+# no bench framework. `cargo bench -p simworld-core --bench cache_bench` (needs data/out/vilnius.pmtiles).
+[[bench]]
+name = "cache_bench"
+harness = false

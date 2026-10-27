@@ -6,3 +6,4 @@ data/out/
 data/sources/
 addons/simworld/bin/
 .DS_Store
+.idea/

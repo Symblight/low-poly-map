@@ -13,7 +13,7 @@ The GDExtension (`simplane_world`) is a **reusable library**: this spike is its 
 **In scope**
 
 - Tile rings around the camera, with load and unload while moving
-- Low-poly building extrusion from OSM footprints, plus flat ground meshed from landuse, water and roads (lit roads glow at night)
+- Low-poly building extrusion from OSM footprints, plus flat ground meshed from landuse, water and roads (roads do not glow; the `lit` flag is kept in the data for later street lamps and cars)
 - Satellite imagery draped on the ground, from a configurable image source (see "Satellite imagery")
 - Daylight: sun position and day/night factor from a clock, exposed to the host (see "Daylight")
 - Night window lighting driven by building type
@@ -43,7 +43,7 @@ flowchart TB
     end
     subgraph Rust["Rust GDExtension (worker threads)"]
         Ring["Ring manager<br/>wanted tiles, look-ahead, hysteresis, priorities"]
-        Fetch["Fetcher + cache<br/>PMTiles range requests, disk LRU cache"]
+        Fetch["Fetcher + cache<br/>PMTiles range requests, SQLite disk cache"]
         Mesh["Mesher<br/>MVT decode, extrude, LOD, light sprite points"]
         Ring --> Fetch --> Mesh
     end
@@ -100,7 +100,7 @@ You need your own tiles, because standard schemas such as OpenMapTiles drop buil
 2. **Build:** planetiler (or tilemaker) with a custom profile writing one `.pmtiles` file for z13–z16.
 3. **Host:** any static host or CDN that supports HTTP range requests (S3 + CloudFront, Cloudflare R2). Never public OSM tile servers.
 4. **Fetch in Rust:** the `pmtiles` crate with a `reqwest` + rustls backend. The header and directories are cached once, then each tile is one range request.
-5. **Cache:** raw MVT bytes in the app's Caches directory, with an LRU cap of 300 MB. Pre-download the test area before a flight in later versions.
+5. **Cache:** raw MVT bytes in one SQLite file per source (`tiles-{hash}.sqlite`, WAL, own cache thread) in the app's Caches directory, LRU by bytes with a cap of 300 MB (profile key `cache.cap_mb`); built and measured, see [spec-tile-cache.md](spec-tile-cache.md). Pre-download the test area before a flight in later versions (`simworld-cli bake`).
 
 **Layer `buildings` (custom profile)**
 
@@ -147,11 +147,11 @@ The percentages are starting values to tune by eye; they are not measured data.
 
 ## Ground and terrain hook
 
-The ground stays flat for this spike, but it is no longer a blank plane: Rust meshes each tile's landuse, water and road polygons into one flat ground mesh, so parks, rivers and streets read from the air and lit streets glow at night.
+The ground stays flat for this spike, but it is no longer a blank plane: Rust meshes each tile's landuse, water and road polygons into one flat ground mesh, so parks, rivers and streets read from the air.
 
 - **Areas:** landuse, park and water polygons triangulated with `earcutr` at ground height, with a small offset per class to avoid z-fighting (water lowest); color per class from a fixed low-poly palette.
 - **Roads:** `roads` lines buffered into flat strips laid just above the areas; width by `highway` class: motorway 14 m, primary 10 m, secondary 8 m, tertiary and residential 6 m, other 3 m.
-- **Night:** strips with `lit=yes` carry an emissive sodium tint in the ground shader, so the street grid glows under the building lights; unlit roads stay dark.
+- **Night:** roads stay dark asphalt (decision 2026-10-27: roads do not glow). Strips with `lit=yes` keep the `lit` flag in the vertex COLOR for later street lamps and car headlights.
 - **Bands:** ground for R0–R2 (z16–z14), simplified more at coarser bands; R3 has lights only (with imagery on, R3 also gets one textured quad, see "Satellite imagery"). One ground mesh per tile with its own material, following the same visibility rule as the buildings. It adds one draw call per R0–R2 tile, counted against the 300 cap.
 - **Terrain hook:** every height goes through one Rust elevation function, `ground_height(lat, lon)` in meters, which returns 0 for now. Building bases, ground vertices and the slant-distance query use it, and `WorldStreamer.ground_height_at(local_x, local_z)` exposes it to Godot for height above ground. A later DEM spike swaps the function's source without changing the API.
 
@@ -179,7 +179,7 @@ If a source has no image at the needed zoom, Rust builds the texture from the ne
 
 **Pipeline**
 
-1. Fetch: on the tokio runtime, in parallel with the vector tile; its own disk LRU cache (default cap 500 MB, set by `cache_mb`), keyed by source fingerprint so a rebuilt archive never serves stale images.
+1. Fetch: on the tokio runtime, in parallel with the vector tile; its own byte cap (default 500 MB, set by `cache_mb`), planned as a second table in the same SQLite file (spec-tile-cache.md, "Later"), keyed by source fingerprint so a rebuilt archive never serves stale images.
 2. Decode on a rayon thread to RGBA8, build mipmaps, and darken nothing: day/night shading happens in the shader.
 3. Ground UVs: Rust writes `TEX_UV` on every ground vertex as the vertex position in the tile, 0..1 in Web Mercator x/y, so the texture lines up exactly with the vector geometry and with neighbouring tiles.
 4. R3 gets a ground mesh when imagery is on: one textured quad per tile (2 triangles), so daytime flight at altitude shows the land, not the scene's fallback plane.
@@ -194,7 +194,7 @@ If a source has no image at the needed zoom, Rust builds the texture from the ne
 **Shading**
 
 - Day: ground albedo = imagery. Vector water polygons stay on top, so later reflections can use them. Road strips are not drawn over imagery by day, since roads are already in the photo.
-- Night: imagery albedo is scaled by `1 − night_factor` toward a dark floor, and the lit-road emission from the vector `roads` layer is added on top.
+- Night: imagery albedo is scaled by `1 − night_factor` toward a dark floor, and roads stay unlit.
 - Buildings stand on the imagery as they are; the roof outlines and shadows baked into the photo are accepted for the spike.
 
 **Rendering cost**
@@ -282,7 +282,7 @@ The milestones run in order; each ends with a demo on the device.
 2. **Tiles:** the custom `.pmtiles` for Vilnius is hosted; Rust fetches and caches tiles; a debug overlay shows the rings.
 3. **Buildings:** R0 and R1 extruded buildings stream around a free-fly camera with floating origin.
 4. **LOD:** R2 merged meshes and R3 sprites, with look-ahead, hysteresis and altitude rules.
-5. **Ground:** flat landuse, water, park and road meshes per tile, lit roads emissive, and the `ground_height` terrain hook (returns 0 for now).
+5. **Ground:** flat landuse, water, park and road meshes per tile, roads unlit, and the `ground_height` terrain hook (returns 0 for now).
 6. **Night:** window shader, profiles, sprite cross-fade, glow and fog (details in `docs/spec-night-rendering.md`); `set_clock` / `daylight()` in Rust and a time-of-day slider that drives sun, sky and shader globals from it.
 7. **Imagery:** `configure_imagery` with a self-hosted raster source, imagery cache, ground `TEX_UV`, per-tile textures from the pool, R3 textured ground, day/night shading, on-screen attributions.
 8. **Measure:** desktop frame time and memory in a recorded 15-minute flight, then port to iPhone 17 and check the iOS budgets.

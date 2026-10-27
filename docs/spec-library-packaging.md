@@ -130,7 +130,7 @@ The library gets its own repository, `simworld`, made from today's `lowpolymap/`
 - Renaming the crate changes the library file (`libsimplane_world.*` becomes `libsimworld_godot.*`). Update the `.gdextension` entries in the same commit. Keep `entry_symbol = "gdext_rust_init"`.
 - Add a `Log` trait (`info`, `warn`, `error`) and a `Diagnostics` struct (profiling on/off, warning rate limit) to the core. Pass both in at construction. Remove `std::env::var("SIMPLANE_PROFILE")` from library code; the binding and the CLI map their own switches onto `Diagnostics`.
 - Wrap the scheduler and worker in a core `World` type that holds the frame, the local space, the scheduler and the worker. Its methods mirror the contract in plain Rust: `update_camera`, `pop_ready`, `drain_fades`, `drain_unload`, `take_origin_shift` and `stats`. `streamer.rs` becomes a type-conversion shell over `World`.
-- Keep `crate-type = ["cdylib", "staticlib"]` on `simworld-godot` only. The core stays an `rlib`, and the iOS rules (rustls, no desktop-only crates) apply to the core too.
+- Keep `crate-type = ["cdylib", "staticlib"]` on `simworld-godot` only. The core stays an `rlib`, and the iOS rules (rustls, no desktop-only crates) apply to the core too. The disk cache uses `rusqlite` with the `bundled` feature, which compiles the SQLite amalgamation with `cc`, so every target needs a C toolchain (for iOS: Xcode and the iPhoneOS SDK). That iOS build is not yet verified (see spec-tile-cache.md, acceptance 5).
 
 ### 3. Data-driven configuration (fixes A6, A7)
 
@@ -228,7 +228,7 @@ The test bench is the project's main role after the split. Testing happens at fo
 `simworld-cli` commands:
 
 - `fly <script.json>` runs a scripted flight and reports.
-- `bake --bbox ... --zooms ...` pre-fills a cache directory (this is the planned "pre-download the test area"). It writes the same on-disk format as the runtime cache, the one-file SQLite format in [spec-tile-cache.md](spec-tile-cache.md) once that lands, so a baked cache can be shipped or copied. It takes the same folder lock, so it cannot run against a cache folder a game is using.
+- `bake --bbox ... --zooms ...` pre-fills a cache directory (this is the planned "pre-download the test area"). It writes the same on-disk format as the runtime cache, the one-file SQLite format in [spec-tile-cache.md](spec-tile-cache.md) (built, T1-T3), so a baked cache can be shipped or copied. It takes the same folder lock, so it cannot run against a cache folder a game is using.
 - `tile <z/x/y> --out tile.obj` dumps one tile's meshes for inspection.
 - `validate-profile <file>` checks a world profile.
 
@@ -256,7 +256,7 @@ If hashes still differ, golden files are kept per architecture. The CI matrix ru
 - Release checklist:
   - all four test levels pass
   - `CHANGELOG.md` and `docs/contract.md` are updated
-  - the iOS static library builds (`cargo build --target aarch64-apple-ios -p simworld-godot`), even before the iOS port, so that iOS readiness can't regress unnoticed
+  - the iOS static library builds (`cargo build --target aarch64-apple-ios -p simworld-godot`), even before the iOS port, so that iOS readiness can't regress unnoticed; this includes compiling the bundled SQLite of the disk cache
   - `THIRD_PARTY_NOTICES.md` is regenerated
 
 ### 9. Licensing

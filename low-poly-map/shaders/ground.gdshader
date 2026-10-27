@@ -4,7 +4,7 @@ shader_type spatial;
 //
 // Vertex COLOR encoding (from Rust):
 //   r = class / 16 (0 grass/park, 1 forest, 2 water, 3 residential, 4 commercial, 5 industrial, 6 other landuse, 8 road)
-//   g = lit (1 for lit=yes roads, else 0)
+//   g = lit (1 for lit=yes roads, else 0); carried for later (street lamps, cars) and not used for shading: roads do not glow
 //   b = road class / 8 (0 none, 1 motorway, 2 primary, 3 secondary, 4 tertiary, 5 residential, 6 other)
 //   a = 1
 // The mesh is flat, but the shading normal is rebuilt from screen derivatives and forced to face up, so it does not
@@ -21,13 +21,10 @@ uniform float darken : hint_range(0.0, 1.0) = 0.88;
 // at range (floors of buildings, ground classes against each other). Kept tiny so building bases are not covered.
 uniform float depth_bias_per_m : hint_range(0.0, 0.0005) = 0.00002;
 uniform float depth_bias_max_m = 3.0;
-// 0 = off (day), 1 = full (night). StreamerBridge sets it for light sprites and ground alike; M6 turns it into a global.
+// 0 = day, 1 = night. StreamerBridge sets it for light sprites and ground alike; M6 turns it into a global.
+// Not read by the ground shading today (roads no longer glow); kept because the host still sets it and imagery
+// will dim the ground with it.
 uniform float night_factor : hint_range(0.0, 1.0) = 1.0;
-uniform vec3 sodium_tint : source_color = vec3(1.0, 0.62, 0.25);
-uniform float lit_road_emission = 1.1;
-// Lit road strips get thin at range; boost them so the street grid still reads from the air.
-uniform float lit_road_far_boost = 1.0;
-uniform float lit_road_far_m = 6000.0;
 
 varying float v_depth;
 
@@ -66,7 +63,6 @@ void fragment() {
 	if (!lod_dither_keep(FRAGCOORD.xy)) discard;
 #endif
 	int cls = int(floor(COLOR.r * 16.0 + 0.5));
-	float lit = step(0.5, COLOR.g);
 	int road_class = int(floor(COLOR.b * 8.0 + 0.5));
 	bool is_road = cls == 8;
 
@@ -85,9 +81,4 @@ void fragment() {
 	ALBEDO = albedo;
 	ROUGHNESS = is_water ? 0.18 : (is_road ? 0.75 : 0.92);
 	SPECULAR = is_water ? 0.8 : 0.25;
-
-	if (is_road && lit > 0.5) {
-		float far_k = 1.0 + lit_road_far_boost * smoothstep(0.0, lit_road_far_m, v_depth);
-		EMISSION = sodium_tint * lit_road_emission * night_factor * far_k;
-	}
 }

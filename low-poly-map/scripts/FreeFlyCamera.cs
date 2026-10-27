@@ -3,7 +3,10 @@ using Godot;
 namespace LowPolyMap;
 
 /// <summary>
-/// WASD + right-mouse look free-fly camera. Speed 0..250 m/s via mouse wheel (hard cap).
+/// WASD + right-mouse look free-fly camera. Speed is set with the mouse wheel and has no built-in cap: the game decides
+/// how fast it may go (<see cref="MaxSpeed"/> is unlimited unless the host or launch arg <c>--max-speed=&lt;m/s&gt;</c>
+/// sets one). Shift multiplies the speed by 4, Ctrl ("turbo") by 10. The streaming budgets were tested up to
+/// <see cref="TestedSpeed"/> m/s; faster flight can show holes and late tiles.
 /// F toggles an autopilot: straight, level flight along the current horizontal heading at the
 /// current Speed (mouse look still steers). Launch arg <c>--autopilot=&lt;speed_mps&gt;</c> starts it
 /// flying north at 300 m AGL. PgUp / PgDn double / halve the altitude (instant jump, for LOD tests).
@@ -12,9 +15,15 @@ namespace LowPolyMap;
 /// </summary>
 public partial class FreeFlyCamera : Camera3D
 {
-    public const float MaxSpeed = 250f;
+    /// <summary>Streaming budgets (look-ahead, fades, tile queues) were tested up to this speed. Informational only.</summary>
+    public const float TestedSpeed = 250f;
+    public const float ShiftBoost = 4f;
+    public const float TurboBoost = 10f;
+    private const string MaxSpeedArg = "--max-speed=";
+    /// <summary>Optional speed cap in m/s. Unlimited by default; the game (or <c>--max-speed=</c>) may set one.</summary>
+    public static float MaxSpeed { get; set; } = float.PositiveInfinity;
 
-    [Export(PropertyHint.Range, "0,250,1")] public float Speed { get; set; } = 40f;
+    [Export(PropertyHint.Range, "0,1000,1,or_greater")] public float Speed { get; set; } = 80f;
     [Export] public float MouseSensitivity { get; set; } = 0.003f;
     /// <summary>Terrain height under the camera. StreamerBridge updates it every frame from WorldStreamer.ground_height_at (0 until a DEM exists).</summary>
     [Export] public float GroundY { get; set; } = 0f;
@@ -44,6 +53,16 @@ public partial class FreeFlyCamera : Camera3D
         _yaw = e.Y;
         _pitch = e.X;
 
+        // The cap first: --autopilot= below clamps against it, whatever the argument order.
+        foreach (var arg in OS.GetCmdlineUserArgs())
+        {
+            if (!arg.StartsWith(MaxSpeedArg, System.StringComparison.Ordinal)) continue;
+            if (!float.TryParse(arg.Substring(MaxSpeedArg.Length), System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out var ms) || ms <= 0f) continue;
+            MaxSpeed = ms;
+            GD.Print($"[FreeFlyCamera] max speed capped at {MaxSpeed} m/s");
+        }
+
         foreach (var arg in OS.GetCmdlineUserArgs())
         {
             if (arg.StartsWith(ClimbArg, System.StringComparison.Ordinal))
@@ -60,7 +79,7 @@ public partial class FreeFlyCamera : Camera3D
             if (!float.TryParse(arg.Substring(AutopilotArg.Length), System.Globalization.NumberStyles.Float,
                     System.Globalization.CultureInfo.InvariantCulture, out var v)) v = Speed;
             Speed = Mathf.Clamp(v, 0f, MaxSpeed);
-            if (v > MaxSpeed) GD.Print($"[FreeFlyCamera] --autopilot speed {v} clamped to cap {MaxSpeed} m/s");
+            if (v > MaxSpeed) GD.Print($"[FreeFlyCamera] --autopilot speed {v} clamped to --max-speed {MaxSpeed} m/s");
             // Fly north (-Z), level, at 300 m AGL.
             _yaw = 0f;
             _pitch = -0.12f;
@@ -93,9 +112,9 @@ public partial class FreeFlyCamera : Camera3D
                     Input.MouseMode = _looking ? Input.MouseModeEnum.Captured : Input.MouseModeEnum.Visible;
                 }
                 else if (mb.Pressed && mb.ButtonIndex == MouseButton.WheelUp)
-                    Speed = Mathf.Clamp(Speed * 1.15f + 1f, 0f, MaxSpeed);
+                    Speed = Mathf.Clamp(Speed * 1.25f + 2f, 0f, MaxSpeed);
                 else if (mb.Pressed && mb.ButtonIndex == MouseButton.WheelDown)
-                    Speed = Mathf.Clamp(Speed / 1.15f - 1f, 0f, MaxSpeed);
+                    Speed = Mathf.Clamp(Speed / 1.25f - 2f, 0f, MaxSpeed);
                 break;
             case InputEventMouseMotion mm when _looking:
                 _yaw -= mm.Relative.X * MouseSensitivity;
@@ -149,7 +168,7 @@ public partial class FreeFlyCamera : Camera3D
         if (Input.IsPhysicalKeyPressed(Key.E)) dir += Vector3.Up;
         if (Input.IsPhysicalKeyPressed(Key.Q)) dir -= Vector3.Up;
 
-        var boost = Input.IsPhysicalKeyPressed(Key.Shift) ? 3f : 1f;
+        var boost = Input.IsPhysicalKeyPressed(Key.Ctrl) ? TurboBoost : Input.IsPhysicalKeyPressed(Key.Shift) ? ShiftBoost : 1f;
         Velocity = dir.LengthSquared() > 0f ? dir.Normalized() * Mathf.Min(Speed * boost, MaxSpeed) : Vector3.Zero;
         GlobalPosition += Velocity * (float)delta;
     }

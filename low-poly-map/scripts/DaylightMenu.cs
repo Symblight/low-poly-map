@@ -34,7 +34,7 @@ public partial class DaylightMenu : PanelContainer
 
     public override void _Ready()
     {
-        // Bottom-right: the F3 text fills the left column and the minimap the top-right corner.
+        // Bottom-right: the F1 text fills the left column and the minimap the top-right corner.
         AnchorLeft = 1f; AnchorRight = 1f; AnchorTop = 1f; AnchorBottom = 1f;
         GrowHorizontal = GrowDirection.Begin; GrowVertical = GrowDirection.Begin;
         OffsetLeft = -Margin - Width; OffsetRight = -Margin; OffsetBottom = -Margin - 22f; OffsetTop = -Margin - 22f; // above the key-hint line

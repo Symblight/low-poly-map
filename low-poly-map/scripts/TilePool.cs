@@ -86,7 +86,7 @@ public sealed class TilePool
     public ShaderMaterial LightMaterial => _lightMaterial;
     public ShaderMaterial GroundMaterial => _groundMaterial;
 
-    /// <summary>0 = day, 1 = full night. Drives the light sprites and the lit-road emission (M6 replaces this with a global).</summary>
+    /// <summary>0 = day, 1 = full night. Drives the light sprites (M6 replaces this with a global).</summary>
     public void SetNightFactor(float night)
     {
         _lightMaterial.SetShaderParameter("night_factor", night);
@@ -118,7 +118,7 @@ public sealed class TilePool
         _buildingMaterial = new ShaderMaterial { Shader = GD.Load<Shader>("res://shaders/building_day.gdshader") };
         _buildingFadeMaterial = new ShaderMaterial { Shader = LoadDitherVariant("res://shaders/building_day.gdshader") };
 
-        // One shared material for every ground mesh (palette and lit-road emission decoded from vertex COLOR).
+        // One shared material for every ground mesh (palette decoded from vertex COLOR).
         _groundMaterial = new ShaderMaterial { Shader = GD.Load<Shader>("res://shaders/ground.gdshader") };
         _groundFadeMaterial = new ShaderMaterial { Shader = LoadDitherVariant("res://shaders/ground.gdshader") };
     }

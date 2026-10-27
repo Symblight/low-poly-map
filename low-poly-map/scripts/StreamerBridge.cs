@@ -22,7 +22,7 @@ public partial class StreamerBridge : Node3D
     /// <summary>Tile source. Empty = synthetic city. Overridden by the user arg --tile-url=&lt;url&gt;.</summary>
     [Export] public string TileUrl { get; set; } = "";
     [Export] public FreeFlyCamera? Camera { get; set; }
-    /// <summary>0 = day, 1 = night: lights and lit-road emission. Plain value until M6's TimeOfDay owns it as a global.</summary>
+    /// <summary>0 = day, 1 = night: drives the light sprites. Plain value until M6's TimeOfDay owns it as a global.</summary>
     [Export(PropertyHint.Range, "0,1,0.01")] public float NightFactor { get; set; } = 1f;
     /// <summary>Visual earth curvature (shaders/earth_curve.gdshaderinc): 0 = flat, 1 = real Earth, larger exaggerates. User arg --curvature=&lt;x&gt;.</summary>
     [Export(PropertyHint.Range, "0,100,0.1")] public float Curvature { get; set; } = 1f;
@@ -91,7 +91,27 @@ public partial class StreamerBridge : Node3D
     /// </summary>
     public System.Action<double>? ExternalCameraUpdate { get; set; }
 
+    /// <summary>Raised from <c>_Process</c> after every <see cref="ApplyProfileOverrides"/> request has run: (ok, library error text).</summary>
+    public event System.Action<bool, string>? Reconfigured;
+    /// <summary>Successful reconfigures since start (not counting the startup configure).</summary>
+    public int ReconfigureCount { get; private set; }
+    public bool LastReconfigureOk { get; private set; } = true;
+    public string LastReconfigureError { get; private set; } = "";
+    /// <summary>True from <see cref="ApplyProfileOverrides"/> until the next frame start runs it.</summary>
+    public bool ReconfigurePending => _pendingOverrides != null;
+    /// <summary>Highest <see cref="ActiveTiles"/> seen (checked against the pool size by the settings self-test).</summary>
+    public int PeakActiveTiles { get; private set; }
+    /// <summary>Node sets (tile roots) under the pool container: created sets, in use or free.</summary>
+    public int TileRootCount => _tileRoot?.GetChildCount() ?? 0;
+
     private string _lastLoggedStatus = "";
+    private string _tileUrl = "";
+    private string _cacheDir = "";
+    /// <summary>profile_path and resolved --area/--set overrides from the launch args, kept for <see cref="ApplyProfileOverrides"/> (never re-derived: --area scales the library defaults and would compound).</summary>
+    private string _argProfilePath = "";
+    private Godot.Collections.Dictionary _argOverrides = new();
+    private Godot.Collections.Dictionary? _pendingOverrides;
+    private readonly List<long> _dropScratch = new(256);
     private TilePool? _pool;
     private Node3D? _tileRoot;
 
@@ -158,6 +178,8 @@ public partial class StreamerBridge : Node3D
             Streamer.OriginShifted += OnOriginShifted;
             var cacheDir = ProjectSettings.GlobalizePath("user://tile_cache");
             DirAccess.MakeDirRecursiveAbsolute(cacheDir);
+            _tileUrl = url;
+            _cacheDir = cacheDir;
             ConfigureWorld(url, cacheDir);
             GD.Print($"[StreamerBridge] WorldStreamer created, cache_dir={cacheDir}, debug_tiles={Streamer.HasDebugTiles}");
         }
@@ -281,6 +303,8 @@ public partial class StreamerBridge : Node3D
     private void ConfigureWorld(string url, string cacheDir)
     {
         var overrides = ParseProfileArgs(out var profilePath);
+        _argProfilePath = profilePath;
+        _argOverrides = overrides;
         ProfileOverrides = overrides;
         bool haveProfileArgs = profilePath.Length > 0 || overrides.Count > 0;
         if (profilePath.Length > 0) GD.Print($"[StreamerBridge] profile file: {profilePath}");
@@ -304,6 +328,8 @@ public partial class StreamerBridge : Node3D
             GD.PushError($"[StreamerBridge] profile rejected by the library: {result.Error}");
             GD.Print("[StreamerBridge] retrying with the default world profile");
             ProfileOverrides = new Godot.Collections.Dictionary();
+            _argProfilePath = "";
+            _argOverrides = new Godot.Collections.Dictionary();
             options.Remove("profile_path");
             options.Remove("profile_overrides");
             result = Streamer.ConfigureWorld(options);
@@ -363,6 +389,8 @@ public partial class StreamerBridge : Node3D
 
         if (Streamer.IsAvailable && Camera != null)
         {
+            // A queued reconfigure runs first, so this frame's update_camera already carries the new origin and camera position.
+            if (_pendingOverrides != null) RunReconfigure();
             // Height above ground = camera y - terrain height under it (0 until the DEM spike).
             CameraGroundHeight = Streamer.GroundHeightAt(Camera.GlobalPosition.X, Camera.GlobalPosition.Z);
             Camera.GroundY = (float)CameraGroundHeight;
@@ -581,6 +609,7 @@ public partial class StreamerBridge : Node3D
 
         _secReady++;
         ReadyTotal++;
+        if (Cover.Loaded > PeakActiveTiles) PeakActiveTiles = Cover.Loaded;
 
         long us = (long)Time.GetTicksUsec() - t0;
         int r = System.Math.Clamp(tile.Ring, 0, 3);
@@ -605,12 +634,138 @@ public partial class StreamerBridge : Node3D
     private void UnloadTile(string key)
     {
         if (!TileKey.TryParse(key, out long packed)) return;
+        ReleaseTile(packed);
+    }
+
+    private bool ReleaseTile(long packed)
+    {
         var nodes = Cover.Remove(packed);
-        if (nodes == null) return;
+        if (nodes == null) return false;
         if (nodes.FadeMaterialActive) _fading.Remove(nodes);
         _pool!.Release(nodes);
         _secUnloaded++;
         UnloadedTotal++;
+        return true;
+    }
+
+    // ---- reconfigure (settings panel) ---------------------------------------
+
+    /// <summary>
+    /// Queues a world reconfigure with <paramref name="panelOverrides"/> (nested like the profile JSON, e.g. bands.r3_edge_m) merged
+    /// over the launch-arg profile (panel wins). It runs at the start of the next <c>_Process</c>, before update_camera, and ends with
+    /// <see cref="Reconfigured"/>. A later call before that replaces the queued one. The world restarts at the camera's current
+    /// position: that is the new origin, the camera goes back to local x/z = 0 (altitude and orientation kept), and every tile is
+    /// released through the unload batch the library returns for the teleport.
+    /// </summary>
+    public void ApplyProfileOverrides(Godot.Collections.Dictionary panelOverrides) => _pendingOverrides = panelOverrides;
+
+    private void RunReconfigure()
+    {
+        var panel = _pendingOverrides!;
+        _pendingOverrides = null;
+        bool ok = TryReconfigure(panel, out var error);
+        LastReconfigureOk = ok;
+        LastReconfigureError = error;
+        if (ok) ReconfigureCount++;
+        else GD.PushError($"[StreamerBridge] reconfigure rejected, previous world keeps running: {error}");
+        Reconfigured?.Invoke(ok, error);
+    }
+
+    private bool TryReconfigure(Godot.Collections.Dictionary panel, out string error)
+    {
+        error = "";
+        if (!Streamer.HasConfigureWorld) { error = $"configure_world needs api 0.6 (library {Streamer.ApiVersionText})"; return false; }
+        if (Camera == null) { error = "no camera assigned"; return false; }
+        long t0 = (long)Time.GetTicksUsec();
+
+        // New origin = where the camera is now (f32 geodetic: 0.1-0.4 m). Without a running world there is nothing to convert from.
+        var cam = Camera.GlobalPosition;
+        bool recenter = WorldRunning;
+        double lat = OriginLat, lon = OriginLon;
+        if (recenter)
+        {
+            var geo = Streamer.LocalToGeodetic(cam);
+            if (geo == Vector3.Zero) { error = "local_to_geodetic failed (camera position not convertible)"; return false; }
+            lat = geo.X;
+            lon = geo.Y;
+        }
+
+        var merged = (Godot.Collections.Dictionary)_argOverrides.Duplicate(true);
+        MergeInto(merged, panel);
+        var options = WorldStreamerFacade.MakeWorldOptions(lat, lon, _tileUrl, _cacheDir);
+        if (_argProfilePath.Length > 0) options["profile_path"] = _argProfilePath;
+        if (merged.Count > 0) options["profile_overrides"] = merged;
+        // Same cache_dir, no Shutdown() in between: the lock is kept across the teleport (contract 11a).
+        var result = Streamer.ConfigureWorld(options);
+        if (!result.Ok)
+        {
+            error = result.Error.Length > 0 ? result.Error : "configure_world failed";
+            return false;
+        }
+
+        // Fresh start. Take the unload batch right now (before any new delivery can reuse a key), release stragglers too.
+        int unloadedBefore = UnloadedTotal;
+        var unload = Streamer.PollUnload();
+        for (int i = 0; i < unload.Length; i++) UnloadTile(unload[i]);
+        _dropScratch.Clear();
+        foreach (var n in Cover.All) _dropScratch.Add(n.Packed);
+        for (int i = 0; i < _dropScratch.Count; i++) ReleaseTile(_dropScratch[i]);
+        if (_dropScratch.Count > 0)
+            GD.PushWarning($"[StreamerBridge] reconfigure: {_dropScratch.Count} tiles were not in the library's unload batch of {unload.Length}; released anyway");
+        _fading.Clear();
+        _suspectRoots.Clear();
+        _pendingRoots.Clear();
+
+        if (recenter) Camera.GlobalPosition = new Vector3(0f, cam.Y, 0f);
+        LastShift = Vector3.Zero;
+        TotalShift = Vector3.Zero;
+        ProfileOverrides = merged;
+        WorldRunning = true;
+        ConfigureError = "";
+        Attributions = result.Attributions;
+        AfterConfigure();
+        GD.Print($"[StreamerBridge] reconfigured: origin=({lat:0.000000}, {lon:0.000000}) camera -> (0, {cam.Y:0.0}, 0) from ({cam.X:0.0}, {cam.Z:0.0}), "
+            + $"{UnloadedTotal - unloadedBefore} tiles released, {((long)Time.GetTicksUsec() - t0) / 1000.0:0.0} ms; effective {EffectiveProfileText()}");
+        return true;
+    }
+
+    /// <summary>Deep merge: nested dictionaries merge, everything else in <paramref name="over"/> replaces.</summary>
+    private static void MergeInto(Godot.Collections.Dictionary into, Godot.Collections.Dictionary over)
+    {
+        foreach (var kv in over)
+        {
+            if (kv.Value.VariantType == Variant.Type.Dictionary && into.TryGetValue(kv.Key, out var cur) && cur.VariantType == Variant.Type.Dictionary)
+                MergeInto(cur.AsGodotDictionary(), kv.Value.AsGodotDictionary());
+            else
+                into[kv.Key] = kv.Value.VariantType == Variant.Type.Dictionary ? kv.Value.AsGodotDictionary().Duplicate(true) : kv.Value;
+        }
+    }
+
+    /// <summary>The values the library is running with (world_profile), e.g. "bands 0.6/2.5/7/25 km, min building height R0/R1/R2 0/0/0 m".</summary>
+    public string EffectiveProfileText()
+    {
+        var p = Streamer.WorldProfile();
+        var sb = new StringBuilder();
+        if (p.TryGetValue("bands", out var bv) && bv.VariantType == Variant.Type.Dictionary)
+        {
+            var b = bv.AsGodotDictionary();
+            sb.Append("bands ");
+            for (int i = 0; i < BandEdgeKeys.Length; i++)
+                sb.Append(i > 0 ? "/" : "").Append(b.TryGetValue(BandEdgeKeys[i], out var e) ? (e.AsDouble() / 1000.0).ToString("0.##", System.Globalization.CultureInfo.InvariantCulture) : "?");
+            sb.Append(" km");
+        }
+        if (p.TryGetValue("buildings", out var bd) && bd.VariantType == Variant.Type.Dictionary)
+        {
+            var d = bd.AsGodotDictionary();
+            sb.Append(sb.Length > 0 ? ", " : "").Append("min building height R0/R1/R2 ");
+            for (int i = 0; i < 3; i++)
+            {
+                double h = d.TryGetValue("r" + i, out var rv) && rv.VariantType == Variant.Type.Dictionary && rv.AsGodotDictionary().TryGetValue("min_height_m", out var mh) ? mh.AsDouble() : double.NaN;
+                sb.Append(i > 0 ? "/" : "").Append(double.IsNaN(h) ? "?" : h.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture));
+            }
+            sb.Append(" m");
+        }
+        return sb.ToString();
     }
 
     /// <summary>One-line cover summary (also callable from GDScript probes).</summary>

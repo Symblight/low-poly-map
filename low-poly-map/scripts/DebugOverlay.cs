@@ -5,10 +5,10 @@ using Godot;
 namespace LowPolyMap;
 
 /// <summary>
-/// F3-toggled debug overlay: a text block (FPS, draw calls, per-ring streamer stats, upload time,
-/// camera) plus a top-down minimap around the camera. The map shows only tiles that are currently visible
+/// Shows only an FPS label by default. F1 toggles the detailed debug overlay (off at startup): a text block (FPS, draw
+/// calls, per-ring streamer stats, upload time, camera) plus a top-down minimap around the camera. The map shows only tiles that are currently visible
 /// (the quadtree cover), coloured by band; H also outlines hidden tiles (hidden by their children / waiting for
-/// siblings) and tiles still in flight. Refreshed 4x/s. M cycles minimap zoom.
+/// siblings) and tiles still in flight. Refreshed 4x/s. M cycles minimap zoom (detail mode only).
 /// </summary>
 public partial class DebugOverlay : Control
 {
@@ -64,6 +64,7 @@ public partial class DebugOverlay : Control
     private double _timer;
     private int _zoom;
     private bool _showHidden;
+    private bool _detail;
     private int _tileCount;
     private bool _haveStats;
     private Vector2 _heading = new(0, -1);
@@ -97,7 +98,16 @@ public partial class DebugOverlay : Control
         _map.Draw += DrawMap;
         AddChild(_map);
 
+        // Detail mode (F1) is off at startup (launch arg --overlay-detail starts with it on): only the FPS headline is on screen.
+        _detail = System.Linq.Enumerable.Contains(OS.GetCmdlineUserArgs(), "--overlay-detail");
+        ApplyDetailVisibility();
         Refresh();
+    }
+
+    private void ApplyDetailVisibility()
+    {
+        _label.Visible = _detail;
+        _map.Visible = _detail;
     }
 
     private static Label MakeLabel(string name)
@@ -113,12 +123,14 @@ public partial class DebugOverlay : Control
     {
         if (@event is InputEventKey { Pressed: true, Echo: false } k)
         {
-            if (k.PhysicalKeycode == Key.F3)
+            if (k.PhysicalKeycode == Key.F1)
             {
-                Visible = !Visible;
-                if (Visible) Refresh();
+                _detail = !_detail;
+                ApplyDetailVisibility();
+                Refresh();
                 GetViewport().SetInputAsHandled();
             }
+            else if (!_detail) return; // M / H only act on the detail overlay
             else if (k.PhysicalKeycode == Key.M)
             {
                 _zoom = (_zoom + 1) % ZoomSpansM.Length;
@@ -134,7 +146,6 @@ public partial class DebugOverlay : Control
 
     public override void _Process(double delta)
     {
-        if (!Visible) return;
         _timer -= delta;
         if (_timer > 0) return;
         _timer = RefreshInterval;
@@ -143,6 +154,13 @@ public partial class DebugOverlay : Control
 
     private void Refresh()
     {
+        if (!_detail)
+        {
+            // Only the FPS headline; the rest (and its per-refresh debug_stats / debug_tiles calls) is skipped.
+            _head.Text = "FPS " + Engine.GetFramesPerSecond().ToString("0");
+            _head.AddThemeColorOverride("font_color", Colors.White);
+            return;
+        }
         var streamer = Bridge?.Streamer;
         if (Camera != null)
         {
@@ -266,7 +284,7 @@ public partial class DebugOverlay : Control
             if (streamer.HasDebugTiles) sb.Append("debug_tiles: ").Append(_tileCount).Append(" tiles\n");
             else sb.Append("debug_tiles: not exported by this Rust build\n");
         }
-        sb.Append("[F2] daylight  [F3] overlay  [F] autopilot  [PgUp/PgDn] alt x2 / x0.5  [H] hidden tiles: ").Append(_showHidden ? "outlined" : "off").Append("  [M] map zoom (").Append(ZoomSpansM[_zoom] / 1000f).Append(" km)");
+        sb.Append("[F1] overlay  [F2] daylight  [F3] settings  [F] autopilot  [PgUp/PgDn] alt x2 / x0.5  [H] hidden tiles: ").Append(_showHidden ? "outlined" : "off").Append("  [M] map zoom (").Append(ZoomSpansM[_zoom] / 1000f).Append(" km)");
         if (Bridge != null && Bridge.Attributions.Length > 0)
             sb.Append('\n').Append(string.Join(" | ", Bridge.Attributions));
     }

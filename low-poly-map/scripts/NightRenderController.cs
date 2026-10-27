@@ -5,7 +5,7 @@ namespace LowPolyMap;
 /// <summary>
 /// Night rendering (docs/spec-night-rendering.md): lives on the WorldEnvironment node and drives its Environment.
 /// - Bloom: only things above the HDR glow threshold glow. At night the threshold sits just below the emission of lit
-///   windows / light sprites / lit roads (<see cref="EmissionLevel"/>); concrete, roofs and sky stay far below it. By day
+///   windows / light sprites (<see cref="EmissionLevel"/>); concrete, roofs and sky stay far below it. By day
 ///   it is raised out of reach of sunlit surfaces. Glow intensity rises with altitude so the light carpet blooms at cruise.
 /// - Tone map: Filmic or AgX, switchable (export, T key, <c>--tonemap=filmic|agx</c>).
 /// - Eye adaptation, external view only (<see cref="ExternalView"/>): Godot's auto exposure is Forward+ only (the engine
@@ -33,7 +33,7 @@ public partial class NightRenderController : WorldEnvironment
     // ---- bloom ----------------------------------------------------------------------------------
     /// <summary>
     /// HDR value (linear, before tone map) a lit window / sprite / lit road reaches. The glow threshold is derived from it;
-    /// the building night shader (M6) must emit at least this much. Sprites emit 1.6 * colour, lit roads 1.1 * sodium.
+    /// the building night shader (M6) must emit at least this much. Sprites emit 1.6 * colour; roads do not glow.
     /// </summary>
     [Export] public float EmissionLevel { get; set; } = 1.0f;
     /// <summary>Glow threshold = EmissionLevel * this at night ("just below" the emission).</summary>

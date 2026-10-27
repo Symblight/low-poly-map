@@ -6,7 +6,7 @@
   "type": "object",
   "properties": {
     "profile_version": {
-      "description": "Profile schema version (integer). A file with the library's version or older is strict (an unknown key is an error); a newer file loads and unknown keys are ignored with a warning. The library reads version 2 (version 2 added buildings.r0..r2.min_height_m; a version 1 file loads with their defaults).",
+      "description": "Profile schema version (integer). A file with the library's version or older is strict (an unknown key is an error); a newer file loads and unknown keys are ignored with a warning. The library reads version 3 (version 2 added buildings.r0..r2.min_height_m, version 3 added lights.min_ring; an older file loads with their defaults).",
       "type": "integer",
       "minimum": 1,
       "maximum": 1000000
@@ -467,11 +467,11 @@
       "additionalProperties": false
     },
     "lights": {
-      "description": "Light sprites (R2/R3) and building light profiles.",
+      "description": "Light sprites (bands min_ring..R3, default R2/R3) and building light profiles.",
       "type": "object",
       "properties": {
         "cluster_on_agl_m": {
-          "description": "Above this height above ground (meters) each tile's lights are clustered into cells (the light carpet); already delivered R2/R3 tiles are re-delivered.",
+          "description": "Above this height above ground (meters) each tile's lights are clustered into cells (the light carpet); already delivered lit tiles are re-delivered.",
           "type": "number",
           "minimum": 0,
           "maximum": 100000
@@ -487,6 +487,12 @@
           "type": "number",
           "minimum": 1,
           "maximum": 10000
+        },
+        "min_ring": {
+          "description": "Finest band that carries light sprites (0 = R0 ... 3 = R3 only; profile_version 3). Default 2: R2 and R3 only, the finer bands are meant to get windows. Lower values put sprites on top of the R1 (and R0) building meshes, a stopgap until the window shader exists.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3
         },
         "profiles": {
           "description": "Light profiles (contract vertex COLOR r = id / 8: residential 0, office 1, retail 2, industrial 3, civic 4): which OSM building values belong to each, and the sprite color.",

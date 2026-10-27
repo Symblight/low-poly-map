@@ -85,6 +85,27 @@ mod tests {
         assert_eq!(d3.lights, build_tile(k13, 3, frame, &Payload::Synthetic, &p).unwrap().lights);
     }
 
+    /// `lights.min_ring` is the finest band that carries lights: lowering it lights R1 (and R0) with exactly the
+    /// lights the same tile has as R2 (they do not depend on the band), raising it takes them off R2.
+    #[test]
+    fn lights_min_ring_selects_the_lit_bands() {
+        let frame = Frame::new(54.6872, 25.2797);
+        let key = crate::geo::tile_for(54.6872, 25.2797, 15);
+        let lit = |min_ring: u32, ring: usize| {
+            let mut w = crate::profile::WorldProfile::default();
+            w.lights.min_ring = min_ring;
+            let p = Profile::new(w).unwrap();
+            build_tile(key, ring, frame, &Payload::Synthetic, &p).unwrap().lights
+        };
+        let reference = lit(2, 2);
+        assert!(!reference.is_empty());
+        assert!(lit(2, 1).is_empty() && lit(2, 0).is_empty(), "default: R0/R1 unlit");
+        assert_eq!(lit(1, 1), reference, "R1 lit like R2 would be");
+        assert!(lit(1, 0).is_empty());
+        assert_eq!(lit(0, 0), reference);
+        assert!(lit(3, 2).is_empty() && !lit(3, 3).is_empty(), "R3 only");
+    }
+
     /// `buildings.rN.min_height_m` drops low buildings from that band's mesh only: the
     /// remaining vertices all belong to buildings at least that tall (COLOR a = height / 400 m),
     /// lights (single and clustered), ground, the decoded building count and the tile box height
@@ -205,7 +226,7 @@ pub fn build_tile(key: TileKey, ring: usize, frame: Frame, payload: &Payload, pr
     let mesh = mesh_tile(&buildings, &proj, ring, profile);
     let ground = mesh_ground(&gf, &proj, ring, profile);
     drop(gf);
-    let lights = if ring >= 2 { LightSet::from_buildings(&buildings, profile) } else { LightSet::default() };
+    let lights = if ring >= profile.lights.min_ring as usize { LightSet::from_buildings(&buildings, profile) } else { LightSet::default() };
     let building_count = buildings.len();
     let max_height = buildings.iter().map(|b| crate::mesher::resolve(b, profile).height).fold(0.0f32, f32::max);
     drop(buildings);

@@ -11,8 +11,8 @@ shader_type spatial;
 // depend on triangle winding (cull_disabled) and keeps working when a DEM later makes the ground non-flat.
 render_mode cull_disabled, diffuse_burley, specular_schlick_ggx;
 
-#include "res://shaders/lod_dither.gdshaderinc"
-#include "res://shaders/earth_curve.gdshaderinc"
+#include "lod_dither.gdshaderinc"
+#include "earth_curve.gdshaderinc"
 
 // Overall subtle darkening so the ground sits below the buildings in brightness.
 uniform float darken : hint_range(0.0, 1.0) = 0.88;
@@ -21,10 +21,7 @@ uniform float darken : hint_range(0.0, 1.0) = 0.88;
 // at range (floors of buildings, ground classes against each other). Kept tiny so building bases are not covered.
 uniform float depth_bias_per_m : hint_range(0.0, 0.0005) = 0.00002;
 uniform float depth_bias_max_m = 3.0;
-// 0 = day, 1 = night. StreamerBridge sets it for light sprites and ground alike; M6 turns it into a global.
-// Not read by the ground shading today (roads no longer glow); kept because the host still sets it and imagery
-// will dim the ground with it.
-uniform float night_factor : hint_range(0.0, 1.0) = 1.0;
+// Roads no longer glow, so the ground does not read simworld_night_factor today; imagery (M7) will dim the ground with it.
 
 varying float v_depth;
 

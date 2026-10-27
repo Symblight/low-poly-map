@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-"SimWorld" (working name; the repo folder is still `lowpolymap`, the Rust crates are `simworld-core` / `simworld-godot` / `simworld-cli`) is a streamed low-poly OSM city for the SimPlane flight game: a Rust GDExtension (`WorldStreamer`) streams PMTiles around a camera and generates everything; a Godot 4.7 (.NET/C#) project displays it. It started as a spike and is being turned into a reusable library with a test bench. The packaging plan is in `docs/spec-library-packaging.md` (phases P0-P7); this repo has finished P0 (baseline), P1 (core split: Cargo workspace, `World`, `Log`, `Diagnostics`), P2 (contract: `docs/contract.md`, `api_version`), P3 (config: world profile JSON + schema, `configure_world`, `world_profile()`, golden determinism hashes) and the Rust half of P4 (host API: geodetic camera input and conversions, `origin_shifted` / `status_changed` signals, `status()`, `attributions()`, `shutdown()`, cache folder lock, several instances). Contract version: `api_version` 0.7 (`docs/contract.md`); crate version 0.5.0 (`CHANGELOG.md`).
+"SimWorld" (working name; the repo folder is still `lowpolymap`, the Rust crates are `simworld-core` / `simworld-godot` / `simworld-cli`) is a streamed low-poly OSM city for the SimPlane flight game: a Rust GDExtension (`WorldStreamer`) streams PMTiles around a camera and generates everything; a Godot 4.7 (.NET/C#) addon (`addons/simworld/`) displays it. It started as a spike and is being turned into a reusable library with a test bench. The packaging plan is in `docs/spec-library-packaging.md` (phases P0-P7); this repo has finished P0 (baseline), P1 (core split: Cargo workspace, `World`, `Log`, `Diagnostics`), P2 (contract: `docs/contract.md`, `api_version`), P3 (config: world profile JSON + schema, `configure_world`, `world_profile()`, golden determinism hashes), P4 (host API: geodetic camera input and conversions, `origin_shifted` / `status_changed` signals, `status()`, `attributions()`, `shutdown()`, cache folder lock, several instances) and P5 (addon: `addons/simworld/` with `WorldView`, settings resource, global shader uniforms, `NightLook`, editor plugin, multi-platform `.gdextension`; the test bench consumes it; **not verified: the minimal iOS export**, see "Addon"). Contract version: `api_version` 0.7 (`docs/contract.md`); crate version 0.5.0 (`CHANGELOG.md`).
 
 Milestones (`docs/spike-streamed-osm-city.md`, "Milestones, acceptance and risks"):
 
@@ -12,13 +12,15 @@ Milestones (`docs/spike-streamed-osm-city.md`, "Milestones, acceptance and risks
 - **M6 Night: partway.** Built: dithered LOD fades (`poll_fades`, `shaders/lod_dither.gdshaderinc`), glow/fog/tone map/eye adaptation (`NightRenderController`), light sprites with a `night_factor` (roads do not glow), and an interim C# daylight clock (`TimeOfDay`, `DaylightMenu`; NOAA sun math in C#). **Not built:** the window shader with light profiles (`building_windows.gdshader`; `building_day.gdshader` is still the daytime placeholder and there is no `hour` uniform), sprite/window cross-fade, and `set_clock` / `daylight()` in Rust.
 - **M7 Imagery, M8 Measure: not started.** `ground_height_at` returns 0 (no DEM).
 
-The Rust side has a `cargo test` baseline of 106 passed, 0 failed, 3 ignored (103 in `simworld-core` + 3 in `simworld-godot`; tests pin `api_version`, the `#[func]` list and the `#[signal]` list to `docs/contract.md`, `lifecycle_tests` cover the 0.7 host API and lifecycle, `profile::tests` pin `addons/simworld/profiles/default.json` and the schema to the code, `golden_tests` pin per-tile output hashes and the cover). `scheduler::tests::GodotSim` mirrors the C# visibility rule.
+The Rust side has a `cargo test` baseline of 108 passed, 0 failed, 3 ignored (105 in `simworld-core` + 3 in `simworld-godot`; tests pin `api_version`, the `#[func]` list and the `#[signal]` list to `docs/contract.md`, `lifecycle_tests` cover the 0.7 host API and lifecycle, `profile::tests` pin `addons/simworld/profiles/default.json` and the schema to the code, `golden_tests` pin per-tile output hashes and the cover). `scheduler::tests::GodotSim` mirrors the C# visibility rule.
 
 ## Commands
 
 - Rust (from `rust/`, the workspace root, never from `low-poly-map/`): `cargo check`, `cargo test`, `cargo build` (debug `target/debug/libsimworld_godot.dylib` that the editor loads), `cargo build --release`. `cargo tree -p simworld-core | grep -i godot` must print nothing.
+- **Addon sync (after every edit under `addons/simworld/`, before `dotnet build` or running the bench):** `tools/sync_addon.sh` copies `addons/simworld/` to `low-poly-map/addons/simworld/` (generated, git-ignored; the addon source is at the repo root, never edit the copy). It first pulls Godot-generated `.uid` files that exist only in the copy back to the source (commit them), and leaves out `simworld.gdextension` and `bin/` (the bench loads the library from `rust/target` through `low-poly-map/simplane_world.gdextension`, the editor-only dev override).
 - C# (from `low-poly-map/`): `dotnet build`.
-- Godot binary is not on PATH: `G=~/Downloads/Godot_mono.app/Contents/MacOS/Godot`. Headless smoke test, from `low-poly-map/`: `$G --headless --path . --quit-after 120`. It prints the godot-rust init line, the Godot version, the `[StreamerBridge]` lines (tile source, `poll_fades available`, `WorldStreamer configured ... [simworld-godot <version> (build ...)]`, disk cache stats, first tile, a `[StreamerBridge] debug_stats {...}` line) and some `slow upload` lines. A green run has no errors and a `first tile` line. Add `-- --tile-url=` for the offline synthetic city.
+- Addon libraries: `tools/build_addon.sh [--release] [--ios]` builds `simworld-godot` for this OS and copies it to `addons/simworld/bin/<os>/` (git-ignored; macOS universal via `lipo` when both rust targets are installed, else the host architecture only). Needed only for a project that uses the addon's own `.gdextension` (a game, the fresh-project check), not for the bench.
+- Godot binary is not on PATH: `G=~/Downloads/Godot_mono.app/Contents/MacOS/Godot`. Headless smoke test, from `low-poly-map/`: `$G --headless --path . --quit-after 120`. It prints the godot-rust init line, the Godot version, the `[WorldView]` lines (tile source, `poll_fades available`, `WorldStreamer configured ... [simworld-godot <version> (build ...)]`, disk cache stats, first tile, a `[WorldView] debug_stats {...}` line) and some `slow upload` lines. A green run has no errors and a `first tile` line. Add `-- --tile-url=` for the offline synthetic city.
 - Run the test bench: `$G --path .` (add user arguments after `--`, see `low-poly-map/CLAUDE.md`).
 - Hot reload: keep the editor open, `cargo build`, refocus the editor window (`reloadable = true` in `simplane_world.gdextension`). `WorldStreamer` is not a tool class, so it only runs in-game, not in the editor.
 - Tile build: `data/build_tiles.sh` (Docker, planetiler 0.10.2) writes `data/out/vilnius.pmtiles`; `data/serve.sh` serves it with Range support at `http://127.0.0.1:8787/`. See `data/README.md`.
@@ -40,8 +42,10 @@ lowpolymap/                  # repo root (git); the future library repo is calle
   CHANGELOG.md
   docs/                      # contract.md (the WorldStreamer contract), specs and the design doc
   .claude/agents/            # rust-world-streamer.md, godot-csharp-integrator.md (point to docs/contract.md)
-  addons/simworld/profiles/  # world profile: default.json (all keys = compiled-in defaults) + world-profile.schema.json (P3)
-  low-poly-map/              # Godot project root and test bench (project.godot, scenes/, scripts/, shaders/, textures/)
+  addons/simworld/           # the Godot rendering addon (P5): plugin.cfg, simworld.gdextension, runtime/ (C#, namespace SimWorld), shaders/, textures/,
+                             #   profiles/ (default.json + world-profile.schema.json, P3), bin/ (built libraries, ignored)
+  tools/                     # sync_addon.sh (addon -> bench copy), build_addon.sh (libraries -> addons/simworld/bin)
+  low-poly-map/              # Godot project root and test bench (project.godot, scenes/, scripts/ = host code, shaders/fallback_ground; addons/ = generated copy)
   rust/                      # Cargo workspace, OUTSIDE the Godot project:
     simworld-core/           #   pure Rust world (no godot), rlib; World, Log, Diagnostics, all modules
     simworld-godot/          #   gdext binding, WorldStreamer node only (cdylib + staticlib -> libsimworld_godot.*); build.rs (build marker)
@@ -53,13 +57,17 @@ lowpolymap/                  # repo root (git); the future library repo is calle
 - Never put Rust crates inside `low-poly-map/`. They go in `rust/`.
 - `low-poly-map/simplane_world.gdextension` (file name kept) points at `res://../rust/target/{debug,release}/libsimworld_godot.dylib` (macOS only; editor use only). Exported builds and the iOS `.xcframework` need the library copied into the project.
 
+## Addon (`addons/simworld/`, P5)
+
+- `runtime/` (namespace `SimWorld`, compiled into the host's assembly): `WorldView` (the entry node: owns the streamer, runs the per-frame calls, uploads, fades, shifts the origin; no default origin, no command line; `AutoStart` or `Start()`, `SetTime(hour, night)`, C# event `OriginShifted`), `IWorldCameraSource` (+ `Camera3DSource` adapter; a `Camera3D` needs no code), `WorldRenderSettings` (resource: upload budget, prewarm, debug, building/ground/light-sprite material tunables), `NightLook` (resource: glow threshold/intensity and fog on an `Environment` the host passes in; exposure, tone map, sun, sky stay in the host), `ShaderGlobals` / `AddonPaths`, `SimWorldPlugin` (editor plugin), `WorldStreamerFacade`, `TilePool`, `TileCover`, `TileKey`.
+- Shader globals `simworld_night_factor`, `simworld_hour`, `simworld_curve_center`, `simworld_curve_inv_2r`: the editor plugin writes them into `[shader_globals]` when enabled; `WorldView` adds any that are missing at runtime. `GlobalShaderParameterGetList` is editor-only: never use it at runtime.
+- Asset paths come from the script's resource path (`AddonPaths.Root`); shader `#include`s are relative (the dither variant rewrites them to absolute because an in-memory shader has no path). `build_addon.sh` fills `bin/`; the release zip (P7) is this folder with `bin/`.
+- Not done: the minimal iOS export of a project that uses the addon (needs the iOS rust target, Xcode and Godot's iOS .NET export; the plan has a fallback if C# on iOS is blocked), `ios` `.gdextension` entries are written but unbuilt; Windows and Linux libraries are built only on those hosts (CI, P7); the profile colours / lit shares as shader globals wait for the window shader (M6).
+
 ## Planned library structure (docs/spec-library-packaging.md, "Target structure")
 
-Not built yet; do not create these folders without the matching phase.
-
-- Done in P1: `rust/` is a Cargo workspace with `simworld-core`, `simworld-godot`, `simworld-cli` (see Layout). Done in P3: the world profile (`simworld-core/src/profile.rs`; `addons/simworld/profiles/default.json` + `world-profile.schema.json`) and `simworld-cli validate-profile` / `default-profile`. Still to come in the core: `daylight` (M6); the other CLI commands (P6).
-- `addons/simworld/` at the repo root: the Godot rendering addon (`plugin.cfg`, multi-platform `.gdextension`, C# runtime `WorldView`/`TilePool`/`TileCover`/`TileKey`/facade, shaders, textures). Only `addons/simworld/profiles/` exists so far (P3); the rest is phase P5.
-- `low-poly-map/` stays as the test bench and demo host: `FreeFlyCamera`, `DebugOverlay`, `TimeOfDay`, `DaylightMenu`, test drivers.
+- Done: P1 workspace (`simworld-core`, `simworld-godot`, `simworld-cli`), P3 world profile (`simworld-core/src/profile.rs`; `addons/simworld/profiles/`; `simworld-cli validate-profile` / `default-profile`), P5 addon. Still to come in the core: `daylight` (M6); the other CLI commands (P6).
+- `low-poly-map/` stays as the test bench and demo host: `FreeFlyCamera`, `BenchArgs` (all launch arguments), `DebugOverlay`, `TimeOfDay`, `DaylightMenu`, `SettingsMenu`, `NightRenderController`, test drivers.
 - Releases: git tag `vX.Y.Z` plus `simworld-addon-vX.Y.Z.zip` with prebuilt libraries; the SimPlane game vendors the zip and needs no Rust toolchain.
 
 ## Architecture

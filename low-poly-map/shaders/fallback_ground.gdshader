@@ -3,7 +3,7 @@ shader_type spatial;
 // curvature as the tiles so it stays below them at range. The plane mesh must be subdivided for the bend to show.
 render_mode diffuse_burley, specular_schlick_ggx;
 
-#include "res://shaders/earth_curve.gdshaderinc"
+#include "res://addons/simworld/shaders/earth_curve.gdshaderinc"
 
 uniform vec4 albedo_color : source_color = vec4(0.18, 0.22, 0.17, 1.0);
 uniform float roughness_value : hint_range(0.0, 1.0) = 1.0;

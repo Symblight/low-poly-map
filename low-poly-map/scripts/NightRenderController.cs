@@ -1,26 +1,25 @@
 using Godot;
+using SimWorld;
 
 namespace LowPolyMap;
 
 /// <summary>
 /// Night rendering (docs/spec-night-rendering.md): lives on the WorldEnvironment node and drives its Environment.
-/// - Bloom: only things above the HDR glow threshold glow. At night the threshold sits just below the emission of lit
-///   windows / light sprites (<see cref="EmissionLevel"/>); concrete, roofs and sky stay far below it. By day
-///   it is raised out of reach of sunlit surfaces. Glow intensity rises with altitude so the light carpet blooms at cruise.
+/// - Bloom and fog: the addon's <see cref="NightLook"/> (glow threshold below the emission at night, glow intensity by altitude,
+///   depth and haze fog). This host owns everything else below.
 /// - Tone map: Filmic or AgX, switchable (export, T key, <c>--tonemap=filmic|agx</c>).
 /// - Eye adaptation, external view only (<see cref="ExternalView"/>): Godot's auto exposure is Forward+ only (the engine
 ///   warns on Mobile), so exposure is a CPU model: a metered-luminance estimate drives <c>Environment.TonemapExposure</c>
 ///   through an asymmetric low-pass (dark to bright faster than bright to dark).
-/// - Fog: depth fog tuned so R2 blocks (2.5..7 km) dissolve instead of reading as boxes, plus a thin ground-haze height fog.
-/// - Placeholder day/night look (sun, ambient, sky, fog colour) from <see cref="StreamerBridge.NightFactor"/> until the M6
-///   TimeOfDay script owns the sun/moon; switch off with <see cref="DriveLighting"/>.
+/// - Placeholder day/night look (sun, ambient, sky, fog colour) from <see cref="WorldView.NightFactor"/>;
+///   switch off with <see cref="DriveLighting"/>.
 /// Mobile-renderer features only.
 /// </summary>
 public partial class NightRenderController : WorldEnvironment
 {
     public enum ToneMapper { Filmic = 0, AgX = 1 }
 
-    [Export] public StreamerBridge? Bridge { get; set; }
+    [Export] public WorldView? Bridge { get; set; }
     [Export] public FreeFlyCamera? Camera { get; set; }
     [Export] public DirectionalLight3D? Sun { get; set; }
 
@@ -30,20 +29,8 @@ public partial class NightRenderController : WorldEnvironment
     [Export] public bool ExternalView { get; set; } = true;
     [Export] public bool DriveLighting { get; set; } = true;
 
-    // ---- bloom ----------------------------------------------------------------------------------
-    /// <summary>
-    /// HDR value (linear, before tone map) a lit window / sprite / lit road reaches. The glow threshold is derived from it;
-    /// the building night shader (M6) must emit at least this much. Sprites emit 1.6 * colour; roads do not glow.
-    /// </summary>
-    [Export] public float EmissionLevel { get; set; } = 1.0f;
-    /// <summary>Glow threshold = EmissionLevel * this at night ("just below" the emission).</summary>
-    [Export(PropertyHint.Range, "0.3,1,0.01")] public float ThresholdBelowEmission { get; set; } = 0.82f;
-    /// <summary>Daytime threshold: above anything a sunlit surface or the sky reaches.</summary>
-    [Export] public float DayThreshold { get; set; } = 3.0f;
-    [Export] public float GlowIntensityGround { get; set; } = 0.4f;
-    [Export] public float GlowIntensityCruise { get; set; } = 1.4f;
-    [Export] public float GlowAltLowM { get; set; } = 300f;
-    [Export] public float GlowAltHighM { get; set; } = 10000f;
+    /// <summary>The addon's bloom and fog look; null = defaults.</summary>
+    [Export] public NightLook? Look { get; set; }
 
     // ---- exposure (CPU model, see class comment) ---------------------------------------------------
     /// <summary>Scene luminance (linear, pre exposure) that should map to mid grey.</summary>
@@ -60,15 +47,6 @@ public partial class NightRenderController : WorldEnvironment
     [Export] public float TauDarkToBright { get; set; } = 2.0f;
     [Export] public float TauBrightToDark { get; set; } = 8.0f;
 
-    // ---- fog ------------------------------------------------------------------------------------
-    /// <summary>Depth fog is pow(smoothstep(begin, end, slant distance), curve): ~5 % at the R1/R2 border (2.5 km), ~80 % at 7 km.</summary>
-    [Export] public float FogBeginM { get; set; } = 1500f;
-    [Export] public float FogEndM { get; set; } = 9000f;
-    [Export] public float FogCurve { get; set; } = 1.0f;
-    /// <summary>Height fog (per fragment height, not per ray): fragments below this world y get 1 - exp(-(h - y) * density).</summary>
-    [Export] public float HazeTopM { get; set; } = 150f;
-    [Export] public float HazeDensity { get; set; } = 0.0006f;
-
     private Godot.Environment _env = null!;
     private ProceduralSkyMaterial? _sky;
 
@@ -82,8 +60,8 @@ public partial class NightRenderController : WorldEnvironment
     private int _shotFrames = -1;
 
     // Public for the overlay.
-    public float GlowIntensityNow { get; private set; }
-    public float GlowThresholdNow { get; private set; }
+    public float GlowIntensityNow => Look?.GlowIntensityNow ?? 0f;
+    public float GlowThresholdNow => Look?.GlowThresholdNow ?? 0f;
     public float ExposureNow => _exposure;
     public float MeteredLuminanceNow { get; private set; }
 
@@ -98,6 +76,7 @@ public partial class NightRenderController : WorldEnvironment
 
     public override void _Ready()
     {
+        Look ??= new NightLook();
         _env = Environment ?? new Godot.Environment();
         Environment = _env;
         _sky = _env.Sky?.SkyMaterial as ProceduralSkyMaterial;
@@ -111,7 +90,6 @@ public partial class NightRenderController : WorldEnvironment
             else if (arg.StartsWith("--glow-blend=", System.StringComparison.Ordinal)) _testBlend = arg.Substring(13);
             else if (arg.StartsWith("--cam-alt=", System.StringComparison.Ordinal) && float.TryParse(arg.Substring(10), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var ca)) _testAlt = ca;
             else if (arg.StartsWith("--cam-pitch=", System.StringComparison.Ordinal) && float.TryParse(arg.Substring(12), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var cp)) _testPitch = cp;
-            else if (arg.StartsWith("--night=", System.StringComparison.Ordinal) && float.TryParse(arg.Substring(8), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var nf) && Bridge != null) Bridge.NightFactor = nf;
             else if (arg.StartsWith("--shot=", System.StringComparison.Ordinal))
             {
                 // --shot=<png>[,<frames>]: save the viewport after N frames (default 90) and quit. Verification aid.
@@ -121,7 +99,7 @@ public partial class NightRenderController : WorldEnvironment
             }
         }
 
-        ConfigureStatic();
+        Look.ApplyStatic(_env);
         ApplyTonemap();
         if (_testNoGlow) _env.GlowEnabled = false;
         if (_testBlend.Length > 0) _env.GlowBlendMode = _testBlend switch { "additive" => Godot.Environment.GlowBlendModeEnum.Additive, "screen" => Godot.Environment.GlowBlendModeEnum.Screen, "replace" => Godot.Environment.GlowBlendModeEnum.Replace, _ => Godot.Environment.GlowBlendModeEnum.Softlight };
@@ -131,39 +109,6 @@ public partial class NightRenderController : WorldEnvironment
             if (!float.IsNaN(_testPitch)) Camera.Rotation = new Vector3(Mathf.DegToRad(_testPitch), 0f, 0f);
         }
         if (_shotFrames > 0 && !System.Linq.Enumerable.Contains(OS.GetCmdlineUserArgs(), "--shot-hud") && GetParent()?.GetNodeOrNull<CanvasLayer>("HUD") is { } hud) hud.Visible = false;
-    }
-
-    /// <summary>Everything that does not change per frame.</summary>
-    private void ConfigureStatic()
-    {
-        // Bloom: half-resolution first level, three levels (1/2, 1/4, 1/8); no bloom term, so only the threshold decides.
-        _env.GlowEnabled = true;
-        _env.GlowNormalized = false;
-        _env.GlowBloom = 0f;
-        _env.GlowStrength = 1.0f;
-                _env.GlowBlendMode = Godot.Environment.GlowBlendModeEnum.Additive; // Softlight showed no visible bloom on Mobile
-        _env.GlowHdrScale = 0.45f;
-        _env.GlowHdrLuminanceCap = 12f;
-        // SetGlowLevel is 0-based (glow_levels/1 == index 0); 7 levels exist.
-        for (int i = 0; i < 7; i++) _env.SetGlowLevel(i, 0f);
-        _env.SetGlowLevel(0, 0.6f); // 1/2 resolution
-        _env.SetGlowLevel(1, 1.0f); // 1/4
-        _env.SetGlowLevel(2, 0.8f); // 1/8
-
-        // Fog.
-        _env.FogEnabled = true;
-        _env.FogMode = Godot.Environment.FogModeEnum.Depth;
-        _env.FogDensity = 1.0f;
-        _env.FogDepthBegin = FogBeginM;
-        _env.FogDepthEnd = FogEndM;
-        _env.FogDepthCurve = FogCurve;
-        _env.FogHeight = HazeTopM;
-        _env.FogHeightDensity = HazeDensity;
-        _env.FogSkyAffect = 0f; // the sky horizon is matched to the fog colour instead
-        _env.FogSunScatter = 0f;
-        _env.FogLightEnergy = 1f;
-
-        // No depth of field: not enabled anywhere (spec: too heavy for the phone, pilots do not see it).
     }
 
     private void ApplyTonemap()
@@ -205,14 +150,8 @@ public partial class NightRenderController : WorldEnvironment
         float night = Bridge != null ? Bridge.NightFactor : 1f;
         float alt = Camera != null ? (float)Camera.AltitudeAgl : 0f;
 
-        // ---- glow: threshold below the emission at night, out of reach by day; stronger the higher we are ----
-        float altK = Mathf.SmoothStep(GlowAltLowM, GlowAltHighM, alt);
-        float threshold = Mathf.Lerp(DayThreshold, EmissionLevel * ThresholdBelowEmission, night);
-        float intensity = Mathf.Lerp(GlowIntensityGround, GlowIntensityCruise, altK);
-        _env.GlowHdrThreshold = threshold;
-        _env.GlowIntensity = intensity;
-        GlowThresholdNow = threshold;
-        GlowIntensityNow = intensity;
+        // ---- glow and fog: the addon's look ----
+        Look!.Update(_env, night, alt);
 
         // ---- eye adaptation (external view only) ----
         float target = 1f;

@@ -1,0 +1,19 @@
+; SimWorld WorldStreamer GDExtension (Rust, gdext 0.5.x, api-4-7): the simworld-godot crate wrapping simworld-core.
+; The libraries in bin/ are built by tools/build_addon.sh (release zips carry them; they are not committed).
+; Layout: bin/macos/libsimworld_godot.{debug,release}.dylib, bin/windows/simworld_godot.{debug,release}.dll,
+;         bin/linux/libsimworld_godot.{debug,release}.so, bin/ios/simworld_godot.{debug,release}.xcframework.
+
+[configuration]
+entry_symbol = "gdext_rust_init"
+compatibility_minimum = 4.7
+reloadable = true
+
+[libraries]
+macos.debug = "res://addons/simworld/bin/macos/libsimworld_godot.debug.dylib"
+macos.release = "res://addons/simworld/bin/macos/libsimworld_godot.release.dylib"
+windows.debug.x86_64 = "res://addons/simworld/bin/windows/simworld_godot.debug.dll"
+windows.release.x86_64 = "res://addons/simworld/bin/windows/simworld_godot.release.dll"
+linux.debug.x86_64 = "res://addons/simworld/bin/linux/libsimworld_godot.debug.so"
+linux.release.x86_64 = "res://addons/simworld/bin/linux/libsimworld_godot.release.so"
+ios.debug = "res://addons/simworld/bin/ios/simworld_godot.debug.xcframework"
+ios.release = "res://addons/simworld/bin/ios/simworld_godot.release.xcframework"

@@ -24,6 +24,10 @@ window/stretch/aspect="expand"
 
 project/assembly_name="LowPolyMap"
 
+[editor_plugins]
+
+enabled=PackedStringArray("res://addons/simworld/plugin.cfg")
+
 [physics]
 
 3d/physics_engine="Jolt Physics"
@@ -35,11 +39,19 @@ renderer/rendering_method="mobile"
 
 [shader_globals]
 
-curve_center={
+simworld_night_factor={
+"type": "float",
+"value": 1.0
+}
+simworld_hour={
+"type": "float",
+"value": 12.0
+}
+simworld_curve_center={
 "type": "vec3",
 "value": Vector3(0, 0, 0)
 }
-curve_inv_2r={
+simworld_curve_inv_2r={
 "type": "float",
 "value": 0.0
 }

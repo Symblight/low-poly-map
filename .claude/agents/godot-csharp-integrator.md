@@ -10,20 +10,20 @@ You are the Godot C# engineer for the SimPlane streamed-city spike. Rust (`World
 ## Project layout (`low-poly-map/` is the Godot project root; Rust lives outside it in `../rust/`)
 
 ```
-low-poly-map/
-  project.godot              # rendering method: mobile
-  simplane_world.gdextension # points to res://../rust/target/{debug,release}/libsimworld_godot.dylib
-  scenes/CitySpike.tscn
-  scripts/
-    StreamerBridge.cs        # owns WorldStreamer, uploads tiles, origin shifts
-    TilePool.cs              # pooled MeshInstance3D + MultiMeshInstance3D
-    FreeFlyCamera.cs         # WASD + mouse, speed slider 0–250 m/s, altitude readout
-    TimeOfDay.cs             # 0–24 h slider -> shader globals + sun/moon
-    DebugOverlay.cs          # rings, stats from debug_stats(), FPS, draw calls
-  shaders/
-    building_windows.gdshader
-    light_sprite.gdshader
+addons/simworld/            # THE LIBRARY ADDON (edit here, then run tools/sync_addon.sh); namespace SimWorld
+  plugin.cfg, simworld.gdextension (bin/ holds built libraries, ignored)
+  runtime/                   # WorldView (owns WorldStreamer, uploads tiles, origin shifts), IWorldCameraSource, WorldRenderSettings,
+                             #   NightLook, ShaderGlobals, SimWorldPlugin, WorldStreamerFacade, TilePool, TileCover, TileKey
+  shaders/                   # building_day, ground, light_sprite, lod_dither.gdshaderinc, earth_curve.gdshaderinc (relative includes)
   textures/light_dot_32.png  # 32×32 radial falloff
+  profiles/                  # world profile JSON + schema
+low-poly-map/                # test bench (Godot project root); addons/ inside it is a generated copy, never edit it
+  project.godot              # rendering method: mobile; the addon plugin is enabled
+  simplane_world.gdextension # dev override: res://../rust/target/{debug,release}/libsimworld_godot.dylib
+  scenes/CitySpike.tscn
+  scripts/                   # host code, namespace LowPolyMap: BenchArgs (launch args), FreeFlyCamera, TimeOfDay, DaylightMenu,
+                             #   SettingsMenu, DebugOverlay, NightRenderController (exposure/tone map/sun; bloom+fog from NightLook), test drivers
+  shaders/fallback_ground.gdshader
 ```
 
 ## Contract with Rust

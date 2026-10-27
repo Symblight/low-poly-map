@@ -1,5 +1,5 @@
 {
-  "profile_version": 2,
+  "profile_version": 3,
   "bands": {
     "r0_edge_m": 600.0,
     "r1_edge_m": 2500.0,
@@ -122,6 +122,7 @@
     "cluster_on_agl_m": 3300.0,
     "cluster_off_agl_m": 2700.0,
     "cluster_cell_m": 100.0,
+    "min_ring": 2,
     "profiles": {
       "residential": {
         "color": [1.0, 0.655, 0.341],

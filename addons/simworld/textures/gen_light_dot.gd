@@ -1,6 +1,6 @@
-# Generates textures/light_dot_32.png: 32x32 white radial falloff in the alpha channel.
+# Generates addons/simworld/textures/light_dot_32.png: 32x32 white radial falloff in the alpha channel.
 # Run once from the project root:
-#   Godot --headless --path . -s res://tools/gen_light_dot.gd
+#   Godot --headless --path . -s res://addons/simworld/textures/gen_light_dot.gd
 # then let Godot import it (Godot --headless --path . --import) and commit the PNG + .import.
 extends SceneTree
 
@@ -16,6 +16,6 @@ func _init() -> void:
 			var a := t * t * (3.0 - 2.0 * t)
 			a = pow(a, 1.35)
 			img.set_pixel(x, y, Color(1, 1, 1, a))
-	var err := img.save_png("res://textures/light_dot_32.png")
+	var err := img.save_png("res://addons/simworld/textures/light_dot_32.png")
 	print("light_dot_32.png saved, err=", err)
 	quit()

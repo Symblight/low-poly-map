@@ -1,6 +1,6 @@
 using System;
 
-namespace LowPolyMap;
+namespace SimWorld;
 
 /// <summary>
 /// Allocation-free helpers for tile keys. A key "z/x/y" is packed into a long so that parents, siblings and

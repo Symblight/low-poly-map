@@ -7,7 +7,7 @@ shader_type spatial;
 // clamp(sqrt(count) / 8, 0.125, 1). A single light is 0.125, clusters (100 m cells above ~3 km AGL) are higher.
 render_mode unshaded, blend_add, depth_draw_never, cull_disabled, fog_disabled, skip_vertex_transform;
 
-#include "res://shaders/earth_curve.gdshaderinc"
+#include "earth_curve.gdshaderinc"
 
 uniform sampler2D dot_tex : source_color, filter_linear, repeat_disable;
 
@@ -30,13 +30,13 @@ uniform float cluster_bright_gain = 0.8;
 uniform float cluster_world_m = 40.0;
 
 // Footprint of one screen pixel per metre of view depth: 2 * tan(fov / 2) / viewport_height_px. Set from C#
-// (StreamerBridge) whenever the camera fov or the window size changes; the built-in PROJECTION_MATRIX /
+// (WorldView) whenever the camera fov or the window size changes; the built-in PROJECTION_MATRIX /
 // VIEWPORT_SIZE did not give a usable value in this vertex stage.
 uniform float px_per_depth = 0.0014;
 
 uniform float intensity = 1.6;
-// 0 = off (day), 1 = full (night). TimeOfDay drives this as a global in M6; for now a plain uniform.
-uniform float night_factor = 1.0;
+// 0 = off (day), 1 = full (night). Global, set through WorldView.SetTime (the host owns the clock).
+global uniform float simworld_night_factor;
 // Per-tile LOD transition weight from poll_fades (1 = steady). Sprites never dither: both sides of a swap are additive,
 // so scaling brightness by the complementary fades keeps the sum constant instead of flashing double-bright.
 instance uniform float fade_mul : hint_range(0.0, 1.0) = 1.0;
@@ -84,7 +84,7 @@ void fragment() {
 	// Sharp core up close, softer gentle falloff when far.
 	a = pow(a, mix(1.35, 0.8, v_soft));
 	float w = clamp((v_col.a - 0.125) / 0.875, 0.0, 1.0);
-	float bright = intensity * night_factor * v_fade * fade_mul * (1.0 + cluster_bright_gain * w);
+	float bright = intensity * simworld_night_factor * v_fade * fade_mul * (1.0 + cluster_bright_gain * w);
 	// Bigger far sprites spread the same energy over more pixels.
 	bright *= mix(1.0, 0.45, v_soft);
 	ALBEDO = v_col.rgb * bright;

@@ -35,7 +35,7 @@ use crate::rings::{BandParams, RING_COUNT};
 
 /// Profile schema version this library reads. Bump when keys are added (and update
 /// `default.json`, the JSON Schema and `CHANGELOG.md`).
-pub const PROFILE_VERSION: u32 = 2;
+pub const PROFILE_VERSION: u32 = 3;
 
 // ---------------------------------------------------------------------------------------------
 // Data tree
@@ -248,6 +248,10 @@ pub struct Lights {
     pub cluster_off_agl_m: f64,
     /// Cell size (m) of the clustered light carpet.
     pub cluster_cell_m: f64,
+    /// Finest band that carries light sprites (0..3): bands `min_ring..=3` get lights, finer ones none (they are meant to get
+    /// windows). Default 2 = R2/R3 only. Lowering it puts sprites on top of the building meshes of R1 (and R0) as a stopgap
+    /// until the window shader exists. Added in profile_version 3.
+    pub min_ring: u32,
     pub profiles: LightProfiles,
     /// Profile of buildings whose kind is in no profile, by the landuse around them.
     pub landuse_fallback: LanduseFallback,
@@ -503,6 +507,7 @@ impl Default for Lights {
             cluster_on_agl_m: 3300.0,
             cluster_off_agl_m: 2700.0,
             cluster_cell_m: 100.0,
+            min_ring: 2,
             profiles: LightProfiles::default(),
             landuse_fallback: LanduseFallback::default(),
         }
@@ -681,6 +686,7 @@ pub const RANGES: &[(&str, f64, f64)] = &[
     ("lights.cluster_on_agl_m", 0.0, 100_000.0),
     ("lights.cluster_off_agl_m", 0.0, 100_000.0),
     ("lights.cluster_cell_m", 1.0, 10_000.0),
+    ("lights.min_ring", 0.0, 3.0),
     ("lights.profiles.*.color[]", 0.0, 1.0),
     ("streaming.max_fetch_per_band", 1.0, 64.0),
     ("streaming.max_mesh_per_band", 1.0, 64.0),
@@ -1393,11 +1399,12 @@ mod tests {
         assert_eq!(resolve(Some(("e", "{}")), Some(&empty_object()), &NullLog).unwrap(), Profile::default());
     }
 
-    /// profile_version 2 added `buildings.r0..r2.min_height_m` (default 0 = keep all); a
-    /// version 1 file without them still loads strictly and keeps the defaults.
+    /// profile_version 2 added `buildings.r0..r2.min_height_m` (default 0 = keep all) and
+    /// version 3 added `lights.min_ring` (default 2); a version 1 file without them still loads
+    /// strictly and keeps the defaults.
     #[test]
     fn version_1_files_load_with_the_version_2_defaults() {
-        assert_eq!(PROFILE_VERSION, 2);
+        assert_eq!(PROFILE_VERSION, 3);
         let v1 = r#"{ "profile_version": 1, "buildings": { "r1": { "dp_m": 3.0, "min_area_m2": 25.0 } } }"#;
         let p = resolve(Some(("v1", v1)), None, &NullLog).unwrap();
         assert_eq!(p.profile_version, PROFILE_VERSION);

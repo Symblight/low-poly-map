@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Globalization;
 using Godot;
+using SimWorld;
 
 namespace LowPolyMap;
 
@@ -40,7 +41,7 @@ public partial class GeodeticFlightTest : Node
     private const double TileLimitM = 1.0;
     private const int TileCheckEveryFrames = 30;
 
-    [Export] public StreamerBridge? Bridge { get; set; }
+    [Export] public WorldView? Bridge { get; set; }
     [Export] public FreeFlyCamera? Camera { get; set; }
 
     private bool _enabled;
@@ -87,7 +88,7 @@ public partial class GeodeticFlightTest : Node
             else if (Num(arg, FpsArg, out v)) Engine.MaxFps = (int)v;
             else if (Num(arg, TimeoutArg, out v)) _timeout = v;
         }
-        ProcessPriority = 1; // after StreamerBridge (0): its shift handling is done when the checks run
+        ProcessPriority = 1; // after WorldView (0): its shift handling is done when the checks run
         if (!_enabled) { SetProcess(false); return; }
         if (Engine.MaxFps == 0) Engine.MaxFps = 60; // leave the workers real time to deliver tiles
         GD.Print($"[GeodeticFlightTest] enabled: speed {_speed} m/s, dt {_dt} s, north {PathNorthM} m, east {PathEastM} m, climb {PathClimbM} m");

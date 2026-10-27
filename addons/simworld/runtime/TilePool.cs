@@ -1,7 +1,7 @@
 using System.Collections.Generic;
 using Godot;
 
-namespace LowPolyMap;
+namespace SimWorld;
 
 /// <summary>
 /// The pooled node set that represents one streamed tile: a building MeshInstance3D, a ground MeshInstance3D
@@ -86,41 +86,48 @@ public sealed class TilePool
     public ShaderMaterial LightMaterial => _lightMaterial;
     public ShaderMaterial GroundMaterial => _groundMaterial;
 
-    /// <summary>0 = day, 1 = full night. Drives the light sprites (M6 replaces this with a global).</summary>
-    public void SetNightFactor(float night)
-    {
-        _lightMaterial.SetShaderParameter("night_factor", night);
-        _groundMaterial.SetShaderParameter("night_factor", night);
-        _groundFadeMaterial.SetShaderParameter("night_factor", night);
-    }
-
-    /// <summary>Copy of <paramref name="path"/>'s shader with <c>#define LOD_DITHER</c> inserted after the shader_type line.</summary>
+    /// <summary>
+    /// Copy of <paramref name="path"/>'s shader with <c>#define LOD_DITHER</c> inserted after the shader_type line. The copy has no
+    /// path of its own, so relative <c>#include</c>s are made absolute against the original's folder.
+    /// </summary>
     private static Shader LoadDitherVariant(string path)
     {
         var src = GD.Load<Shader>(path);
-        var code = src.Code;
+        var dir = path.Substring(0, path.LastIndexOf('/'));
+        var code = System.Text.RegularExpressions.Regex.Replace(src.Code, "#include \"(?!res://)([^\"]+)\"", m => $"#include \"{dir}/{m.Groups[1].Value}\"");
         int nl = code.IndexOf('\n', code.IndexOf("shader_type", System.StringComparison.Ordinal));
         var variant = new Shader { Code = code.Insert(nl + 1, "#define LOD_DITHER\n") };
         variant.ResourceName = path + " (LOD_DITHER)";
         return variant;
     }
 
-    public TilePool(Node3D container)
+    /// <param name="container">Parent of the pooled tile roots.</param>
+    /// <param name="settings">Material parameters; null = <see cref="WorldRenderSettings"/> defaults.</param>
+    /// <param name="addonRoot">Addon folder; null = <see cref="AddonPaths.Root"/>.</param>
+    public TilePool(Node3D container, WorldRenderSettings? settings = null, string? addonRoot = null)
     {
         _container = container;
+        settings ??= new WorldRenderSettings();
+        string shaders = (addonRoot ?? AddonPaths.Root) + "/shaders";
+        string textures = (addonRoot ?? AddonPaths.Root) + "/textures";
 
         // Unit quad; the sprite shader sizes it in pixels and billboards it.
-        _lightMaterial = new ShaderMaterial { Shader = GD.Load<Shader>("res://shaders/light_sprite.gdshader") };
-        _lightMaterial.SetShaderParameter("dot_tex", GD.Load<Texture2D>("res://textures/light_dot_32.png"));
+        _lightMaterial = new ShaderMaterial { Shader = GD.Load<Shader>(shaders + "/light_sprite.gdshader") };
+        _lightMaterial.SetShaderParameter("dot_tex", GD.Load<Texture2D>(textures + "/light_dot_32.png"));
+        settings.ApplyToLights(_lightMaterial);
         _lightMesh = new QuadMesh { Size = Vector2.One, Material = _lightMaterial };
 
         // One shared material for every building mesh of every tile (opaque, no discard).
-        _buildingMaterial = new ShaderMaterial { Shader = GD.Load<Shader>("res://shaders/building_day.gdshader") };
-        _buildingFadeMaterial = new ShaderMaterial { Shader = LoadDitherVariant("res://shaders/building_day.gdshader") };
+        _buildingMaterial = new ShaderMaterial { Shader = GD.Load<Shader>(shaders + "/building_day.gdshader") };
+        _buildingFadeMaterial = new ShaderMaterial { Shader = LoadDitherVariant(shaders + "/building_day.gdshader") };
+        settings.ApplyToBuilding(_buildingMaterial);
+        settings.ApplyToBuilding(_buildingFadeMaterial);
 
         // One shared material for every ground mesh (palette decoded from vertex COLOR).
-        _groundMaterial = new ShaderMaterial { Shader = GD.Load<Shader>("res://shaders/ground.gdshader") };
-        _groundFadeMaterial = new ShaderMaterial { Shader = LoadDitherVariant("res://shaders/ground.gdshader") };
+        _groundMaterial = new ShaderMaterial { Shader = GD.Load<Shader>(shaders + "/ground.gdshader") };
+        _groundFadeMaterial = new ShaderMaterial { Shader = LoadDitherVariant(shaders + "/ground.gdshader") };
+        settings.ApplyToGround(_groundMaterial);
+        settings.ApplyToGround(_groundFadeMaterial);
     }
 
     /// <summary>Creates <paramref name="count"/> hidden node sets up front to avoid first-use hitches.</summary>

@@ -7,8 +7,8 @@ shader_type spatial;
 //   g = seed 0..1, b = floor height / 10 m, a = building height / 400 m.   UV = meters (u along wall, v up).
 render_mode cull_back, diffuse_burley, specular_schlick_ggx;
 
-#include "res://shaders/lod_dither.gdshaderinc"
-#include "res://shaders/earth_curve.gdshaderinc"
+#include "lod_dither.gdshaderinc"
+#include "earth_curve.gdshaderinc"
 
 uniform float roof_darken : hint_range(0.0, 1.0) = 0.62;
 uniform float floor_line_strength : hint_range(0.0, 1.0) = 0.22;

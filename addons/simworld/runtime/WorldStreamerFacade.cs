@@ -2,7 +2,7 @@ using System.Collections.Generic;
 using Godot;
 using Godot.Collections;
 
-namespace LowPolyMap;
+namespace SimWorld;
 
 public enum TileState { Queued, Fetching, Meshing, Ready, Failed, Unloading, Unknown }
 

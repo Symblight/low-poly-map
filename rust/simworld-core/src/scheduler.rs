@@ -42,8 +42,8 @@
 //! level (the shader's parity rule needs that).
 //!
 //! # Lights
-//! R2/R3 tiles carry single and clustered lights. Crossing 3300 m AGL upwards (2700 m down)
-//! switches the mode; already delivered R2/R3 tiles are re-delivered under the same key:
+//! Tiles of the bands `lights.min_ring..=3` (default R2/R3) carry single and clustered lights. Crossing 3300 m AGL upwards (2700 m down)
+//! switches the mode; already delivered lit tiles are re-delivered under the same key:
 //! R3 from the light sets kept here (no mesh), R2 by re-running fetch (disk cache) + mesh.
 //!
 //! Lifecycle per entry: Queued -> Fetching -> Fetched -> Decoding -> Ready -> (delivered) Idle.
@@ -332,6 +332,7 @@ impl Scheduler {
             }
             let present = self.present(k);
             let clustered = self.clustered;
+            let min_lit_ring = self.profile.lights.min_ring as usize;
             let fading = self.fades.contains_key(&k);
             // Bottom-up coarsening: a node merges only once none of its children is split.
             let kids_split = k.z < crate::rings::LEAF_ZOOM
@@ -372,7 +373,7 @@ impl Scheduler {
                         // or nothing below is present: drop the subtree now.
                         e.split = false;
                         e.coarsening = false;
-                        if e.held && e.ring >= 2 {
+                        if e.held && e.ring >= min_lit_ring {
                             // Visible again: catch up on light-mode flips missed while split.
                             Self::mark_relight(e, clustered);
                         }
@@ -476,16 +477,17 @@ impl Scheduler {
             return;
         }
         self.clustered = want;
+        let min_ring = self.profile.lights.min_ring as usize;
         for e in self.entries.values_mut() {
             // A split parent is hidden behind its children: it is re-lit if it ever returns.
-            if !e.held || e.split || e.ring < 2 {
+            if !e.held || e.split || e.ring < min_ring {
                 continue;
             }
             Self::mark_relight(e, want);
         }
     }
 
-    /// A held R2/R3 entry whose delivered lights differ from `mode` gets re-delivered.
+    /// A held lit entry (band >= `lights.min_ring`) whose delivered lights differ from `mode` gets re-delivered.
     fn mark_relight(e: &mut Entry, mode: bool) {
         let stale = e.lights_mode != mode;
         if e.ring == 3 && e.lights.is_some() {
@@ -504,7 +506,7 @@ impl Scheduler {
                 Some(i) => {
                     // Godot still holds it: restore without refetching.
                     let mut e = self.unloading.swap_remove(i);
-                    if e.ring >= 2 {
+                    if e.ring >= self.profile.lights.min_ring as usize {
                         Self::mark_relight(&mut e, self.clustered);
                     }
                     e
@@ -712,10 +714,11 @@ impl Scheduler {
     /// Coarsen fade done: the parent is a leaf again, its subtree unloads this frame.
     fn finish_coarsen(&mut self, k: TileKey) {
         let clustered = self.clustered;
+        let min_ring = self.profile.lights.min_ring as usize;
         if let Some(e) = self.entries.get_mut(&k) {
             e.split = false;
             e.coarsening = false;
-            if e.held && e.ring >= 2 {
+            if e.held && e.ring >= min_ring {
                 Self::mark_relight(e, clustered);
             }
         }
@@ -1158,11 +1161,13 @@ mod tests {
         pending: VecDeque<(u64, WorkerMsg)>,
         frame: u64,
         real: Option<Frame>,
+        /// Profile of the real builds (`real`); None = the test default.
+        profile: Option<Arc<Profile>>,
     }
 
     impl FakeWorker {
         fn new() -> Self {
-            Self { pending: VecDeque::new(), frame: 0, real: None }
+            Self { pending: VecDeque::new(), frame: 0, real: None, profile: None }
         }
         fn submit(&mut self, jobs: &mut Vec<Job>) {
             for j in jobs.drain(..) {
@@ -1172,7 +1177,7 @@ mod tests {
                     }
                     Job::Decode { key, ring, job, payload } => {
                         let result = match self.real {
-                            Some(f) => build_tile(key, ring, f, &payload, crate::profile::test_default()),
+                            Some(f) => build_tile(key, ring, f, &payload, self.profile.as_deref().unwrap_or(crate::profile::test_default())),
                             None => Ok(fake_data(key, ring)),
                         };
                         (2, WorkerMsg::Decoded { key, ring, job, result })
@@ -1636,10 +1641,27 @@ mod tests {
 
     #[test]
     fn synthetic_city_streams_real_meshes_and_lights() {
+        let lights = synthetic_city_settles(dp());
+        assert!(lights[0] == 0 && lights[1] == 0 && lights[2] > 0 && lights[3] > 0);
+    }
+
+    /// `lights.min_ring` = 1: R1 tiles carry lights through the whole pipeline too (R0 still none), and a
+    /// settled cover has no cover errors (the lights do not touch the visibility rule).
+    #[test]
+    fn lights_min_ring_1_lights_r1_through_the_scheduler() {
+        let mut w = crate::profile::WorldProfile::default();
+        w.lights.min_ring = 1;
+        let lights = synthetic_city_settles(Arc::new(Profile::new(w).unwrap()));
+        assert!(lights[0] == 0 && lights[1] > 0 && lights[2] > 0 && lights[3] > 0, "{lights:?}");
+    }
+
+    /// Streams the synthetic city around 300 m AGL until settled; returns the light counts per ring.
+    fn synthetic_city_settles(profile: Arc<Profile>) -> [usize; RING_COUNT] {
         let mut h = Harness::new();
         let frame = Frame::new(VILNIUS.0, VILNIUS.1);
-        h.s = Scheduler::new(frame, true, dp());
+        h.s = Scheduler::new(frame, true, profile.clone());
         h.w.real = Some(frame);
+        h.w.profile = Some(profile);
         let mut tris = [0usize; RING_COUNT];
         let mut ground = [0usize; RING_COUNT];
         let mut lights = [0usize; RING_COUNT];
@@ -1671,7 +1693,7 @@ mod tests {
         assert!(h.s.settled());
         assert!(tris[0] > 0 && tris[1] > 0 && tris[2] > 0 && tris[3] == 0);
         assert!(ground[0] > 0 && ground[1] > 0 && ground[2] > 0 && ground[3] == 0);
-        assert!(lights[0] == 0 && lights[1] == 0 && lights[2] > 0 && lights[3] > 0);
+        lights
     }
 
     #[test]

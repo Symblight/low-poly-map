@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Text;
 using Godot;
+using SimWorld;
 
 namespace LowPolyMap;
 
@@ -43,7 +44,7 @@ public partial class DebugOverlay : Control
     private static readonly string[] StateNames =
         { "queued", "fetching", "meshing", "ready", "failed", "unloading" };
 
-    [Export] public StreamerBridge? Bridge { get; set; }
+    [Export] public WorldView? Bridge { get; set; }
     [Export] public FreeFlyCamera? Camera { get; set; }
     [Export] public NightRenderController? Render { get; set; }
 

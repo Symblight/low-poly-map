@@ -2,30 +2,49 @@ using System.Collections.Generic;
 using System.Text;
 using Godot;
 
-namespace LowPolyMap;
+namespace SimWorld;
 
 /// <summary>
-/// Owns the Rust WorldStreamer (via the facade), drives it every frame, uploads ready tiles
-/// into pooled nodes and returns unloaded tiles to the pool. Visibility follows the quadtree-cover
-/// sibling-swap rule (see <see cref="TileCover"/>). Exposes timing/counters for the debug overlay.
+/// The library's entry node: owns the Rust WorldStreamer (via the facade), drives it every frame, uploads ready tiles into
+/// pooled nodes and returns unloaded tiles to the pool. Visibility follows the quadtree-cover sibling-swap rule (see
+/// <see cref="TileCover"/>). Put it in a scene, set <see cref="OriginLat"/> / <see cref="OriginLon"/> and a <see cref="Camera"/>
+/// (or a <see cref="CameraSource"/>), and the city streams around the camera. The host sets the time of day through
+/// <see cref="SetTime"/>, shifts its own nodes on <see cref="OriginShifted"/>, and owns the environment, the sun and the exposure.
+/// Exposes timing and counters for a debug overlay.
 /// </summary>
-public partial class StreamerBridge : Node3D
+[GlobalClass]
+public partial class WorldView : Node3D
 {
-    private const long UploadBudgetUs = 2000;
-    private const int MaxTilesPerFrame = 2;
-    private const int PrewarmTiles = 24;
-    private const double VerifyInterval = 5.0;
-    private const string TileUrlArg = "--tile-url=";
-
-    [Export] public double OriginLat { get; set; } = 54.6872;
-    [Export] public double OriginLon { get; set; } = 25.2797;
-    /// <summary>Tile source. Empty = synthetic city. Overridden by the user arg --tile-url=&lt;url&gt;.</summary>
+    /// <summary>Geodetic origin of the world frame (WGS84 degrees). No default: the host chooses where the world starts.</summary>
+    [Export] public double OriginLat { get; set; } = double.NaN;
+    [Export] public double OriginLon { get; set; } = double.NaN;
+    /// <summary>Tile source (PMTiles URL). Empty = synthetic city.</summary>
     [Export] public string TileUrl { get; set; } = "";
-    [Export] public FreeFlyCamera? Camera { get; set; }
-    /// <summary>0 = day, 1 = night: drives the light sprites. Plain value until M6's TimeOfDay owns it as a global.</summary>
-    [Export(PropertyHint.Range, "0,1,0.01")] public float NightFactor { get; set; } = 1f;
-    /// <summary>Visual earth curvature (shaders/earth_curve.gdshaderinc): 0 = flat, 1 = real Earth, larger exaggerates. User arg --curvature=&lt;x&gt;.</summary>
+    /// <summary>Disk cache folder (<c>user://</c> or an OS path). Must be unique per instance (contract 11a). Empty = no disk cache.</summary>
+    [Export] public string CacheDir { get; set; } = "user://simworld_cache";
+    /// <summary>World profile JSON file (<c>res://</c>, <c>user://</c> or an OS path); empty = compiled-in defaults. Needs api 0.6.</summary>
+    [Export(PropertyHint.File, "*.json")] public string ProfilePath { get; set; } = "";
+    /// <summary>Camera used for the field of view (sprite size) and the far plane. Also the pose source unless <see cref="CameraSource"/> is set.</summary>
+    [Export] public Camera3D? Camera { get; set; }
+    /// <summary>Tuning of the rendering side; null = defaults.</summary>
+    [Export] public WorldRenderSettings? Settings { get; set; }
+    /// <summary>Start in <c>_Ready</c>. Turn off to set properties from code first and call <see cref="Start"/> yourself.</summary>
+    [Export] public bool AutoStart { get; set; } = true;
+    /// <summary>Visual earth curvature (shaders/earth_curve.gdshaderinc): 0 = flat, 1 = real Earth, larger exaggerates.</summary>
     [Export(PropertyHint.Range, "0,100,0.1")] public float Curvature { get; set; } = 1f;
+
+    /// <summary>Pose source (position, velocity, AGL, origin shifts). Null = <see cref="Camera"/> itself when it implements <see cref="IWorldCameraSource"/>, else an adapter around it.</summary>
+    public IWorldCameraSource? CameraSource { get; set; }
+    /// <summary>Profile overrides (nested like the profile JSON) merged over <see cref="ProfilePath"/> at every configure; set before <see cref="Start"/>.</summary>
+    public Godot.Collections.Dictionary BaseProfileOverrides { get; set; } = new();
+
+    /// <summary>0 = day, 1 = night, as last given to <see cref="SetTime"/>.</summary>
+    public float NightFactor { get; private set; } = 1f;
+    /// <summary>Local solar hour as last given to <see cref="SetTime"/>.</summary>
+    public float Hour { get; private set; } = 12f;
+
+    /// <summary>Raised from <c>_Process</c> after the view applied a re-center: the vector to subtract from every host node in the world frame.</summary>
+    public event System.Action<Vector3>? OriginShifted;
 
     private const double EarthRadiusM = 6_371_000.0;
 
@@ -74,7 +93,7 @@ public partial class StreamerBridge : Node3D
     public string[] Attributions { get; private set; } = System.Array.Empty<string>();
     /// <summary>Effective band edges for the overlay, e.g. "bands 0.6/2.5/7/25 km" (empty until the profile is readable, api 0.6+).</summary>
     public string BandsText { get; private set; } = "";
-    /// <summary>The resolved profile overrides passed to configure_world (empty = none), for logs and tests.</summary>
+    /// <summary>The effective profile overrides passed to configure_world (base + panel; empty = none), for logs and tests.</summary>
     public Godot.Collections.Dictionary ProfileOverrides { get; private set; } = new();
 
     /// <summary>Re-centers seen through take_origin_shift() (the authoritative path) and the latest / summed shift.</summary>
@@ -86,7 +105,7 @@ public partial class StreamerBridge : Node3D
     public Vector3 LastSignalShift { get; private set; }
     /// <summary>
     /// Host hook: when set, replaces the update_camera(...) call in each frame (same place in the call order, before
-    /// take_origin_shift). The hook may move <see cref="Camera"/> (in the pre-shift frame; the bridge subtracts the shift
+    /// take_origin_shift). The hook may move the camera (in the pre-shift frame; the view subtracts the shift
     /// afterwards) and must call one camera update on the Streamer (e.g. UpdateCameraGeodetic).
     /// </summary>
     public System.Action<double>? ExternalCameraUpdate { get; set; }
@@ -107,9 +126,11 @@ public partial class StreamerBridge : Node3D
     private string _lastLoggedStatus = "";
     private string _tileUrl = "";
     private string _cacheDir = "";
-    /// <summary>profile_path and resolved --area/--set overrides from the launch args, kept for <see cref="ApplyProfileOverrides"/> (never re-derived: --area scales the library defaults and would compound).</summary>
-    private string _argProfilePath = "";
-    private Godot.Collections.Dictionary _argOverrides = new();
+    private bool _started;
+    private bool _initialized;
+    private WorldRenderSettings _settings = new();
+    private IWorldCameraSource? _source;
+    private Camera3DSource? _adapter;
     private Godot.Collections.Dictionary? _pendingOverrides;
     private readonly List<long> _dropScratch = new(256);
     private TilePool? _pool;
@@ -124,7 +145,6 @@ public partial class StreamerBridge : Node3D
     /// <summary>True when the loaded Rust build exports poll_fades(); false = no transitions, instant swaps (old behaviour).</summary>
     public bool FadesSupported => Cover.FadesEnabled;
 
-    private float _appliedNight = -1f;
     private double _secTimer;
     private int _secReady;
     private int _secUnloaded;
@@ -137,52 +157,96 @@ public partial class StreamerBridge : Node3D
     private readonly HashSet<long> _suspectRoots = new();
     private readonly StringBuilder _report = new();
 
+    public override void _EnterTree()
+    {
+        if (GetScript().As<Script>() is { } script) AddonPaths.SetFromScriptPath(script.ResourcePath);
+        ShaderGlobals.EnsureRegistered();
+    }
+
     public override void _Ready()
     {
-        foreach (var arg in OS.GetCmdlineUserArgs())
-            if (arg.StartsWith("--curvature=", System.StringComparison.Ordinal)
-                && float.TryParse(arg.Substring(12), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var cv))
-                Curvature = Mathf.Max(cv, 0f);
+        if (AutoStart) Start();
+    }
+
+    /// <summary>Builds the tile pool and the WorldStreamer node once (idempotent). Needs the node in the tree.</summary>
+    private void Initialize()
+    {
+        if (_initialized) return;
+        _initialized = true;
+        _settings = Settings ?? new WorldRenderSettings();
+        TilePool.DebugLightAlpha = _settings.DebugLightAlpha;
+
+        if (CameraSource != null) _source = CameraSource;
+        else if (Camera is IWorldCameraSource s) _source = s;
+        else if (Camera != null) _source = _adapter = new Camera3DSource(Camera);
+
         // Curved vertices sink below the flat tile AABBs: widen the cull box by the drop at the camera's far plane.
         float far = Camera?.Far ?? 30000f;
         TilePool.CurveCullMargin = (float)(far * (double)far * Curvature / (2.0 * EarthRadiusM));
 
         _tileRoot = new Node3D { Name = "Tiles" };
         AddChild(_tileRoot);
-        _pool = new TilePool(_tileRoot);
-        _pool.Prewarm(PrewarmTiles);
-
-        foreach (var arg in OS.GetCmdlineUserArgs())
-            if (arg.StartsWith("--light-alpha=", System.StringComparison.Ordinal)
-                && float.TryParse(arg.Substring(14), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var la))
-                TilePool.DebugLightAlpha = la;
-        if (CoverSelfTest.Requested()) CoverSelfTest.Run(this);
-
-        var url = ResolveTileUrl();
-        TileSource = url.Length == 0 ? "synthetic city" : url;
-        GD.Print($"[StreamerBridge] tile source: {TileSource}");
+        _pool = new TilePool(_tileRoot, _settings);
+        _pool.Prewarm(_settings.PrewarmTiles);
 
         Streamer = WorldStreamerFacade.Create();
-        if (Streamer.IsAvailable) GD.Print($"[StreamerBridge] library api {Streamer.ApiVersionText}");
-        foreach (var arg in OS.GetCmdlineUserArgs())
-            if (arg.StartsWith("--fake-fade=", System.StringComparison.Ordinal)
-                && float.TryParse(arg.Substring(12), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var ff))
-                _fakeFade = ff;
+        if (Streamer.IsAvailable) GD.Print($"[WorldView] library api {Streamer.ApiVersionText}");
+        _fakeFade = _settings.DebugFakeFade;
         Cover.FadesEnabled = Streamer.HasPollFades || _fakeFade >= 0f;
-        GD.Print($"[StreamerBridge] poll_fades {(Cover.FadesEnabled ? "available: dithered LOD fades on" : "missing in this Rust build: instant sibling swaps")}");
+        GD.Print($"[WorldView] poll_fades {(Cover.FadesEnabled ? "available: dithered LOD fades on" : "missing in this Rust build: instant sibling swaps")}");
         if (Streamer.Node is { } node)
         {
             node.Name = "WorldStreamer";
             AddChild(node);
             Streamer.StatusChanged += OnStatusChanged;
             Streamer.OriginShifted += OnOriginShifted;
-            var cacheDir = ProjectSettings.GlobalizePath("user://tile_cache");
-            DirAccess.MakeDirRecursiveAbsolute(cacheDir);
-            _tileUrl = url;
-            _cacheDir = cacheDir;
-            ConfigureWorld(url, cacheDir);
-            GD.Print($"[StreamerBridge] WorldStreamer created, cache_dir={cacheDir}, debug_tiles={Streamer.HasDebugTiles}");
         }
+    }
+
+    /// <summary>
+    /// Builds what the view needs and configures the world from the properties (origin, tile source, cache folder, profile).
+    /// Runs from <c>_Ready</c> when <see cref="AutoStart"/> is on. Failures are logged and exposed as <see cref="ConfigureError"/>; the
+    /// view then runs without a world.
+    /// </summary>
+    public void Start()
+    {
+        if (_started) return;
+        _started = true;
+        Initialize();
+        if (!Streamer.IsAvailable || Streamer.Node == null) return;
+        if (double.IsNaN(OriginLat) || double.IsNaN(OriginLon))
+        {
+            ConfigureError = "OriginLat / OriginLon are not set";
+            GD.PushError("[WorldView] OriginLat / OriginLon are not set; running without a world.");
+            return;
+        }
+        _tileUrl = TileUrl.Trim();
+        TileSource = _tileUrl.Length == 0 ? "synthetic city" : _tileUrl;
+        GD.Print($"[WorldView] tile source: {TileSource}");
+        _cacheDir = CacheDir.Length == 0 ? "" : CacheDir.Contains("://") ? ProjectSettings.GlobalizePath(CacheDir) : CacheDir;
+        if (_cacheDir.Length > 0) DirAccess.MakeDirRecursiveAbsolute(_cacheDir);
+        ConfigureWorld(_tileUrl, _cacheDir);
+        GD.Print($"[WorldView] WorldStreamer created, cache_dir={_cacheDir}, debug_tiles={Streamer.HasDebugTiles}");
+    }
+
+    /// <summary>The library's default world profile (world_profile() of an unconfigured streamer), for hosts that derive overrides from it.</summary>
+    public Godot.Collections.Dictionary DefaultProfile()
+    {
+        Initialize();
+        return Streamer.IsAvailable ? Streamer.WorldProfile() : new Godot.Collections.Dictionary();
+    }
+
+    /// <summary>
+    /// Time of day for the shaders: writes the global uniforms <c>simworld_hour</c> and <c>simworld_night_factor</c> (light sprites
+    /// fade in with the night factor). The host owns the clock and calls this whenever it changes.
+    /// </summary>
+    public void SetTime(float localHour, float nightFactor)
+    {
+        Hour = localHour;
+        NightFactor = nightFactor;
+        ShaderGlobals.EnsureRegistered();
+        RenderingServer.GlobalShaderParameterSet(ShaderGlobals.Hour, localHour);
+        RenderingServer.GlobalShaderParameterSet(ShaderGlobals.NightFactor, nightFactor);
     }
 
     public override void _ExitTree()
@@ -192,7 +256,7 @@ public partial class StreamerBridge : Node3D
         {
             Streamer.StatusChanged -= OnStatusChanged;
             Streamer.OriginShifted -= OnOriginShifted;
-            if (Streamer.HasHostApi) GD.Print("[StreamerBridge] shutdown (releasing the cache lock)");
+            if (Streamer.HasHostApi) GD.Print("[WorldView] shutdown (releasing the cache lock)");
             Streamer.Shutdown();
         }
     }
@@ -203,7 +267,7 @@ public partial class StreamerBridge : Node3D
         var line = $"status: {st.State} - {st.Message}";
         if (line == _lastLoggedStatus) return;
         _lastLoggedStatus = line;
-        GD.Print($"[StreamerBridge] {line}");
+        GD.Print($"[WorldView] {line}");
     }
 
     // Diagnostic only: the bridge shifts from take_origin_shift() (same-frame ordering); never consume the shift here.
@@ -215,104 +279,24 @@ public partial class StreamerBridge : Node3D
 
     // ---- configuration ---------------------------------------------------
 
-    private const string ProfileArg = "--profile=";
-    private const string SetArg = "--set=";
-    private const string AreaArg = "--area=";
     private static readonly string[] BandEdgeKeys = { "r0_edge_m", "r1_edge_m", "r2_edge_m", "r3_edge_m" };
-    private static readonly double[] BandEdgeDefaults = { 600.0, 2500.0, 7000.0, 25000.0 };
-
-    private static bool TryNumber(string text, out double v) =>
-        double.TryParse(text, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out v);
 
     /// <summary>
-    /// Builds the profile options from the user args: --profile=&lt;path&gt;, --area=&lt;0.05..1&gt; (scales the four band edges, applied
-    /// first) and repeated --set=&lt;dotted.key&gt;=&lt;number&gt; (applied last, wins). Returns the nested overrides (may be empty).
-    /// </summary>
-    private Godot.Collections.Dictionary ParseProfileArgs(out string profilePath)
-    {
-        profilePath = "";
-        double area = 0;
-        var sets = new List<(string Key, Variant Value)>();
-        foreach (var arg in OS.GetCmdlineUserArgs())
-        {
-            if (arg.StartsWith(ProfileArg, System.StringComparison.Ordinal))
-            {
-                var path = arg.Substring(ProfileArg.Length).Trim();
-                if (path.Length == 0) continue;
-                // Rust reads the file itself: hand over an OS path (res:// and user:// resolve through Godot).
-                profilePath = path.Contains("://") ? ProjectSettings.GlobalizePath(path) : System.IO.Path.GetFullPath(path);
-            }
-            else if (arg.StartsWith(AreaArg, System.StringComparison.Ordinal))
-            {
-                if (!TryNumber(arg.Substring(AreaArg.Length), out var a)) { GD.PushWarning($"[StreamerBridge] bad {arg}; expected --area=<0.05..1>"); continue; }
-                area = System.Math.Clamp(a, 0.05, 1.0);
-                if (area != a) GD.Print($"[StreamerBridge] --area={a} clamped to {area}");
-            }
-            else if (arg.StartsWith(SetArg, System.StringComparison.Ordinal))
-            {
-                var kv = arg.Substring(SetArg.Length);
-                int eq = kv.IndexOf('=');
-                if (eq <= 0 || eq == kv.Length - 1) { GD.PushWarning($"[StreamerBridge] bad {arg}; expected --set=<dotted.key>=<number>"); continue; }
-                var key = kv.Substring(0, eq).Trim();
-                var text = kv.Substring(eq + 1).Trim();
-                // Numbers always go as float (like Godot's JSON parser): Rust accepts integral floats for integer keys.
-                if (TryNumber(text, out var num)) sets.Add((key, num));
-                else if (text == "true" || text == "false") sets.Add((key, text == "true"));
-                else sets.Add((key, text));
-            }
-        }
-
-        var overrides = new Godot.Collections.Dictionary();
-        if (area > 0)
-        {
-            Godot.Collections.Dictionary bands = new();
-            var profile = Streamer.WorldProfile();
-            Godot.Collections.Dictionary? pb = profile.TryGetValue("bands", out var bv) && bv.VariantType == Variant.Type.Dictionary ? bv.AsGodotDictionary() : null;
-            for (int i = 0; i < BandEdgeKeys.Length; i++)
-            {
-                double def = pb != null && pb.TryGetValue(BandEdgeKeys[i], out var e) ? e.AsDouble() : BandEdgeDefaults[i];
-                bands[BandEdgeKeys[i]] = def * area;
-            }
-            overrides["bands"] = bands;
-        }
-        foreach (var (key, value) in sets) SetDotted(overrides, key, value);
-        return overrides;
-    }
-
-    private static void SetDotted(Godot.Collections.Dictionary root, string dotted, Variant value)
-    {
-        var parts = dotted.Split('.');
-        var d = root;
-        for (int i = 0; i < parts.Length - 1; i++)
-        {
-            if (!(d.TryGetValue(parts[i], out var sub) && sub.VariantType == Variant.Type.Dictionary))
-            {
-                var nd = new Godot.Collections.Dictionary();
-                d[parts[i]] = nd;
-                d = nd;
-            }
-            else d = sub.AsGodotDictionary();
-        }
-        d[parts[^1]] = value;
-    }
-
-    /// <summary>
-    /// configure_world (api 0.6+, with the profile args) or the legacy configure. On a profile error the world is retried with the
-    /// default profile; any other failure (e.g. cache_dir in use) leaves the spike running without a world.
+    /// configure_world (api 0.6+, with the profile) or the legacy configure. On a profile error the world is retried with the
+    /// default profile; any other failure (e.g. cache_dir in use) leaves the view running without a world.
     /// </summary>
     private void ConfigureWorld(string url, string cacheDir)
     {
-        var overrides = ParseProfileArgs(out var profilePath);
-        _argProfilePath = profilePath;
-        _argOverrides = overrides;
+        var overrides = BaseProfileOverrides;
+        var profilePath = ProfilePath.Length == 0 ? "" : ProfilePath.Contains("://") ? ProjectSettings.GlobalizePath(ProfilePath) : System.IO.Path.GetFullPath(ProfilePath);
         ProfileOverrides = overrides;
         bool haveProfileArgs = profilePath.Length > 0 || overrides.Count > 0;
-        if (profilePath.Length > 0) GD.Print($"[StreamerBridge] profile file: {profilePath}");
-        if (overrides.Count > 0) GD.Print($"[StreamerBridge] profile overrides: {Godot.Json.Stringify(overrides)}");
+        if (profilePath.Length > 0) GD.Print($"[WorldView] profile file: {profilePath}");
+        if (overrides.Count > 0) GD.Print($"[WorldView] profile overrides: {Godot.Json.Stringify(overrides)}");
 
         if (!Streamer.HasConfigureWorld)
         {
-            if (haveProfileArgs) GD.PushWarning($"[StreamerBridge] profile args ignored: library api {Streamer.ApiVersionText} has no configure_world (needs 0.6)");
+            if (haveProfileArgs) GD.PushWarning($"[WorldView] profile ignored: library api {Streamer.ApiVersionText} has no configure_world (needs 0.6)");
             Streamer.Configure(OriginLat, OriginLon, url, cacheDir);
             WorldRunning = true; // legacy configure reports errors only in the Godot log
             AfterConfigure();
@@ -325,11 +309,11 @@ public partial class StreamerBridge : Node3D
         var result = Streamer.ConfigureWorld(options);
         if (!result.Ok && haveProfileArgs && result.Error.StartsWith("profile", System.StringComparison.Ordinal))
         {
-            GD.PushError($"[StreamerBridge] profile rejected by the library: {result.Error}");
-            GD.Print("[StreamerBridge] retrying with the default world profile");
+            GD.PushError($"[WorldView] profile rejected by the library: {result.Error}");
+            GD.Print("[WorldView] retrying with the default world profile");
             ProfileOverrides = new Godot.Collections.Dictionary();
-            _argProfilePath = "";
-            _argOverrides = new Godot.Collections.Dictionary();
+            ProfilePath = "";
+            BaseProfileOverrides = new Godot.Collections.Dictionary();
             options.Remove("profile_path");
             options.Remove("profile_overrides");
             result = Streamer.ConfigureWorld(options);
@@ -337,7 +321,7 @@ public partial class StreamerBridge : Node3D
         if (!result.Ok)
         {
             ConfigureError = result.Error.Length > 0 ? result.Error : "configure_world failed";
-            GD.PushError($"[StreamerBridge] configure_world failed: {ConfigureError}. Running without a world (no tiles will load).");
+            GD.PushError($"[WorldView] configure_world failed: {ConfigureError}. Running without a world (no tiles will load).");
             return;
         }
         WorldRunning = true;
@@ -349,8 +333,8 @@ public partial class StreamerBridge : Node3D
     {
         Status = Streamer.Status();
         if (Attributions.Length == 0) Attributions = Streamer.Attributions();
-        if (Attributions.Length > 0) GD.Print($"[StreamerBridge] attribution: {string.Join(" | ", Attributions)}");
-        else if (Streamer.HasHostApi) GD.Print("[StreamerBridge] attribution: none required (synthetic city)");
+        if (Attributions.Length > 0) GD.Print($"[WorldView] attribution: {string.Join(" | ", Attributions)}");
+        else if (Streamer.HasHostApi) GD.Print("[WorldView] attribution: none required (synthetic city)");
 
         var profile = Streamer.WorldProfile();
         if (profile.TryGetValue("bands", out var bv) && bv.VariantType == Variant.Type.Dictionary)
@@ -365,37 +349,22 @@ public partial class StreamerBridge : Node3D
             }
             if (sb.Length > 0) BandsText = sb.Append(" km").ToString();
         }
-        if (BandsText.Length > 0) GD.Print($"[StreamerBridge] effective {BandsText}");
-    }
-
-    private string ResolveTileUrl()
-    {
-        var url = TileUrl;
-        foreach (var arg in OS.GetCmdlineUserArgs())
-        {
-            if (arg.StartsWith(TileUrlArg, System.StringComparison.Ordinal))
-                url = arg.Substring(TileUrlArg.Length); // may be empty -> synthetic
-        }
-        return url.Trim();
+        if (BandsText.Length > 0) GD.Print($"[WorldView] effective {BandsText}");
     }
 
     public override void _Process(double delta)
     {
-        if (_pool != null && NightFactor != _appliedNight)
+        if (_source != null && Streamer.IsAvailable)
         {
-            _appliedNight = NightFactor;
-            _pool.SetNightFactor(NightFactor);
-        }
-
-        if (Streamer.IsAvailable && Camera != null)
-        {
+            _adapter?.Tick(delta);
             // A queued reconfigure runs first, so this frame's update_camera already carries the new origin and camera position.
             if (_pendingOverrides != null) RunReconfigure();
             // Height above ground = camera y - terrain height under it (0 until the DEM spike).
-            CameraGroundHeight = Streamer.GroundHeightAt(Camera.GlobalPosition.X, Camera.GlobalPosition.Z);
-            Camera.GroundY = (float)CameraGroundHeight;
+            var pos = _source.GlobalPosition;
+            CameraGroundHeight = Streamer.GroundHeightAt(pos.X, pos.Z);
+            _source.SetGroundHeight(CameraGroundHeight);
             if (ExternalCameraUpdate != null) ExternalCameraUpdate(delta);
-            else Streamer.UpdateCamera(Camera.GlobalPosition, Camera.Velocity, Camera.AltitudeAgl);
+            else Streamer.UpdateCamera(_source.GlobalPosition, _source.Velocity, _source.AltitudeAgl);
 
             // Shift first so tiles polled below (already in the new frame) are not shifted twice.
             var shift = Streamer.TakeOriginShift();
@@ -404,17 +373,18 @@ public partial class StreamerBridge : Node3D
             {
                 OriginShiftCount++;
                 TotalShift += shift;
-                Camera.GlobalPosition -= shift;
+                _source.ApplyOriginShift(shift);
                 Cover.Shift(shift);
+                OriginShifted?.Invoke(shift);
             }
-            RenderingServer.GlobalShaderParameterSet("curve_center", Camera.GlobalPosition);
-            RenderingServer.GlobalShaderParameterSet("curve_inv_2r", (float)(Curvature / (2.0 * EarthRadiusM)));
+            RenderingServer.GlobalShaderParameterSet(ShaderGlobals.CurveCenter, _source.GlobalPosition);
+            RenderingServer.GlobalShaderParameterSet(ShaderGlobals.CurveInv2R, (float)(Curvature / (2.0 * EarthRadiusM)));
 
             // Poll one tile at a time so a single heavy tile cannot drag a second one into the same
             // frame: stop as soon as the budget is spent (Rust keeps the rest queued).
             long t0 = (long)Time.GetTicksUsec();
             int n0 = ReadyTotal;
-            for (int n = 0; n < MaxTilesPerFrame; n++)
+            for (int n = 0; n < _settings.MaxTilesPerFrame; n++)
             {
                 var ready = Streamer.PollReady(1);
                 if (ready.Count == 0) break;
@@ -422,20 +392,20 @@ public partial class StreamerBridge : Node3D
                 {
                     if (WorldStreamerFacade.TryParseReady(d, out var tile)) UploadTile(in tile);
                 }
-                if ((long)Time.GetTicksUsec() - t0 >= UploadBudgetUs) break;
+                if ((long)Time.GetTicksUsec() - t0 >= _settings.UploadBudgetUs) break;
             }
             PollFades();
             var unload = Streamer.PollUnload();
             for (int i = 0; i < unload.Length; i++) UnloadTile(unload[i]);
             UploadUsLastFrame = (long)Time.GetTicksUsec() - t0;
-            if (n0 != ReadyTotal) { UploadFrames++; if (UploadUsLastFrame > UploadBudgetUs) UploadFramesOverBudget++; }
+            if (n0 != ReadyTotal) { UploadFrames++; if (UploadUsLastFrame > _settings.UploadBudgetUs) UploadFramesOverBudget++; }
             if (UploadUsLastFrame > _secUploadMax) _secUploadMax = UploadUsLastFrame;
         }
 
         UpdateSpriteScale();
 
         _sinceCheck += delta;
-        if (_sinceCheck >= VerifyInterval)
+        if (_settings.VerifyIntervalS > 0 && _sinceCheck >= _settings.VerifyIntervalS)
         {
             _sinceCheck = 0;
             VerifyCover();
@@ -559,7 +529,7 @@ public partial class StreamerBridge : Node3D
         long t0 = (long)Time.GetTicksUsec();
         if (!TileKey.TryParse(tile.Key, out long packed))
         {
-            GD.PushError($"[StreamerBridge] ready tile with unparsable key '{tile.Key}'");
+            GD.PushError($"[WorldView] ready tile with unparsable key '{tile.Key}'");
             return;
         }
         var pool = _pool!;
@@ -620,14 +590,14 @@ public partial class StreamerBridge : Node3D
         if (!_loggedFirstTile)
         {
             _loggedFirstTile = true;
-            GD.Print($"[StreamerBridge] first tile {tile.Key} ring={tile.Ring} origin={tile.Origin} lights={tile.Lights.Length} tris={nodes.Tris} groundTris={nodes.GroundTris}");
+            GD.Print($"[WorldView] first tile {tile.Key} ring={tile.Ring} origin={tile.Origin} lights={tile.Lights.Length} tris={nodes.Tris} groundTris={nodes.GroundTris}");
             // One-time stats block so the headless smoke test shows the debug_stats contract is live.
-            GD.Print($"[StreamerBridge] debug_stats {Godot.Json.Stringify(Streamer.DebugStats())}");
+            GD.Print($"[WorldView] debug_stats {Godot.Json.Stringify(Streamer.DebugStats())}");
         }
         if (us > 2000 && _slowLogs < 40)
         {
             _slowLogs++;
-            GD.Print($"[StreamerBridge] slow upload {tile.Key} ring={tile.Ring} tris={nodes.Tris} groundTris={nodes.GroundTris} lights={tile.Lights.Length} {us / 1000.0:0.00} ms (mesh {(tm1 - tm0) / 1000.0:0.00}, ground {(tm1b - tm1) / 1000.0:0.00}, lights {(tm2 - tm1b) / 1000.0:0.00}) {Describe(tile.Mesh)}");
+            GD.Print($"[WorldView] slow upload {tile.Key} ring={tile.Ring} tris={nodes.Tris} groundTris={nodes.GroundTris} lights={tile.Lights.Length} {us / 1000.0:0.00} ms (mesh {(tm1 - tm0) / 1000.0:0.00}, ground {(tm1b - tm1) / 1000.0:0.00}, lights {(tm2 - tm1b) / 1000.0:0.00}) {Describe(tile.Mesh)}");
         }
     }
 
@@ -667,7 +637,7 @@ public partial class StreamerBridge : Node3D
         LastReconfigureOk = ok;
         LastReconfigureError = error;
         if (ok) ReconfigureCount++;
-        else GD.PushError($"[StreamerBridge] reconfigure rejected, previous world keeps running: {error}");
+        else GD.PushError($"[WorldView] reconfigure rejected, previous world keeps running: {error}");
         Reconfigured?.Invoke(ok, error);
     }
 
@@ -675,11 +645,11 @@ public partial class StreamerBridge : Node3D
     {
         error = "";
         if (!Streamer.HasConfigureWorld) { error = $"configure_world needs api 0.6 (library {Streamer.ApiVersionText})"; return false; }
-        if (Camera == null) { error = "no camera assigned"; return false; }
+        if (_source == null) { error = "no camera assigned"; return false; }
         long t0 = (long)Time.GetTicksUsec();
 
         // New origin = where the camera is now (f32 geodetic: 0.1-0.4 m). Without a running world there is nothing to convert from.
-        var cam = Camera.GlobalPosition;
+        var cam = _source.GlobalPosition;
         bool recenter = WorldRunning;
         double lat = OriginLat, lon = OriginLon;
         if (recenter)
@@ -690,10 +660,11 @@ public partial class StreamerBridge : Node3D
             lon = geo.Y;
         }
 
-        var merged = (Godot.Collections.Dictionary)_argOverrides.Duplicate(true);
+        var merged = (Godot.Collections.Dictionary)BaseProfileOverrides.Duplicate(true);
         MergeInto(merged, panel);
         var options = WorldStreamerFacade.MakeWorldOptions(lat, lon, _tileUrl, _cacheDir);
-        if (_argProfilePath.Length > 0) options["profile_path"] = _argProfilePath;
+        var profilePath = ProfilePath.Length == 0 ? "" : ProfilePath.Contains("://") ? ProjectSettings.GlobalizePath(ProfilePath) : System.IO.Path.GetFullPath(ProfilePath);
+        if (profilePath.Length > 0) options["profile_path"] = profilePath;
         if (merged.Count > 0) options["profile_overrides"] = merged;
         // Same cache_dir, no Shutdown() in between: the lock is kept across the teleport (contract 11a).
         var result = Streamer.ConfigureWorld(options);
@@ -711,12 +682,12 @@ public partial class StreamerBridge : Node3D
         foreach (var n in Cover.All) _dropScratch.Add(n.Packed);
         for (int i = 0; i < _dropScratch.Count; i++) ReleaseTile(_dropScratch[i]);
         if (_dropScratch.Count > 0)
-            GD.PushWarning($"[StreamerBridge] reconfigure: {_dropScratch.Count} tiles were not in the library's unload batch of {unload.Length}; released anyway");
+            GD.PushWarning($"[WorldView] reconfigure: {_dropScratch.Count} tiles were not in the library's unload batch of {unload.Length}; released anyway");
         _fading.Clear();
         _suspectRoots.Clear();
         _pendingRoots.Clear();
 
-        if (recenter) Camera.GlobalPosition = new Vector3(0f, cam.Y, 0f);
+        if (recenter) _source.ApplyOriginShift(new Vector3(cam.X, 0f, cam.Z));
         LastShift = Vector3.Zero;
         TotalShift = Vector3.Zero;
         ProfileOverrides = merged;
@@ -724,7 +695,7 @@ public partial class StreamerBridge : Node3D
         ConfigureError = "";
         Attributions = result.Attributions;
         AfterConfigure();
-        GD.Print($"[StreamerBridge] reconfigured: origin=({lat:0.000000}, {lon:0.000000}) camera -> (0, {cam.Y:0.0}, 0) from ({cam.X:0.0}, {cam.Z:0.0}), "
+        GD.Print($"[WorldView] reconfigured: origin=({lat:0.000000}, {lon:0.000000}) camera -> (0, {cam.Y:0.0}, 0) from ({cam.X:0.0}, {cam.Z:0.0}), "
             + $"{UnloadedTotal - unloadedBefore} tiles released, {((long)Time.GetTicksUsec() - t0) / 1000.0:0.0} ms; effective {EffectiveProfileText()}");
         return true;
     }
@@ -765,6 +736,8 @@ public partial class StreamerBridge : Node3D
             }
             sb.Append(" m");
         }
+        if (p.TryGetValue("lights", out var lt) && lt.VariantType == Variant.Type.Dictionary && lt.AsGodotDictionary().TryGetValue("min_ring", out var mr))
+            sb.Append(sb.Length > 0 ? ", " : "").Append("lights from R").Append(mr.AsInt64());
         return sb.ToString();
     }
 
@@ -807,11 +780,11 @@ public partial class StreamerBridge : Node3D
         if (errors > 0)
         {
             ConsistencyErrors += errors;
-            GD.PushError($"[StreamerBridge] cover consistency: {errors} problem(s)\n{_report}");
+            GD.PushError($"[WorldView] cover consistency: {errors} problem(s)\n{_report}");
         }
         else if (ConsistencyChecks == 1 || Cover.Loaded > 0 && ConsistencyChecks % 12 == 0)
         {
-            GD.Print($"[StreamerBridge] cover consistent: {Cover.Loaded} tiles loaded, visible R0..R3 = "
+            GD.Print($"[WorldView] cover consistent: {Cover.Loaded} tiles loaded, visible R0..R3 = "
                 + $"{Cover.VisibleByRing[0]}/{Cover.VisibleByRing[1]}/{Cover.VisibleByRing[2]}/{Cover.VisibleByRing[3]}, "
                 + $"hidden by children {Cover.HiddenByChildren}, waiting siblings {Cover.WaitingSiblings}");
         }

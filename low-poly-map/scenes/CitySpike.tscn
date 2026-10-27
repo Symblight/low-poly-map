@@ -1,6 +1,6 @@
-[gd_scene load_steps=15 format=3]
+[gd_scene load_steps=16 format=3]
 
-[ext_resource type="Script" path="res://scripts/StreamerBridge.cs" id="1_bridge"]
+[ext_resource type="Script" path="res://addons/simworld/runtime/WorldView.cs" id="1_bridge"]
 [ext_resource type="Script" path="res://scripts/FreeFlyCamera.cs" id="2_cam"]
 [ext_resource type="Script" path="res://scripts/DebugOverlay.cs" id="3_overlay"]
 [ext_resource type="Script" path="res://scripts/NightRenderController.cs" id="4_night"]
@@ -9,6 +9,7 @@
 [ext_resource type="Shader" path="res://shaders/fallback_ground.gdshader" id="7_fallback"]
 [ext_resource type="Script" path="res://scripts/GeodeticFlightTest.cs" id="8_geotest"]
 [ext_resource type="Script" path="res://scripts/SettingsMenu.cs" id="9_settings"]
+[ext_resource type="Script" path="res://scripts/BenchArgs.cs" id="10_args"]
 
 [sub_resource type="PlaneMesh" id="PlaneMesh_ground"]
 size = Vector2(80000, 80000)
@@ -44,7 +45,7 @@ fog_depth_curve = 1.6
 [node name="WorldEnvironment" type="WorldEnvironment" parent="." node_paths=PackedStringArray("Bridge", "Camera", "Sun")]
 environment = SubResource("Env_1")
 script = ExtResource("4_night")
-Bridge = NodePath("../StreamerBridge")
+Bridge = NodePath("../WorldView")
 Camera = NodePath("../FreeFlyCamera")
 Sun = NodePath("../Sun")
 
@@ -67,19 +68,27 @@ far = 30000.0
 script = ExtResource("2_cam")
 Speed = 40.0
 
-[node name="StreamerBridge" type="Node3D" parent="." node_paths=PackedStringArray("Camera")]
+[node name="WorldView" type="Node3D" parent="." node_paths=PackedStringArray("Camera")]
 script = ExtResource("1_bridge")
+OriginLat = 54.6872
+OriginLon = 25.2797
 TileUrl = "http://127.0.0.1:8787/vilnius.pmtiles"
+CacheDir = "user://tile_cache"
 Camera = NodePath("../FreeFlyCamera")
+AutoStart = false
+
+[node name="BenchArgs" type="Node" parent="." node_paths=PackedStringArray("View")]
+script = ExtResource("10_args")
+View = NodePath("../WorldView")
 
 [node name="GeodeticFlightTest" type="Node" parent="." node_paths=PackedStringArray("Bridge", "Camera")]
 script = ExtResource("8_geotest")
-Bridge = NodePath("../StreamerBridge")
+Bridge = NodePath("../WorldView")
 Camera = NodePath("../FreeFlyCamera")
 
 [node name="TimeOfDay" type="Node" parent="." node_paths=PackedStringArray("Bridge", "Sun")]
 script = ExtResource("5_tod")
-Bridge = NodePath("../StreamerBridge")
+Bridge = NodePath("../WorldView")
 Sun = NodePath("../Sun")
 
 [node name="HUD" type="CanvasLayer" parent="."]
@@ -93,7 +102,7 @@ grow_horizontal = 2
 grow_vertical = 2
 mouse_filter = 2
 script = ExtResource("3_overlay")
-Bridge = NodePath("../../StreamerBridge")
+Bridge = NodePath("../../WorldView")
 Camera = NodePath("../../FreeFlyCamera")
 Render = NodePath("../../WorldEnvironment")
 
@@ -103,5 +112,5 @@ Clock = NodePath("../../TimeOfDay")
 
 [node name="SettingsMenu" type="PanelContainer" parent="HUD" node_paths=PackedStringArray("Bridge", "Camera")]
 script = ExtResource("9_settings")
-Bridge = NodePath("../../StreamerBridge")
+Bridge = NodePath("../../WorldView")
 Camera = NodePath("../../FreeFlyCamera")

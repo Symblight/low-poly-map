@@ -1,4 +1,5 @@
 using Godot;
+using SimWorld;
 
 namespace LowPolyMap;
 
@@ -6,7 +7,7 @@ namespace LowPolyMap;
 /// Simulated clock and sun for the spike (host side, see docs/spec-library-packaging.md "Test bench: daylight menu").
 /// Owns date, local time and clock speed; computes sun elevation / azimuth at the streamer origin (NOAA approximation),
 /// points <see cref="Sun"/> along the sun (or a fixed moon direction at night) and writes
-/// <see cref="StreamerBridge.NightFactor"/> (0 day ... 1 night, smooth between sun elevation +6° and -6°).
+/// <see cref="WorldView.SetTime"/> (night factor 0 day ... 1 night, smooth between sun elevation +6° and -6°).
 /// Interim until Rust exports <c>set_clock</c> / <c>daylight()</c>: then <see cref="Update"/> delegates to them and keeps
 /// the same public surface. <see cref="OverrideNight"/> pins the night factor for look tuning.
 /// Launch args: <c>--time=HH:MM</c>, <c>--date=MM-DD</c>, <c>--time-speed=&lt;x&gt;</c>, <c>--night=&lt;0..1&gt;</c> (= override).
@@ -21,7 +22,7 @@ public partial class TimeOfDay : Node
     private const double MoonElevationDeg = 35.0;
     private const int Year = 2026;
 
-    [Export] public StreamerBridge? Bridge { get; set; }
+    [Export] public WorldView? Bridge { get; set; }
     [Export] public DirectionalLight3D? Sun { get; set; }
 
     /// <summary>Local time in hours, 0..24.</summary>
@@ -48,7 +49,7 @@ public partial class TimeOfDay : Node
 
     public override void _Ready()
     {
-        ProcessPriority = -1; // before StreamerBridge / NightRenderController read the night factor this frame
+        ProcessPriority = -1; // before WorldView / NightRenderController read the night factor this frame
         var inv = System.Globalization.CultureInfo.InvariantCulture;
         foreach (var arg in OS.GetCmdlineUserArgs())
         {
@@ -133,7 +134,7 @@ public partial class TimeOfDay : Node
         SunAzimuthDeg = az;
         SunNightFactor = 1f - Mathf.SmoothStep((float)-TwilightDeg, (float)TwilightDeg, (float)elev);
         NightFactor = OverrideNight ? NightOverride : SunNightFactor;
-        if (Bridge != null) Bridge.NightFactor = NightFactor;
+        Bridge?.SetTime((float)LocalHour, NightFactor);
         if (Sun != null) AimLight(elev, az, NightFactor);
     }
 

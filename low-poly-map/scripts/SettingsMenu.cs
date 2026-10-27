@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Threading.Tasks;
 using Godot;
+using SimWorld;
 
 namespace LowPolyMap;
 
@@ -8,7 +9,7 @@ namespace LowPolyMap;
 /// F3-toggled settings panel (bottom-left; hidden at startup, launch arg <c>--settings-open</c> shows it): flight speed
 /// (live, two-way with <see cref="FreeFlyCamera.Speed"/>), the four band edges (how far each LOD ring of 3D buildings reaches)
 /// and the per-ring minimum building height. Edges and heights are profile values the library reads at configure time, so
-/// they are applied by <see cref="StreamerBridge.ApplyProfileOverrides"/> (world restart at the camera position): with the
+/// they are applied by <see cref="WorldView.ApplyProfileOverrides"/> (world restart at the camera position): with the
 /// auto-apply box on, 0.6 s after the last change, otherwise with the Apply button. A rejected profile keeps the previous world
 /// running, shows the library's error in red and reverts the sliders. Controls never take keyboard focus (only the speed
 /// number box does while it is being typed in), so flying keeps working. The logic (model, apply, revert) does not depend on the
@@ -33,7 +34,7 @@ public partial class SettingsMenu : PanelContainer
     private static readonly string[] EdgeKeys = { "r0_edge_m", "r1_edge_m", "r2_edge_m", "r3_edge_m" };
     private static readonly string[] EdgeNames = { "R0 detailed buildings", "R1 boxes", "R2 merged", "R3 lights only" };
 
-    [Export] public StreamerBridge? Bridge { get; set; }
+    [Export] public WorldView? Bridge { get; set; }
     [Export] public FreeFlyCamera? Camera { get; set; }
 
     /// <summary>Apply range / filter changes 0.6 s after the last change (default on); off = Apply button only.</summary>
@@ -49,11 +50,20 @@ public partial class SettingsMenu : PanelContainer
     public string LastError { get; private set; } = "";
     /// <summary>True when the library's profile has the buildings.rN.min_height_m keys (profile_version 2).</summary>
     public bool HasMinHeight { get; private set; }
+    /// <summary>Finest band that carries light sprites as shown on the panel (0..3; library default 2) and as applied.</summary>
+    public int LightMinRing => _lightRing;
+    public int AppliedLightMinRing => _appliedLightRing;
+    /// <summary>True when the library's profile has lights.min_ring (profile_version 3).</summary>
+    public bool HasLightMinRing { get; private set; }
 
     private readonly double[] _edges = new double[4];
     private readonly double[] _appliedEdges = new double[4];
     private readonly double[] _minH = new double[3];
     private readonly double[] _appliedMinH = new double[3];
+    private const int LightRingDefault = 2;
+    private int _lightRing = LightRingDefault, _appliedLightRing = LightRingDefault;
+    private HSlider _ringSlider = null!;
+    private SpinBox _ringBox = null!;
     private readonly StreamerStats _stats = new();
 
     private readonly HSlider[] _edgeSlider = new HSlider[4];
@@ -122,6 +132,14 @@ public partial class SettingsMenu : PanelContainer
             _minBox[i].ValueChanged += v => { if (!_syncing) SetMinHeight(ring, v); };
         }
 
+        // -- light sprites in the near field (stopgap until the window shader)
+        AddHeading(col, "Light sprites (no windows yet)", ResetLights);
+        (_ringSlider, _ringBox) = AddRow(col, "Lights from band", 0, 3, 1, 0, 3, 1, "");
+        _ringBox.Prefix = "R";
+        _ringBox.TooltipText = "Finest band with light sprites: R3 = only far away, R2 = default, R1 = from 0.6 km, R0 = everywhere";
+        _ringSlider.ValueChanged += v => { if (!_syncing) SetLightMinRing((int)v); };
+        _ringBox.ValueChanged += v => { if (!_syncing) SetLightMinRing((int)v); };
+
         // -- apply
         var applyRow = new HBoxContainer();
         var apply = new Button { Text = "Apply", FocusMode = FocusModeEnum.None, TooltipText = "Restart the world at the camera position with these ranges" };
@@ -148,6 +166,7 @@ public partial class SettingsMenu : PanelContainer
         if (Bridge != null) Bridge.Reconfigured += OnReconfigured;
         if (!HasMinHeight)
             for (int i = 0; i < 3; i++) { _minSlider[i].Editable = false; _minBox[i].Editable = false; }
+        _ringSlider.Editable = _ringBox.Editable = HasLightMinRing;
         RefreshStatus();
 
         if (System.Linq.Enumerable.Contains(OS.GetCmdlineUserArgs(), "--settings-selftest")) RunSelfTest();
@@ -216,6 +235,8 @@ public partial class SettingsMenu : PanelContainer
             _minSlider[i].SetValueNoSignal(_minH[i]);
             _minBox[i].SetValueNoSignal(_minH[i]);
         }
+        _ringSlider.SetValueNoSignal(_lightRing);
+        _ringBox.SetValueNoSignal(_lightRing);
         _syncing = false;
     }
 
@@ -274,6 +295,19 @@ public partial class SettingsMenu : PanelContainer
         MarkDirty();
     }
 
+    /// <summary>Finest band (0..3) that gets light sprites.</summary>
+    public void SetLightMinRing(int ring)
+    {
+        if (!HasLightMinRing) return;
+        ring = System.Math.Clamp(ring, 0, 3);
+        if (_lightRing == ring) return;
+        _lightRing = ring;
+        SyncWidgets();
+        MarkDirty();
+    }
+
+    public void ResetLights() => SetLightMinRing(LightRingDefault);
+
     public void ResetRange()
     {
         for (int i = 0; i < 4; i++) _edges[i] = EdgeDefaults[i];
@@ -303,8 +337,15 @@ public partial class SettingsMenu : PanelContainer
         System.Array.Copy(EdgeDefaults, _edges, 4);
         System.Array.Clear(_minH);
         HasMinHeight = false;
+        HasLightMinRing = false;
+        _lightRing = LightRingDefault;
         if (profile != null)
         {
+            if (profile.TryGetValue("lights", out var lv) && lv.VariantType == Variant.Type.Dictionary && lv.AsGodotDictionary().TryGetValue("min_ring", out var mr))
+            {
+                HasLightMinRing = true;
+                _lightRing = System.Math.Clamp((int)mr.AsInt64(), 0, 3);
+            }
             if (profile.TryGetValue("bands", out var bv) && bv.VariantType == Variant.Type.Dictionary)
             {
                 var b = bv.AsGodotDictionary();
@@ -323,12 +364,13 @@ public partial class SettingsMenu : PanelContainer
         }
         System.Array.Copy(_edges, _appliedEdges, 4);
         System.Array.Copy(_minH, _appliedMinH, 3);
+        _appliedLightRing = _lightRing;
         _effective = Bridge != null && Bridge.Streamer.IsAvailable ? Bridge.EffectiveProfileText() : "no world";
     }
 
     // ---- apply --------------------------------------------------------------------------------
 
-    /// <summary>Queues a world restart with the panel's band edges and minimum heights (see <see cref="StreamerBridge.ApplyProfileOverrides"/>).</summary>
+    /// <summary>Queues a world restart with the panel's band edges and minimum heights (see <see cref="WorldView.ApplyProfileOverrides"/>).</summary>
     public void Apply()
     {
         if (Bridge == null) return;
@@ -341,6 +383,7 @@ public partial class SettingsMenu : PanelContainer
             for (int i = 0; i < 3; i++) b["r" + i] = new Godot.Collections.Dictionary { ["min_height_m"] = _minH[i] };
             o["buildings"] = b;
         }
+        if (HasLightMinRing) o["lights"] = new Godot.Collections.Dictionary { ["min_ring"] = _lightRing };
         _dirty = false;
         ApplyInFlight = true;
         Bridge.ApplyProfileOverrides(o);
@@ -363,6 +406,7 @@ public partial class SettingsMenu : PanelContainer
             // Rejected: the previous world still runs; go back to its values.
             System.Array.Copy(_appliedEdges, _edges, 4);
             System.Array.Copy(_appliedMinH, _minH, 3);
+            _lightRing = _appliedLightRing;
             _dirty = false;
             _error.Text = "REJECTED: " + error;
             _error.Visible = true;
@@ -501,6 +545,7 @@ public partial class SettingsMenu : PanelContainer
         // Config A: smaller ranges plus a height filter. Config B: the library defaults.
         double[] edgesA = { 600, 2500, 3000, 6000 }, minA = { 0, 8, 0 };
         double[] edgesB = EdgeDefaults, minB = { 0, 0, 0 };
+        const int ringA = 1, ringB = LightRingDefault;
         int nodesBase = (int)Performance.GetMonitor(Performance.Monitor.ObjectNodeCount);
         long loadedA = -1, loadedB = -1;
         int rootsWarm = 0;
@@ -522,6 +567,8 @@ public partial class SettingsMenu : PanelContainer
 
             for (int i = 0; i < 4; i++) SetEdge(i, edges[i]);
             for (int i = 0; i < 3; i++) SetMinHeight(i, minH[i]);
+            int lightRing = a ? ringA : ringB;
+            SetLightMinRing(lightRing);
             Apply();
             if (!await WaitFor(() => !ApplyInFlight, 30)) { fails.Add($"apply {k}: bridge never answered"); return; }
             if (!LastApplyOk || bridge.ReconfigureCount != count0 + 1) { fails.Add($"apply {k}: rejected: {LastError}"); return; }
@@ -537,6 +584,8 @@ public partial class SettingsMenu : PanelContainer
 
             // Applied values: what the library reports must be what was sent.
             for (int i = 0; i < 4; i++) if (System.Math.Abs(_appliedEdges[i] - edges[i]) > 0.5) fails.Add($"apply {k}: effective edge R{i} {_appliedEdges[i]}, sent {edges[i]}");
+            if (!HasLightMinRing) fails.Add("profile has no lights.min_ring key");
+            else if (_appliedLightRing != lightRing) fails.Add($"apply {k}: effective lights.min_ring {_appliedLightRing}, sent {lightRing}");
             if (!HasMinHeight) fails.Add("profile has no buildings.rN.min_height_m keys");
             else for (int i = 0; i < 3; i++)
                 if (System.Math.Abs(_appliedMinH[i] - minH[i]) > 0.01) fails.Add($"apply {k}: effective min height R{i} {_appliedMinH[i]}, sent {minH[i]}");

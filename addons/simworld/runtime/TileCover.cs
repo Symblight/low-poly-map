@@ -2,7 +2,7 @@ using System.Collections.Generic;
 using System.Text;
 using Godot;
 
-namespace LowPolyMap;
+namespace SimWorld;
 
 /// <summary>
 /// The set of uploaded tiles plus the sibling-swap visibility rule of the quadtree cover:

@@ -1,4 +1,5 @@
 using Godot;
+using SimWorld;
 
 namespace LowPolyMap;
 
@@ -13,7 +14,7 @@ namespace LowPolyMap;
 /// Launch arg <c>--autopilot-climb=&lt;m/s&gt;</c> climbs straight up at that vertical speed to 8000 m and then
 /// descends back down to 100 m, repeating (combine with <c>--autopilot=</c> for a diagonal climb).
 /// </summary>
-public partial class FreeFlyCamera : Camera3D
+public partial class FreeFlyCamera : Camera3D, IWorldCameraSource
 {
     /// <summary>Streaming budgets (look-ahead, fades, tile queues) were tested up to this speed. Informational only.</summary>
     public const float TestedSpeed = 250f;
@@ -25,7 +26,7 @@ public partial class FreeFlyCamera : Camera3D
 
     [Export(PropertyHint.Range, "0,1000,1,or_greater")] public float Speed { get; set; } = 80f;
     [Export] public float MouseSensitivity { get; set; } = 0.003f;
-    /// <summary>Terrain height under the camera. StreamerBridge updates it every frame from WorldStreamer.ground_height_at (0 until a DEM exists).</summary>
+    /// <summary>Terrain height under the camera. WorldView updates it every frame from WorldStreamer.ground_height_at (0 until a DEM exists).</summary>
     [Export] public float GroundY { get; set; } = 0f;
 
     public const float AutopilotAltitudeM = 300f;
@@ -42,6 +43,10 @@ public partial class FreeFlyCamera : Camera3D
     public float ClimbRate { get; private set; }
     private float _climbDir = 1f;
     public double AltitudeAgl => GlobalPosition.Y - GroundY;
+
+    // IWorldCameraSource: WorldView reads the pose and writes back the terrain height and origin shifts.
+    public void SetGroundHeight(double groundY) => GroundY = (float)groundY;
+    public void ApplyOriginShift(Vector3 shift) => GlobalPosition -= shift;
 
     private float _yaw;
     private float _pitch;

@@ -792,10 +792,10 @@ public partial class WorldView : Node3D
         return r;
     }
 
-    /// <summary>Reads <c>lod_edges_m</c>, <c>tau_eff</c>, <c>lod_quality</c> and the view from debug_stats() into the properties above and, when the live R2 to R1 edge moved by more than 5 %, rewrites the cross-fade ranges.</summary>
+    /// <summary>Reads <c>lod_edges_m</c>, <c>tau_eff</c>, <c>lod_quality</c> and the view from lod_state() (debug_stats() before api 1.11) into the properties above and, when the live R2 to R1 edge moved by more than 5 %, rewrites the cross-fade ranges.</summary>
     public void ReadLod()
     {
-        if (!Streamer.IsAvailable || !Streamer.HasSetView || !Streamer.DebugStats(_lodStats, lodOnly: true) || !_lodStats.HasLodStats) return;
+        if (!Streamer.IsAvailable || !Streamer.HasSetView || !Streamer.LodState(_lodStats) || !_lodStats.HasLodStats) return;
         HasLodStats = true;
         TauEff = _lodStats.TauEff;
         LodQuality = _lodStats.LodQuality;

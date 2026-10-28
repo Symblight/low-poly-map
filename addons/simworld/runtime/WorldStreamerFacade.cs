@@ -268,7 +268,7 @@ public sealed class LatencyStage
 /// registered (Rust library not built / not loaded) the facade stays unavailable
 /// and every method is a harmless no-op returning an empty value.
 /// </summary>
-public sealed class WorldStreamerFacade
+public sealed partial class WorldStreamerFacade
 {
     public const string ClassNameText = "WorldStreamer";
 

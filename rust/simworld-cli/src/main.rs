@@ -11,9 +11,13 @@
 //! * `seed airports | water | validate` (docs/spec-world-seed.md section 3.2, phase S0): the seed
 //!   world's offline content tools (module `seed`).
 //!
+//! * `bake <in.pmtiles> <out.pmtiles>` / `bake --verify <out.pmtiles>` (Tiles and LOD v2, step
+//!   T1b): re-tile today's z13-z16 archive into the two data levels (module `bake`).
+//!
 //! Fly scripts, cache bake, tile dumps and benches arrive in phase P6 of
 //! docs/spec-library-packaging.md.
 
+mod bake;
 mod seed;
 
 use std::process::ExitCode;
@@ -41,11 +45,13 @@ fn usage() -> String {
          usage:\n  simworld-cli validate-profile <file.json>   check a world profile (exit 0 = OK)\n  \
          simworld-cli default-profile                print the default world profile\n\
          {}\n\
-         planned (P6): fly, bake, tile, bench",
+         {}\n\
+         planned (P6): fly, tile, bench",
         env!("CARGO_PKG_VERSION"),
         simworld_core::VERSION,
         simworld_core::PROFILE_VERSION,
-        seed::USAGE
+        seed::USAGE,
+        bake::USAGE
     )
 }
 
@@ -68,6 +74,14 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         ["seed", ..] => match seed::run(&args[1..]) {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => ExitCode::FAILURE,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        },
+        ["bake", ..] => match bake::run(&args[1..]) {
             Ok(true) => ExitCode::SUCCESS,
             Ok(false) => ExitCode::FAILURE,
             Err(e) => {

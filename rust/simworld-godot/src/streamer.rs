@@ -478,6 +478,9 @@ impl WorldStreamer {
         d.set("tau_eff", self.world.tau_eff());
         d.set("lod_quality", self.world.lod_quality());
         d.set("lod_edges_m", &PackedFloat64Array::from(&self.world.lod_edges_m()[..]));
+        // api 1.11 (review M1): the estimated cover per ring and the tile budget it is capped to.
+        d.set("lod_tiles_est", &PackedFloat64Array::from(&self.world.lod_tiles_estimate()[..]));
+        d.set("lod_max_tiles", self.world.profile().lod.max_tiles as i64);
         let v = self.world.lod_view();
         d.set("view_fov_y_deg", v.fov_y_deg);
         d.set("view_height_px", v.viewport_h_px as i64);
@@ -490,6 +493,8 @@ impl WorldStreamer {
             d.set("terrain_loaded", &per_terrain_ring(&st.terrain_loaded, n));
             d.set("terrain_tris", st.terrain_tris.min(i64::MAX as u64) as i64);
             d.set("terrain_detail", self.world.terrain_detail());
+            // api 1.11 (review M1): SSE splits left out by `terrain.max_tiles`.
+            d.set("terrain_budget_skipped", st.terrain_budget_skipped as i64);
         }
         d
     }

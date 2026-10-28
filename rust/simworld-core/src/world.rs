@@ -288,6 +288,8 @@ pub struct WorldStats {
     pub terrain_fetching: [i32; MAX_RINGS],
     pub terrain_meshing: [i32; MAX_RINGS],
     pub terrain_loaded: [i32; MAX_RINGS],
+    /// Terrain splits the tile budget (`terrain.max_tiles`) left out of the last cover plan.
+    pub terrain_budget_skipped: usize,
     pub terrain_tris: u64,
     /// Shared CPU job pool (both layers): jobs queued (ready or waiting on dependencies),
     /// running, and cancelled since the world was configured. Zero when not running.
@@ -776,7 +778,7 @@ impl World {
                 w.set_terrain(self.terrain.clone());
                 w.set_seed(self.seed.clone());
                 let mut s = Scheduler::new(frame, w.is_synthetic(), self.profile.clone()).with_terrain(self.terrain.clone());
-                s.set_lod_view(&self.lod_view, self.lod_quality);
+                s.set_lod_view(&self.lod_view, self.cover_quality());
                 // Tiles v2: chunks are cut from data tiles. An archive's levels are known once it
                 // opened (`WorkerMsg::Levels`: two-level, or the compatibility levels of an archive
                 // without `simworld_levels`); the synthetic city is a two-level source generated
@@ -796,7 +798,7 @@ impl World {
                     self.terrain_detail = self.clamp_detail(self.terrain_detail);
                     let mut t = Scheduler::new_terrain(frame, self.profile.clone(), self.terrain.clone());
                     t.set_detail(self.terrain_detail);
-                    t.set_lod_view(&self.lod_view, self.lod_quality);
+                    t.set_lod_view(&self.lod_view, self.cover_quality());
                     self.terrain_sched = Some(t);
                 }
                 self.worker = Some(w);
@@ -1216,6 +1218,7 @@ impl World {
             terrain_fetching: tst.fetching,
             terrain_meshing: tst.meshing,
             terrain_loaded: tst.loaded,
+            terrain_budget_skipped: self.terrain_sched.as_ref().map_or(0, |t| t.budget_skipped()),
             terrain_tris: tst.tris,
             jobs: self.worker.as_ref().map(|w| w.job_stats()).unwrap_or_default(),
             memory: self.memory.stats(),
@@ -1300,13 +1303,28 @@ impl World {
     }
 
     fn apply_lod_view(&mut self) {
+        let q = self.cover_quality();
         if let Some(s) = &mut self.scheduler {
-            s.set_lod_view(&self.lod_view, self.lod_quality);
+            s.set_lod_view(&self.lod_view, q);
         }
         // Terrain (G2): the SSE view, and the foundation guard from the vector edges.
         if let Some(t) = &mut self.terrain_sched {
-            t.set_lod_view(&self.lod_view, self.lod_quality);
+            t.set_lod_view(&self.lod_view, q);
         }
+    }
+
+    /// The quality scale the vector cover runs with: the host's `set_lod_quality` scale, raised
+    /// when the estimated cover of the view would exceed `lod.max_tiles` (review M1;
+    /// [`crate::rings::BandParams::capped_quality`], at the origin's latitude).
+    pub fn cover_quality(&self) -> f64 {
+        let cos_lat = crate::math::cos(self.origin_lat.to_radians());
+        self.profile.bands().capped_quality(&self.lod_view, self.lod_quality, cos_lat)
+    }
+
+    /// Estimated tile count of the vector cover per ring at the view and quality in effect
+    /// ([`crate::rings::estimate_cover_tiles`]; `debug_stats()["lod_tiles_est"]`).
+    pub fn lod_tiles_estimate(&self) -> [f64; RING_COUNT] {
+        crate::rings::estimate_cover_tiles(&self.lod_edges_m(), crate::math::cos(self.origin_lat.to_radians()))
     }
 
     /// The view in effect (see [`World::set_view`]).
@@ -1321,13 +1339,13 @@ impl World {
 
     /// Effective SSE threshold (px): `lod.tau_px` x the quality scale (adaptive factors: T5).
     pub fn tau_eff(&self) -> f64 {
-        self.profile.lod.tau_px * self.lod_quality
+        self.profile.lod.tau_px * self.cover_quality()
     }
 
     /// The vector layer's band edges in effect (m, R0..R3; R3 = `bands.max_distance_m`): the
     /// SSE refine distances of the current view and tau_eff.
     pub fn lod_edges_m(&self) -> [f64; RING_COUNT] {
-        self.profile.bands().edges_for(&self.lod_view, self.lod_quality)
+        self.profile.bands().edges_for(&self.lod_view, self.cover_quality())
     }
 
     /// The terrain detail scale in effect (see [`World::set_terrain_detail`]).

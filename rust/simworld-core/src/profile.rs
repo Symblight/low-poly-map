@@ -102,6 +102,10 @@ pub struct Bands {
 pub struct Lod {
     /// SSE threshold (px) at quality 1.
     pub tau_px: f64,
+    /// Tile budget of the vector cover (estimated tiles, all rings; 0 = no cap): a view or
+    /// quality whose cover would exceed it runs with a higher tau (`rings::BandParams::
+    /// capped_quality`; review M1). The default view needs about 450.
+    pub max_tiles: u32,
     /// Geometric error per coarse level (m): what is lost when that chunk is not refined.
     pub error_m: LodErrors,
     /// Rear-hemisphere tau multiplier (stored; used from step T4).
@@ -576,6 +580,10 @@ pub struct TerrainProfile {
     /// `edge_m` no longer refine (the last one stays the layer's outer limit; every edge still
     /// sizes the ring's look-ahead clamp).
     pub tau_px: f64,
+    /// Tile budget of the terrain cover (leaves; 0 = no cap; review M1): over it the plan
+    /// skips the splits with the smallest screen error (the foundation guard's never, the 2:1
+    /// balance may add a few on top).
+    pub max_tiles: u32,
     /// Skirt depth of terrain tiles (m; 0 = automatic: `2 * max_error_m * detail + 1`, at most 60).
     pub skirt_m: f64,
     /// Terrain mesh shading (smooth adds a NORMAL array).
@@ -865,7 +873,7 @@ impl Default for Lod {
     /// 7000.0 at the default view (1080 px, 60 deg): the default cover is the old one bit for bit
     /// (2.566 / 10.69 / 29.94 rounded would move the R2 edge by 0.78 m and change the golden cover).
     fn default() -> Self {
-        Self { tau_px: 4.0, error_m: LodErrors::default(), rear_tau_scale: 2.0, adaptive: LodAdaptive::default() }
+        Self { tau_px: 4.0, max_tiles: 1000, error_m: LodErrors::default(), rear_tau_scale: 2.0, adaptive: LodAdaptive::default() }
     }
 }
 
@@ -1271,6 +1279,7 @@ impl Default for TerrainProfile {
             drape_step_m: 25.0,
             detail_scale_max: 2.0,
             tau_px: TERRAIN_TAU_PX_DEFAULT,
+            max_tiles: 1500,
             skirt_m: 0.0,
             shading: TerrainShading::Flat,
             horizon_cull: true,
@@ -1304,6 +1313,7 @@ pub const RANGES: &[(&str, f64, f64)] = &[
     ("bands.look_ahead_clamp", 0.0, 1.0),
     ("bands.default_tile_height_m", 0.0, 400.0),
     ("lod.tau_px", 0.5, 64.0),
+    ("lod.max_tiles", 0.0, 1_000_000.0),
     ("lod.error_m.*", 0.01, 1000.0),
     ("lod.rear_tau_scale", 1.0, 16.0),
     ("lod.adaptive.frame_budget_ms", 1.0, 1000.0),
@@ -1391,6 +1401,7 @@ pub const RANGES: &[(&str, f64, f64)] = &[
     ("terrain.drape_step_m", 5.0, 200.0),
     ("terrain.detail_scale_max", 1.0, 8.0),
     ("terrain.tau_px", 0.5, 64.0),
+    ("terrain.max_tiles", 0.0, 1_000_000.0),
     ("terrain.skirt_m", 0.0, 200.0),
     ("terrain.horizon_margin_m", 0.0, 50_000.0),
     ("terrain.max_fetch", 1.0, 16.0),
@@ -1862,6 +1873,7 @@ impl Profile {
                     look_ahead_s: b.look_ahead_s,
                     look_ahead_clamp: b.look_ahead_clamp,
                     default_tile_height_m: b.default_tile_height_m,
+                    max_tiles: lod.max_tiles as f64,
                 };
                 bp.edge_m = bp.edges_for(&crate::rings::LodView::default(), 1.0);
                 bp

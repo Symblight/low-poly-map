@@ -677,3 +677,35 @@ fn offline_start_on_a_cache_without_the_levels_row_renders_cached_tiles() {
     assert!(b.shutdown());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Review M1: a narrow field of view no longer multiplies the cover. Synthetic city at 300 m,
+/// settled per view: fov 60 is the default cover (uncapped), fov 15 stays within
+/// `lod.max_tiles` (+ the estimate's slack) and keeps R3; with the cap off it is ~4x.
+#[test]
+fn narrow_fov_cover_stays_within_the_tile_budget() {
+    let run = |fov: f64, max_tiles: Option<u32>| {
+        let mut w = world();
+        let mut o = opts("");
+        if let Some(m) = max_tiles {
+            o.profile_overrides = Some(serde_json::json!({ "lod": { "max_tiles": m } }));
+        }
+        assert!(w.configure_world(o).ok);
+        assert!(w.set_view(fov, 1080.0, [0.0, 0.0, -1.0]));
+        settle(&mut w);
+        let s = w.stats();
+        let est: f64 = w.lod_tiles_estimate().iter().sum();
+        (s.loaded, est, w.tau_eff())
+    };
+    let (def, def_est, def_tau) = run(60.0, None);
+    let (narrow, narrow_est, narrow_tau) = run(15.0, None);
+    let sum = |l: [i32; 4]| l.iter().sum::<i32>();
+    eprintln!("fov 60: {def:?} = {} (est {def_est:.0}, tau {def_tau}); fov 15 capped: {narrow:?} = {} (est {narrow_est:.0}, tau {narrow_tau:.2})", sum(def), sum(narrow));
+    assert_eq!(def_tau, 4.0, "the default view is not capped");
+    assert!(narrow_tau > 4.0);
+    assert!(sum(narrow) <= 1100, "capped cover {narrow:?}");
+    assert!(narrow[3] > 0, "R3 kept: {narrow:?}");
+    if std::env::var("SIMWORLD_M1_UNCAPPED").is_ok() {
+        let (raw, raw_est, _) = run(15.0, Some(0));
+        eprintln!("fov 15 uncapped: {raw:?} = {} (est {raw_est:.0})", sum(raw));
+    }
+}

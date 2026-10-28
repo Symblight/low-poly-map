@@ -150,7 +150,7 @@ public partial class DebugOverlay : Control
         _timer -= delta;
         if (_timer > 0) return;
         _timer = RefreshInterval;
-        Refresh();
+        using (Diagnostics.PerfMarker.Scope(Diagnostics.PerfCat.Overlay)) Refresh();
     }
 
     private void Refresh()

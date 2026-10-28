@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Text;
 using Godot;
 
@@ -90,6 +91,22 @@ public sealed class TileCover
 
     public IEnumerable<TileNodes> All => _tiles.Values;
 
+    // ---- churn counters (cumulative since the cover was created; a host diffs them per second) ----
+
+    /// <summary>Tiles whose root went from hidden to shown / from shown to hidden.</summary>
+    public long ShownTotal { get; private set; }
+    public long HiddenTotal { get; private set; }
+    /// <summary>Toggles of a tile that had already toggled less than a second before (a flicker candidate).</summary>
+    public long QuickTogglesTotal { get; private set; }
+    /// <summary>Dithered fades (sibling swaps) started and finished.</summary>
+    public long FadesStartedTotal { get; private set; }
+    public long FadesEndedTotal { get; private set; }
+    /// <summary>Keys delivered again less than 10 s after they were removed.</summary>
+    public long RedeliveriesTotal { get; private set; }
+
+    private const int RedeliveryWindowS = 10, RemovedMemory = 4096;
+    private readonly Dictionary<long, long> _removedAt = new(RemovedMemory);
+
     public bool TryGet(long key, out TileNodes nodes) => _tiles.TryGetValue(key, out nodes!);
 
     /// <summary>-1 = not uploaded, otherwise the <see cref="Vis"/> state.</summary>
@@ -100,8 +117,11 @@ public sealed class TileCover
     {
         t.Vis = Vis.WaitingSiblings; // provisional; Account counts it, Refresh below fixes it up
         t.Applied = false;
+        t.Shown = false;
+        t.LastToggleTicks = 0;
         t.Fading = false;
         t.Fade = 1f;
+        if (_removedAt.Remove(t.Packed, out long removed) && Stopwatch.GetTimestamp() - removed < RedeliveryWindowS * Stopwatch.Frequency) RedeliveriesTotal++;
         t.FadeAwait = FadesEnabled;
         if (FadesEnabled) _awaiting.Add(t);
         _tiles[t.Packed] = t;
@@ -125,6 +145,8 @@ public sealed class TileCover
         t.Fading = false;
         t.FadeAwait = false;
         t.Fade = 1f;
+        if (_removedAt.Count >= RemovedMemory) _removedAt.Clear();
+        _removedAt[key] = Stopwatch.GetTimestamp();
         RefreshAround(key);
         return t;
     }
@@ -139,6 +161,7 @@ public sealed class TileCover
         if (t.Fading == fading) return;
         t.Fading = fading;
         FadingTiles += fading ? 1 : -1;
+        if (fading) FadesStartedTotal++; else FadesEndedTotal++;
         Refresh(t.Packed, force: true);
     }
 
@@ -236,7 +259,18 @@ public sealed class TileCover
         t.Vis = want;
         t.Applied = true;
         Account(t, +1);
-        t.Root.Visible = want == Vis.Visible;
+        bool show = want == Vis.Visible;
+        if (show != t.Shown) CountToggle(t, show);
+        t.Root.Visible = show;
+    }
+
+    private void CountToggle(TileNodes t, bool show)
+    {
+        long now = Stopwatch.GetTimestamp();
+        if (show) ShownTotal++; else HiddenTotal++;
+        if (t.LastToggleTicks != 0 && now - t.LastToggleTicks < Stopwatch.Frequency) QuickTogglesTotal++;
+        t.LastToggleTicks = now;
+        t.Shown = show;
     }
 
     /// <summary>Adds (+1) or removes (-1) a tile's contribution to all counters, using its current state.</summary>

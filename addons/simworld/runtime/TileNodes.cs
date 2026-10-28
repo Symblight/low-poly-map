@@ -53,6 +53,9 @@ public class TileNodes
     // Managed by TileCover.
     public TileCover.Vis Vis;
     public bool Applied;
+    /// <summary>Managed by TileCover: whether the root is currently shown, and when it last changed (Stopwatch ticks; 0 = never), for the churn counters.</summary>
+    public bool Shown;
+    public long LastToggleTicks;
     /// <summary>Uploaded but poll_fades has not run since: the root stays hidden (see <see cref="TileCover"/>).</summary>
     public bool FadeAwait;
     /// <summary>Has a poll_fades entry below 1: visible whenever uploaded, drawn with the dithering material variants.</summary>

@@ -272,6 +272,9 @@ public sealed class WorldStreamerFacade
 {
     public const string ClassNameText = "WorldStreamer";
 
+    /// <summary>Time the main thread spends inside the library calls, summed per frame (see <see cref="StreamerTimings"/>).</summary>
+    public StreamerTimings Timings { get; } = new();
+
     /// <summary>Contract major this facade is written against (docs/contract.md). A different library major is never called into.
     /// 1.0 is the first breaking change (wall UV in window units, profile ids 6 and 7); every 0.x library is refused.</summary>
     public const int ExpectedApiMajor = 1;
@@ -644,6 +647,7 @@ public sealed class WorldStreamerFacade
     public bool UpdateCameraGeodetic(double lat, double lon, double altMslM, Vector3 velNed)
     {
         if (!HasHostApi) return false;
+        using var timing = Timings.Time(StreamerCall.UpdateCamera);
         _node!.Call(MUpdateCameraGeodetic, lat, lon, altMslM, velNed);
         return true;
     }
@@ -783,6 +787,7 @@ public sealed class WorldStreamerFacade
     public void UpdateCamera(Vector3 localPos, Vector3 velocity, double altAglM)
     {
         if (!IsAvailable) return;
+        using var timing = Timings.Time(StreamerCall.UpdateCamera);
         _node!.Call(MUpdateCamera, localPos, velocity, altAglM);
     }
 
@@ -790,6 +795,7 @@ public sealed class WorldStreamerFacade
     public Array<Dictionary> PollReady(int maxTiles)
     {
         if (!IsAvailable) return EmptyReady;
+        using var timing = Timings.Time(StreamerCall.PollReady);
         var v = _node!.Call(MPollReady, maxTiles);
         return v.VariantType == Variant.Type.Array ? v.AsGodotArray<Dictionary>() : EmptyReady;
     }
@@ -946,6 +952,7 @@ public sealed class WorldStreamerFacade
     public Dictionary? PollFades()
     {
         if (!IsAvailable || !HasPollFades) return null;
+        using var timing = Timings.Time(StreamerCall.PollFades);
         var v = _node!.Call(MPollFades);
         return v.VariantType == Variant.Type.Dictionary ? v.AsGodotDictionary() : null;
     }
@@ -954,6 +961,7 @@ public sealed class WorldStreamerFacade
     public string[] PollUnload()
     {
         if (!IsAvailable) return EmptyUnload;
+        using var timing = Timings.Time(StreamerCall.PollUnload);
         var v = _node!.Call(MPollUnload);
         return v.VariantType == Variant.Type.PackedStringArray ? v.AsStringArray() : EmptyUnload;
     }
@@ -962,6 +970,7 @@ public sealed class WorldStreamerFacade
     public Vector3 TakeOriginShift()
     {
         if (!IsAvailable) return Vector3.Zero;
+        using var timing = Timings.Time(StreamerCall.TakeOriginShift);
         var v = _node!.Call(MTakeOriginShift);
         return v.VariantType == Variant.Type.Vector3 ? v.AsVector3() : Vector3.Zero;
     }
@@ -970,6 +979,7 @@ public sealed class WorldStreamerFacade
     public Dictionary DebugStats()
     {
         if (!IsAvailable) return new Dictionary();
+        using var timing = Timings.Time(StreamerCall.DebugStats);
         var v = _node!.Call(MDebugStats);
         return v.VariantType == Variant.Type.Dictionary ? v.AsGodotDictionary() : new Dictionary();
     }
@@ -982,6 +992,7 @@ public sealed class WorldStreamerFacade
     public bool DebugStats(StreamerStats into, bool lodOnly = false)
     {
         if (!IsAvailable) return false;
+        using var timing = Timings.Time(StreamerCall.DebugStats);
         var v = _node!.Call(MDebugStats);
         if (v.VariantType != Variant.Type.Dictionary) return false;
         var d = v.AsGodotDictionary();

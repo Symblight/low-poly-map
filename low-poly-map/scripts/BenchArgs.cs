@@ -8,6 +8,7 @@ namespace LowPolyMap;
 /// Test-bench launch arguments for the <see cref="WorldView"/> (host side: the addon itself reads no command line). Applies
 /// <c>--tile-url=</c>, <c>--no-landmarks</c>, <c>--curvature=</c>, <c>--light-alpha=</c>, <c>--fake-fade=</c>, <c>--profile=</c>, <c>--area=</c>,
 /// <c>--set=</c>, <c>--lod-selftest</c>, <c>--view=</c> / <c>--cam-fov=</c> (screen-space LOD view), <c>--render-scale=</c> (3D render scale), <c>--memory-budget-mb=</c>, <c>--pool-trim-hold=</c>, <c>--world=</c> (seed world), <c>--seed-spot=</c>, <c>--seed-selftest</c>, <c>--cover-selftest</c>, <c>--latency-log=</c> and the terrain arguments (<c>--terrain</c>, <c>--terrain-detail=</c>,
+/// <c>--set=</c>, <c>--benchmark=</c> / <c>--soak=</c> / <c>--perf-selftest</c> (see <c>Diagnostics/</c>), <c>--lod-selftest</c>, <c>--view=</c> / <c>--cam-fov=</c> (screen-space LOD view), <c>--world=</c> (seed world), <c>--seed-spot=</c>, <c>--seed-selftest</c>, <c>--cover-selftest</c>, <c>--latency-log=</c> and the terrain arguments (<c>--terrain</c>, <c>--terrain-detail=</c>,
 /// <c>--terrain-reach-km=</c>, <c>--terrain-amplitude=</c>, <c>--far=</c>, <c>--terrain-selftest</c>, <c>--terrain-collision</c>,
 /// <c>--terrain-collision-selftest</c>), then starts the view (the scene turns
 /// <c>AutoStart</c> off). See low-poly-map/CLAUDE.md.
@@ -85,10 +86,12 @@ public partial class BenchArgs : Node
         if (CoverSelfTest.Requested()) coverSimOk = CoverSelfTest.Run(view);
         view.Start();
         if (CoverSelfTest.Requested()) CoverLiveCheck.Attach(view, View?.GetParent(), coverSimOk);
+        if (View?.GetParent() is { } sceneRoot) Diagnostics.Benchmark.Attach(view, Diagnostics.DiagnosticsNode.Attach(view, sceneRoot), sceneRoot);
         if (_areaQuality > 0) GD.Print($"[BenchArgs] --area: set_lod_quality({_areaQuality:0.###}) -> in effect {view.SetLodQuality(_areaQuality):0.###} (band edges are screen-space since api 1.10; bands.max_distance_m scaled by the area)");
         double latencyEvery = LatencyLog.Requested();
         if (latencyEvery > 0) LatencyLog.Attach(view, latencyEvery);
         if (WindowSelfTest.Requested()) GetTree().Quit(WindowSelfTest.Run(view) ? 0 : 1);
+        if (Diagnostics.PerfSelfTest.Requested()) GetTree().Quit(Diagnostics.PerfSelfTest.Run() ? 0 : 1);
         if (!double.IsNaN(_terrainDetail) && view.TerrainActive)
             GD.Print($"[BenchArgs] --terrain-detail={_terrainDetail}: library scale in effect {view.SetTerrainDetail(_terrainDetail):0.##}");
         if (System.Linq.Enumerable.Contains(OS.GetCmdlineUserArgs(), "--hide-vector")) view.VectorVisible = false;

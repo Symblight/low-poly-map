@@ -153,6 +153,12 @@ public sealed class StreamerStats
     public readonly int[] Fetching = new int[Rings];
     public readonly int[] Meshing = new int[Rings];
     public readonly int[] Loaded = new int[Rings];
+    /// <summary>True while the library reports the screen-space LOD fields below (api 1.10; false on an older library, where they stay 0).</summary>
+    public bool HasLodStats;
+    /// <summary>The effective screen-space error threshold in pixels (debug_stats "tau_eff", api 1.10).</summary>
+    public double TauEff;
+    /// <summary>Data tiles held / decoded so far (detail z14 + overview z11, api 1.10) and requests the scheduler did not send, because the PMTiles directory has no entry / because the camera moves too fast.</summary>
+    public long DataTilesLoaded, DataTilesDecoded, RequestsSkippedEmpty, RequestsSkippedMoving;
     public double CacheMb;
     public double OriginLat;
     public double OriginLon;
@@ -214,6 +220,8 @@ public sealed class WorldStreamerFacade
     public const int TerrainCenterMinApiMinor = 6;
     /// <summary>First contract minor with the world seed phase S1: <c>seed_world</c> option, <c>airports()</c>, <c>seed_world_info()</c>, airport light keys (api 1.7).</summary>
     public const int SeedWorldMinApiMinor = 7;
+    /// <summary>First contract minor with <c>set_view(fov_y_deg, viewport_h_px, forward)</c> (screen-space LOD) and the <c>tau_eff</c> / data tile debug_stats fields (api 1.10; 1.8 and 1.9 are reserved).</summary>
+    public const int SetViewMinApiMinor = 10;
 
     private static readonly StringName ClassNameSn = new(ClassNameText);
     private static readonly StringName MConfigure = new("configure");
@@ -226,6 +234,7 @@ public sealed class WorldStreamerFacade
     private static readonly StringName MDebugTiles = new("debug_tiles");
     private static readonly StringName MGroundHeightAt = new("ground_height_at");
     private static readonly StringName MSetTerrainDetail = new("set_terrain_detail");
+    private static readonly StringName MSetView = new("set_view");
 
     private static readonly StringName MConfigureWorld = new("configure_world");
     private static readonly StringName MWorldProfile = new("world_profile");
@@ -291,6 +300,11 @@ public sealed class WorldStreamerFacade
     private static readonly StringName KOriginLon = new("origin_lon");
     private static readonly StringName KVersion = new("version");
     private static readonly StringName KLatency = new("latency");
+    private static readonly StringName KTauEff = new("tau_eff");
+    private static readonly StringName KDataTilesLoaded = new("data_tiles_loaded");
+    private static readonly StringName KDataTilesDecoded = new("data_tiles_decoded");
+    private static readonly StringName KRequestsSkippedEmpty = new("requests_skipped_empty");
+    private static readonly StringName KRequestsSkippedMoving = new("requests_skipped_moving");
     private static readonly StringName MApiVersion = new("api_version");
     private static readonly StringName KApiMajor = new("api_major");
     private static readonly StringName KApiMinor = new("api_minor");
@@ -453,6 +467,8 @@ public sealed class WorldStreamerFacade
         {
             GD.Print($"[WorldStreamerFacade] Rust library api {ApiMajor}.{ApiMinor} is newer than the facade's {ExpectedApiMajor}.{LatestKnownMinor}; additive changes only, fine.");
         }
+        if (!HasSetView)
+            GD.Print($"[WorldStreamerFacade] set_view unavailable (library api {ApiMajor}.{ApiMinor} < {ExpectedApiMajor}.{SetViewMinApiMinor}): LOD follows fixed bands");
     }
 
     // ---- contract -------------------------------------------------------
@@ -786,6 +802,31 @@ public sealed class WorldStreamerFacade
         return v.VariantType == Variant.Type.Float ? v.AsDouble() : double.NaN;
     }
 
+    /// <summary>True when the library has <c>set_view</c> (api 1.10+): the LOD then follows screen-space error instead of fixed distance bands.</summary>
+    public bool HasSetView => IsAvailable && KnownCompatible && ApiMinor >= SetViewMinApiMinor;
+
+    /// <summary>set_view calls made (always 0 on a library without it) and the values of the last one.</summary>
+    public int SetViewCalls { get; private set; }
+    public double LastViewFovYDeg { get; private set; }
+    public int LastViewHeightPx { get; private set; }
+    public Vector3 LastViewForward { get; private set; }
+
+    /// <summary>
+    /// set_view(fov_y_deg, viewport_h_px, forward) (api 1.10): vertical field of view in degrees, viewport height in physical pixels and the
+    /// camera look direction (normalized, local Godot coordinates). Call before <see cref="UpdateCamera"/>, when one of them changed.
+    /// Returns false when the library lacks the method (nothing was sent).
+    /// </summary>
+    public bool SetView(double fovYDeg, int hPx, Vector3 forward)
+    {
+        if (!HasSetView) return false;
+        _node!.Call(MSetView, fovYDeg, hPx, forward);
+        SetViewCalls++;
+        LastViewFovYDeg = fovYDeg;
+        LastViewHeightPx = hPx;
+        LastViewForward = forward;
+        return true;
+    }
+
     private bool? _hasPollFades;
 
     /// <summary>True if the loaded Rust build exports poll_fades() (checked once; false = every tile is fade 1, no transitions).</summary>
@@ -844,6 +885,12 @@ public sealed class WorldStreamerFacade
         if (d.TryGetValue(KOriginLon, out var lo)) into.OriginLon = lo.AsDouble();
         if (d.TryGetValue(KVersion, out var ver)) into.Version = ver.AsString();
         ReadLatency(d, into.Latency);
+        into.HasLodStats = d.ContainsKey(KTauEff);
+        into.TauEff = d.TryGetValue(KTauEff, out var tau) ? tau.AsDouble() : 0.0;
+        into.DataTilesLoaded = d.TryGetValue(KDataTilesLoaded, out var dl) ? dl.AsInt64() : 0;
+        into.DataTilesDecoded = d.TryGetValue(KDataTilesDecoded, out var dd) ? dd.AsInt64() : 0;
+        into.RequestsSkippedEmpty = d.TryGetValue(KRequestsSkippedEmpty, out var se) ? se.AsInt64() : 0;
+        into.RequestsSkippedMoving = d.TryGetValue(KRequestsSkippedMoving, out var sm) ? sm.AsInt64() : 0;
         into.HasTerrain = d.ContainsKey(KTerrainLoaded);
         System.Array.Clear(into.TerrainQueued); System.Array.Clear(into.TerrainFetching);
         System.Array.Clear(into.TerrainMeshing); System.Array.Clear(into.TerrainLoaded);

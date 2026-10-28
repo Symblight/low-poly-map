@@ -21,6 +21,14 @@ public partial class WorldRenderSettings : Resource
     /// <summary>Seconds between cover consistency checks (0 = never).</summary>
     [Export] public double VerifyIntervalS { get; set; } = 5.0;
 
+    // ---- level of detail ----------------------------------------------------------------------
+    /// <summary>
+    /// Multiplies the viewport height sent to <c>set_view</c> (api 1.10, screen-space LOD): below 1 the library works with fewer pixels, so tiles refine later
+    /// (a cheap load knob for a phone that renders at a lower resolution); 1 = the physical height of the rendered viewport.
+    /// </summary>
+    [ExportGroup("Level of detail")]
+    [Export(PropertyHint.Range, "0.1,4,0.05")] public float LodPixelScale { get; set; } = 1f;
+
     // ---- debug --------------------------------------------------------------------------------
     [ExportGroup("Debug")]
     /// <summary>Force every light sprite's weight (ignores Rust's alpha). Negative = off.</summary>

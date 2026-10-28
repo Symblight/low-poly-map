@@ -7,7 +7,7 @@ namespace LowPolyMap;
 /// <summary>
 /// Test-bench launch arguments for the <see cref="WorldView"/> (host side: the addon itself reads no command line). Applies
 /// <c>--tile-url=</c>, <c>--curvature=</c>, <c>--light-alpha=</c>, <c>--fake-fade=</c>, <c>--profile=</c>, <c>--area=</c>,
-/// <c>--set=</c>, <c>--world=</c> (seed world), <c>--seed-spot=</c>, <c>--seed-selftest</c>, <c>--cover-selftest</c>, <c>--latency-log=</c> and the terrain arguments (<c>--terrain</c>, <c>--terrain-detail=</c>,
+/// <c>--set=</c>, <c>--view=</c> / <c>--cam-fov=</c> (screen-space LOD view), <c>--world=</c> (seed world), <c>--seed-spot=</c>, <c>--seed-selftest</c>, <c>--cover-selftest</c>, <c>--latency-log=</c> and the terrain arguments (<c>--terrain</c>, <c>--terrain-detail=</c>,
 /// <c>--terrain-reach-km=</c>, <c>--terrain-amplitude=</c>, <c>--far=</c>, <c>--terrain-selftest</c>, <c>--terrain-collision</c>,
 /// <c>--terrain-collision-selftest</c>), then starts the view (the scene turns
 /// <c>AutoStart</c> off). See low-poly-map/CLAUDE.md.
@@ -45,6 +45,12 @@ public partial class BenchArgs : Node
             else if (arg.StartsWith("--curvature=", System.StringComparison.Ordinal) && TryNumber(arg.Substring(12), out var cv)) view.Curvature = Mathf.Max((float)cv, 0f);
             else if (arg.StartsWith("--light-alpha=", System.StringComparison.Ordinal) && TryNumber(arg.Substring(14), out var la)) settings.DebugLightAlpha = (float)la;
             else if (arg.StartsWith("--fake-fade=", System.StringComparison.Ordinal) && TryNumber(arg.Substring(12), out var ff)) settings.DebugFakeFade = (float)ff;
+            else if (arg.StartsWith("--cam-fov=", System.StringComparison.Ordinal) && TryNumber(arg.Substring(10), out var cf) && cf > 1 && cf < 170 && view.Camera != null)
+            {
+                if (view.Camera is FreeFlyCamera ffc) ffc.BaseFov = (float)cf; // the camera re-applies its base fov every frame (hold Z = zoom)
+                view.Camera.Fov = (float)cf;
+            }
+            else if (arg.StartsWith("--view=", System.StringComparison.Ordinal)) ParseViewOverride(view, arg.Substring(7));
             else if (arg.StartsWith(ProfileArg, System.StringComparison.Ordinal)) view.ProfilePath = arg.Substring(ProfileArg.Length).Trim();
             // A second instance (e.g. a screenshot run while the bench is open) needs its own cache folder: the cache is locked per folder.
             else if (arg.StartsWith("--cache-dir=", System.StringComparison.Ordinal)) view.CacheDir = arg.Substring(12).Trim();
@@ -81,6 +87,26 @@ public partial class BenchArgs : Node
         if (TerrainCollisionSelfTest.Requested()) TerrainCollisionSelfTest.Attach(view, View?.GetParent());
         _fallback = GetParent()?.GetNodeOrNull<MeshInstance3D>("Ground");
         if (_fallback != null && System.Linq.Enumerable.Contains(OS.GetCmdlineUserArgs(), "--hide-fallback")) { _fallback.Visible = false; _fallback = null; }
+    }
+
+    /// <summary><c>--view=&lt;fovdeg&gt;,&lt;H&gt;</c>: overrides what the view sends with set_view (api 1.10); either part may be empty (<c>--view=,540</c>, <c>--view=30</c>).</summary>
+    private static void ParseViewOverride(WorldView view, string text)
+    {
+        var parts = text.Split(',');
+        float? fov = null;
+        int? h = null;
+        if (parts.Length > 0 && parts[0].Trim().Length > 0)
+        {
+            if (TryNumber(parts[0].Trim(), out var f) && f > 0.1 && f < 170) fov = (float)f;
+            else GD.PushWarning($"[BenchArgs] bad --view={text}; expected --view=<fov_y deg>,<H px>");
+        }
+        if (parts.Length > 1 && parts[1].Trim().Length > 0)
+        {
+            if (TryNumber(parts[1].Trim(), out var hv) && hv >= 1 && hv <= 16384) h = (int)System.Math.Round(hv);
+            else GD.PushWarning($"[BenchArgs] bad --view={text}; expected --view=<fov_y deg>,<H px>");
+        }
+        view.SetViewOverride(fov, h);
+        GD.Print($"[BenchArgs] --view: fov_y {(fov.HasValue ? fov.Value.ToString("0.##") : "camera")} deg, H {(h.HasValue ? h.Value.ToString() : "viewport")} px");
     }
 
     private bool _wasTerrain;

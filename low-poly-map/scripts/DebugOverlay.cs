@@ -234,6 +234,7 @@ public partial class DebugOverlay : Control
                 sb.Append("terrain tris ").Append(_stats.TerrainTris.ToString("N0")).Append("  detail x").Append(_stats.TerrainDetail.ToString("0.##")).Append('\n');
             }
             sb.Append("cache ").Append(_stats.CacheMb.ToString("0.0")).Append(" MB\n");
+            AppendViewLine(sb, streamer);
         }
 
         if (Bridge != null)
@@ -319,6 +320,18 @@ public partial class DebugOverlay : Control
         sb.Append("[F1] overlay  [F2] daylight  [F3] settings  [F] autopilot  [PgUp/PgDn] alt x2 / x0.5  [H] hidden tiles: ").Append(_showHidden ? "outlined" : "off").Append("  [M] map zoom (").Append(ZoomSpansM[_zoom] / 1000f).Append(" km)");
         if (Bridge != null && Bridge.Attributions.Length > 0)
             sb.Append('\n').Append(string.Join(" | ", Bridge.Attributions));
+    }
+
+    /// <summary>Screen-space LOD (api 1.10): the view the host sends with set_view (fov_y, viewport height), call count, the library's effective threshold and the data tile / skipped request counters.</summary>
+    private void AppendViewLine(StringBuilder sb, WorldStreamerFacade streamer)
+    {
+        if (Bridge == null) return;
+        sb.Append("view: fov_y ").Append(Bridge.ViewFovYDeg.ToString("0.0")).Append(" deg  H ").Append(Bridge.ViewHeightPx).Append(" px  set_view ");
+        if (!streamer.HasSetView) { sb.Append("unavailable (api ").Append(streamer.ApiVersionText).Append("): fixed bands\n"); return; }
+        sb.Append(streamer.SetViewCalls).Append(" calls");
+        if (!_stats.HasLodStats) { sb.Append("  (no LOD stats in debug_stats)\n"); return; }
+        sb.Append("  tau_eff ").Append(_stats.TauEff.ToString("0.0")).Append(" px  data tiles ").Append(_stats.DataTilesLoaded).Append(" held / ").Append(_stats.DataTilesDecoded)
+          .Append(" decoded  requests skipped: empty ").Append(_stats.RequestsSkippedEmpty).Append(", moving ").Append(_stats.RequestsSkippedMoving).Append('\n');
     }
 
     /// <summary>World seed (api 1.7): generator and phases, the data source of the finest vector tile under the camera, airports near, load warnings.</summary>

@@ -13,6 +13,7 @@ namespace LowPolyMap;
 /// flying north at 300 m AGL. PgUp / PgDn double / halve the altitude (instant jump, for LOD tests).
 /// Launch arg <c>--autopilot-climb=&lt;m/s&gt;</c> climbs straight up at that vertical speed to 8000 m and then
 /// descends back down to 100 m, repeating (combine with <c>--autopilot=</c> for a diagonal climb).
+/// Holding Z zooms 4x (the field of view divides by <see cref="ZoomFactor"/>), for the screen-space LOD tests.
 /// </summary>
 public partial class FreeFlyCamera : Camera3D, IWorldCameraSource
 {
@@ -28,6 +29,10 @@ public partial class FreeFlyCamera : Camera3D, IWorldCameraSource
     [Export] public float MouseSensitivity { get; set; } = 0.003f;
     /// <summary>Terrain height under the camera. WorldView updates it every frame from WorldStreamer.ground_height_at (0 unless the terrain layer is active).</summary>
     [Export] public float GroundY { get; set; } = 0f;
+
+    /// <summary>Field of view (degrees, vertical) without zoom; 0 = take the scene's value in <c>_Ready</c>. <c>--cam-fov=</c> sets it.</summary>
+    public float BaseFov { get; set; }
+    public const float ZoomFactor = 4f;
 
     public const float AutopilotAltitudeM = 300f;
     private const string AutopilotArg = "--autopilot=";
@@ -63,6 +68,7 @@ public partial class FreeFlyCamera : Camera3D, IWorldCameraSource
 
     public override void _Ready()
     {
+        if (BaseFov <= 0f) BaseFov = Fov;
         var e = Rotation;
         _yaw = e.Y;
         _pitch = e.X;
@@ -160,6 +166,8 @@ public partial class FreeFlyCamera : Camera3D, IWorldCameraSource
     public override void _Process(double delta)
     {
         Move(delta);
+        float fov = Input.IsPhysicalKeyPressed(Key.Z) ? BaseFov / ZoomFactor : BaseFov;
+        if (BaseFov > 0f && !Mathf.IsEqualApprox(Fov, fov)) Fov = fov;
         if (ClampToGround)
         {
             var p = GlobalPosition;

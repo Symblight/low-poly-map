@@ -106,10 +106,11 @@ public partial class Benchmark : Node
         return bench;
     }
 
-    /// <summary><c>fullscreen</c>, <c>WxH</c>, or empty for <see cref="WindowSize"/>; the result's machine block records the size used.</summary>
+    /// <summary><c>fullscreen</c> (also the default: a macOS window is paced by the compositor, so windowed frame times vary from run to run) or
+    /// <c>WxH</c> for a window of that size (<see cref="WindowSize"/> if unparsable); the result's machine block records the size used.</summary>
     static void ApplyWindow(string spec)
     {
-        if (spec == "fullscreen")
+        if (spec == "" || spec == "fullscreen")
         {
             DisplayServer.WindowSetMode(DisplayServer.WindowMode.Fullscreen);
             return;

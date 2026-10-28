@@ -7,7 +7,7 @@ namespace LowPolyMap.Diagnostics;
 /// <summary>
 /// The benchmark launch arguments (after <c>--</c>): <c>--benchmark=&lt;name&gt;</c>, <c>--frames=N</c> or <c>--seconds=S</c> (default 60),
 /// <c>--soak=S</c> (run S seconds and report the first and the last minute), <c>--out=&lt;path.json&gt;</c>, <c>--quit</c>,
-/// <c>--update-baseline</c>, <c>--vsync</c>, <c>--bench-window=WxH|fullscreen</c> (default 1600x900). A bare <c>--soak=S</c> runs <c>low-250</c>.
+/// <c>--update-baseline</c>, <c>--vsync</c>, <c>--bench-window=fullscreen|WxH</c> (default fullscreen). A bare <c>--soak=S</c> runs <c>low-250</c>.
 /// </summary>
 public sealed record BenchmarkArgs(string Name, int Frames, double Seconds, double SoakSeconds, string Out, bool Quit, bool Vsync, bool UpdateBaseline, string Window)
 {

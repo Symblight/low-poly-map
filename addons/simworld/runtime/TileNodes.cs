@@ -63,4 +63,6 @@ public class TileNodes
     public int FadeStamp;
     /// <summary>True while the dithering material variants are assigned (instance uniforms are valid).</summary>
     public bool FadeMaterialActive;
+    /// <summary>The dither material clones this node set rents while <see cref="FadeMaterialActive"/> (see <see cref="FadeMaterials"/>): building, ground, five sprite sets; a terrain tile uses [0].</summary>
+    public readonly ShaderMaterial?[] FadeMats = new ShaderMaterial?[7];
 }

@@ -1067,7 +1067,13 @@ public partial class WorldView : Node3D
                 float f = Mathf.Clamp((float)kv.Value.AsDouble(), 0f, 1f);
                 if (f >= 1f)
                 {
-                    EndTileFade(nodes);
+                    // Fully shown: no dithering. But an entry still makes the tile visible whatever its siblings and children are (contract 5, "Visibility
+                    // rule"): the outgoing parent of a refine swap reads exactly 1.0 until the camera has moved by half a fade step, while its 4 children are
+                    // uploaded and read 0.0. Ending the transition here hid the parent behind its children (rule: "all 4 children present") for those frames,
+                    // up to fades.cap_s = 0.75 s: a whole tile blank, the terrain showing through. The entry is dropped on the first call without it.
+                    if (nodes.FadeMaterialActive) { if (nodes is TerrainNodes tn1) _terrainPool!.EndFade(tn1); else pool.EndFade(nodes); }
+                    if (!nodes.Fading) _fading.Add(nodes);
+                    cover.SetFade(nodes, true, 1f);
                     continue;
                 }
                 if (!nodes.Fading) _fading.Add(nodes);
@@ -1193,6 +1199,7 @@ public partial class WorldView : Node3D
             Cover.Add(nodes); // sibling-swap re-evaluation of the affected keys
         }
 
+        VectorTileUploaded?.Invoke(nodes, replace);
         _secReady++;
         ReadyTotal++;
         if (Cover.Loaded + LandmarkCover.Loaded > PeakActiveTiles) PeakActiveTiles = Cover.Loaded + LandmarkCover.Loaded;
@@ -1343,7 +1350,7 @@ public partial class WorldView : Node3D
         if (layer == TileLayer.Landmarks) { LandmarkKeysSeen++; ReleaseLandmarkTile(packed); return; }
         bool terrain = layer == TileLayer.Terrain;
         if (terrain) { TerrainKeysSeen++; ChurnUnload("terrain", key, TerrainCover.TryGet(packed, out var tn) ? tn : null, "poll_unload"); ReleaseTerrainTile(packed); }
-        else { ChurnUnload("world", key, Cover.TryGet(packed, out var vn) ? vn : null, "poll_unload"); ReleaseTile(packed); }
+        else { ChurnUnload("world", key, Cover.TryGet(packed, out var vn) ? vn : null, "poll_unload"); VectorTileUnloading?.Invoke(key, Cover.TryGet(packed, out var un) ? un : null); ReleaseTile(packed); }
     }
 
     /// <summary>After the unloads: creates / frees the collision patch with the flag, re-centres it on the camera.</summary>

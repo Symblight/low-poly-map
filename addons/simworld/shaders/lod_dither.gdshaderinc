@@ -8,8 +8,10 @@
 // one z level apart so their parities differ. Parity 0 keeps the pixel when p < fade, parity 1 when p >= 1 - fade, so with
 // fade_in + fade_out = 1 the two sides cover complementary pixels.
 #ifdef LOD_DITHER
-instance uniform float fade : hint_range(0.0, 1.0) = 1.0;
-instance uniform float fade_parity : hint_range(0.0, 1.0) = 0.0;
+// Per-material uniforms (one dither material per fading tile, see FadeMaterials): NOT instance uniforms, which reserve 16 entries of a
+// 4096-node buffer for every node that ever uses them and read as 0 (an invisible tile) once it is full.
+uniform float fade : hint_range(0.0, 1.0) = 1.0;
+uniform float fade_parity : hint_range(0.0, 1.0) = 0.0;
 
 const float LOD_BAYER4[16] = float[16](
 	0.0, 8.0, 2.0, 10.0,

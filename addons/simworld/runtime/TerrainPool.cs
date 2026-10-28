@@ -27,7 +27,7 @@ public sealed class TerrainPool
     private readonly PoolTrimmer _trimmer;
     private readonly System.Action<TerrainNodes> _destroy;
     private readonly ShaderMaterial _material;
-    private readonly ShaderMaterial _fadeMaterial;
+    private readonly FadeMaterials _fades;
 
     private static readonly StringName PFade = new("fade");
     private static readonly StringName PFadeParity = new("fade_parity");
@@ -44,7 +44,8 @@ public sealed class TerrainPool
     public int Trimmed => _trimmer.Trimmed;
     public int FreeCount => _free.Count;
     public ShaderMaterial Material => _material;
-    public ShaderMaterial FadeMaterial => _fadeMaterial;
+    /// <summary>The configured dither variant (template; fading tiles use clones, see <see cref="FadeMaterials"/>).</summary>
+    public ShaderMaterial FadeMaterial => _fades.Template;
 
     public TerrainPool(Node3D container, WorldRenderSettings? settings = null, string? addonRoot = null)
     {
@@ -54,16 +55,17 @@ public sealed class TerrainPool
         _destroy = Destroy;
         string shaders = (addonRoot ?? AddonPaths.Root) + "/shaders";
         _material = new ShaderMaterial { Shader = GD.Load<Shader>(shaders + "/terrain.gdshader") };
-        _fadeMaterial = new ShaderMaterial { Shader = TilePool.LoadDitherVariant(shaders + "/terrain.gdshader") };
+        var fadeMaterial = new ShaderMaterial { Shader = TilePool.LoadDitherVariant(shaders + "/terrain.gdshader") };
         settings.ApplyToTerrain(_material);
-        settings.ApplyToTerrain(_fadeMaterial);
+        settings.ApplyToTerrain(fadeMaterial);
+        _fades = new FadeMaterials(fadeMaterial);
     }
 
     /// <summary>Flat shading from screen derivatives (profile terrain.shading = "flat", default) or the mesh NORMAL ("smooth").</summary>
     public void SetSmoothShading(bool smooth)
     {
         _material.SetShaderParameter("use_vertex_normal", smooth);
-        _fadeMaterial.SetShaderParameter("use_vertex_normal", smooth);
+        _fades.Set("use_vertex_normal", smooth);
     }
 
     public TerrainNodes Acquire(string key, long packed, int ring)
@@ -127,22 +129,26 @@ public sealed class TerrainPool
         return new TerrainNodes { Root = root, MeshInstance = mi, Mesh = am };
     }
 
-    /// <summary>Switches to the dithering material and sets the per-instance fade / fade_parity (parity = z &amp; 1 of the key).</summary>
+    /// <summary>Switches to a clone of the dithering material (rented per fading tile) and sets its fade / fade_parity (parity = z &amp; 1 of the key).</summary>
     public void SetFade(TerrainNodes t, float fade)
     {
         if (!t.FadeMaterialActive)
         {
-            t.MeshInstance.MaterialOverride = _fadeMaterial;
+            var m = _fades.Rent();
+            m.SetShaderParameter(PFadeParity, (float)(TileKey.Z(t.Packed) & 1));
+            t.FadeMats[0] = m;
+            t.MeshInstance.MaterialOverride = m;
             t.FadeMaterialActive = true;
-            t.MeshInstance.SetInstanceShaderParameter(PFadeParity, (float)(TileKey.Z(t.Packed) & 1));
         }
-        t.MeshInstance.SetInstanceShaderParameter(PFade, fade);
+        t.FadeMats[0]!.SetShaderParameter(PFade, fade);
     }
 
     public void EndFade(TerrainNodes t)
     {
         if (!t.FadeMaterialActive) return;
         t.MeshInstance.MaterialOverride = _material;
+        _fades.Return(t.FadeMats[0]!);
+        t.FadeMats[0] = null;
         t.FadeMaterialActive = false;
     }
 

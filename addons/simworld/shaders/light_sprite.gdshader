@@ -90,7 +90,11 @@ uniform float intensity = 2.4;
 global uniform float simworld_night_factor;
 // Per-tile LOD transition weight from poll_fades (1 = steady). Sprites never dither: both sides of a swap are additive,
 // so scaling brightness by the complementary fades keeps the sum constant instead of flashing double-bright.
-instance uniform float fade_mul : hint_range(0.0, 1.0) = 1.0;
+#ifdef LOD_DITHER
+uniform float fade_mul : hint_range(0.0, 1.0) = 1.0; // per fading tile (one material each, see FadeMaterials); never an instance uniform
+#else
+const float fade_mul = 1.0;
+#endif
 
 varying vec4 v_col;
 varying float v_fade;

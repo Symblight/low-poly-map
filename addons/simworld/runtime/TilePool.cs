@@ -33,8 +33,9 @@ public sealed class TilePool
     private readonly ShaderMaterial _groundMaterial;
     // Dithering variants of the two opaque materials: the same shader source compiled with LOD_DITHER, so the discard
     // (and its loss of early depth rejection) exists only while a tile is in a fade. Per-tile values are instance uniforms.
-    private readonly ShaderMaterial _buildingFadeMaterial;
-    private readonly ShaderMaterial _groundFadeMaterial;
+    private readonly FadeMaterials _buildingFades, _groundFades;
+    // The same for the five sprite sets (shader compiled with LOD_DITHER: plain uniform fade_mul instead of the constant 1).
+    private readonly FadeMaterials _lightFades, _streetFades, _poolFades, _beaconFades, _airportFades;
 
     private static readonly StringName PFade = new("fade");
     private static readonly StringName PFadeParity = new("fade_parity");
@@ -51,8 +52,10 @@ public sealed class TilePool
     public int Trimmed => _trimmer.Trimmed;
     public int FreeCount => _free.Count;
     public ShaderMaterial BuildingMaterial => _buildingMaterial;
-    public ShaderMaterial BuildingFadeMaterial => _buildingFadeMaterial;
-    public ShaderMaterial GroundFadeMaterial => _groundFadeMaterial;
+    /// <summary>The configured dither variants (templates; fading tiles use clones, see <see cref="FadeMaterials"/>).</summary>
+    public ShaderMaterial BuildingFadeMaterial => _buildingFades.Template;
+    public ShaderMaterial GroundFadeMaterial => _groundFades.Template;
+    public FadeMaterials BuildingFades => _buildingFades;
     public ShaderMaterial LightMaterial => _lightMaterial;
     public ShaderMaterial StreetLightMaterial => _streetLightMaterial;
     public ShaderMaterial StreetPoolMaterial => _streetPoolMaterial;
@@ -110,17 +113,35 @@ public sealed class TilePool
 
         // One shared material for every building mesh of every tile (opaque, no discard).
         _buildingMaterial = new ShaderMaterial { Shader = GD.Load<Shader>(shaders + "/building_windows.gdshader") };
-        _buildingFadeMaterial = new ShaderMaterial { Shader = LoadDitherVariant(shaders + "/building_windows.gdshader") };
+        var buildingFade = new ShaderMaterial { Shader = LoadDitherVariant(shaders + "/building_windows.gdshader") };
         settings.ApplyToBuilding(_buildingMaterial);
-        settings.ApplyToBuilding(_buildingFadeMaterial);
+        settings.ApplyToBuilding(buildingFade);
+        _buildingFades = new FadeMaterials(buildingFade);
         SetWindowShares(FallbackWindowShares);
         SetProfileColors(DefaultProfileColors);
 
         // One shared material for every ground mesh (palette decoded from vertex COLOR).
         _groundMaterial = new ShaderMaterial { Shader = GD.Load<Shader>(shaders + "/ground.gdshader") };
-        _groundFadeMaterial = new ShaderMaterial { Shader = LoadDitherVariant(shaders + "/ground.gdshader") };
+        var groundFade = new ShaderMaterial { Shader = LoadDitherVariant(shaders + "/ground.gdshader") };
         settings.ApplyToGround(_groundMaterial);
-        settings.ApplyToGround(_groundFadeMaterial);
+        settings.ApplyToGround(groundFade);
+        _groundFades = new FadeMaterials(groundFade);
+
+        // Sprite fade variants, configured like their plain materials.
+        var dot = _lightMaterial.GetShaderParameter("dot_tex");
+        var lightVariant = LoadDitherVariant(shaders + "/light_sprite.gdshader");
+        ShaderMaterial Sprite(Shader sh, System.Action<ShaderMaterial> apply, bool withDot = true)
+        {
+            var m = new ShaderMaterial { Shader = sh };
+            if (withDot) m.SetShaderParameter("dot_tex", dot);
+            apply(m);
+            return m;
+        }
+        _lightFades = new FadeMaterials(Sprite(lightVariant, settings.ApplyToLights));
+        _streetFades = new FadeMaterials(Sprite(lightVariant, settings.ApplyToStreetLights));
+        _airportFades = new FadeMaterials(Sprite(lightVariant, settings.ApplyToAirportLights));
+        _poolFades = new FadeMaterials(Sprite(LoadDitherVariant(shaders + "/street_light_pool.gdshader"), settings.ApplyToStreetPools, false));
+        _beaconFades = new FadeMaterials(Sprite(LoadDitherVariant(shaders + "/beacon_light.gdshader"), settings.ApplyToBeacons));
     }
 
     /// <summary>
@@ -130,7 +151,7 @@ public sealed class TilePool
     public void SetEmissionLevel(float level)
     {
         _buildingMaterial.SetShaderParameter("emission_level", level);
-        _buildingFadeMaterial.SetShaderParameter("emission_level", level);
+        _buildingFades.Set("emission_level", level);
     }
 
     /// <summary>
@@ -139,48 +160,71 @@ public sealed class TilePool
     /// </summary>
     public void SetLodRanges(float blendStartM, float blendEndM, float poolStartM, float poolEndM)
     {
-        foreach (var m in new[] { _buildingMaterial, _buildingFadeMaterial })
-        {
-            m.SetShaderParameter("avg_fade_start_m", blendStartM);
-            m.SetShaderParameter("avg_fade_end_m", blendEndM);
-        }
+        SetBuilding("avg_fade_start_m", blendStartM);
+        SetBuilding("avg_fade_end_m", blendEndM);
         _lightMaterial.SetShaderParameter("blend_start_m", blendStartM);
         _lightMaterial.SetShaderParameter("blend_end_m", blendEndM);
+        _lightFades.Set("blend_start_m", blendStartM);
+        _lightFades.Set("blend_end_m", blendEndM);
         _streetPoolMaterial.SetShaderParameter("fade_start_m", poolStartM);
         _streetPoolMaterial.SetShaderParameter("fade_end_m", poolEndM);
+        _poolFades.Set("fade_start_m", poolStartM);
+        _poolFades.Set("fade_end_m", poolEndM);
     }
 
     /// <summary>Moves the far fade of every sprite set (building, street, airport lights and beacons): fully faded at <paramref name="endM"/> (bands.max_distance_m).</summary>
     public void SetLightFar(float fadeStartM, float endM)
     {
-        foreach (var m in new[] { _lightMaterial, _streetLightMaterial, _airportLightMaterial, _beaconMaterial })
+        foreach (var (m, f) in SpriteSets(false))
         {
             m.SetShaderParameter("fade_start_m", fadeStartM);
             m.SetShaderParameter("far_end_m", endM);
+            f.Set("fade_start_m", fadeStartM);
+            f.Set("far_end_m", endM);
         }
     }
 
     /// <summary>The environment's depth fog curve on the light sprites, which are additive and fog themselves (fog_disabled).</summary>
     public void SetLightFog(float beginM, float endM, float curve)
     {
-        foreach (var m in new[] { _lightMaterial, _streetLightMaterial, _streetPoolMaterial, _beaconMaterial, _airportLightMaterial })
+        foreach (var (m, f) in SpriteSets(true))
         {
             m.SetShaderParameter("fog_begin_m", beginM);
             m.SetShaderParameter("fog_end_m", endM);
             m.SetShaderParameter("fog_curve", curve);
+            f.Set("fog_begin_m", beginM);
+            f.Set("fog_end_m", endM);
+            f.Set("fog_curve", curve);
         }
     }
 
     /// <summary>Street lamp height above the ground (<c>lights.street.height_m</c>): the light pools sit this far below each lamp.</summary>
-    public void SetStreetLampHeight(float heightM) => _streetPoolMaterial.SetShaderParameter("lamp_height_m", heightM);
+    public void SetStreetLampHeight(float heightM)
+    {
+        _streetPoolMaterial.SetShaderParameter("lamp_height_m", heightM);
+        _poolFades.Set("lamp_height_m", heightM);
+    }
+
+    /// <summary>Each sprite material with its dither variants (the street pool disc only when <paramref name="withPool"/>: it has no light_sprite parameters).</summary>
+    private (ShaderMaterial, FadeMaterials)[] SpriteSets(bool withPool) => withPool
+        ? new[] { (_lightMaterial, _lightFades), (_streetLightMaterial, _streetFades), (_streetPoolMaterial, _poolFades), (_beaconMaterial, _beaconFades), (_airportLightMaterial, _airportFades) }
+        : new[] { (_lightMaterial, _lightFades), (_streetLightMaterial, _streetFades), (_airportLightMaterial, _airportFades), (_beaconMaterial, _beaconFades) };
+
+    /// <summary>A building shader parameter on the plain material and every dither clone.</summary>
+    private void SetBuilding(StringName name, Variant value)
+    {
+        _buildingMaterial.SetShaderParameter(name, value);
+        _buildingFades.Set(name, value);
+    }
 
     /// <summary>Pixel footprint per metre of view depth on both sprite materials (see <c>px_per_depth</c> in light_sprite.gdshader).</summary>
     public void SetSpritePxPerDepth(float k)
     {
-        _lightMaterial.SetShaderParameter("px_per_depth", k);
-        _streetLightMaterial.SetShaderParameter("px_per_depth", k);
-        _beaconMaterial.SetShaderParameter("px_per_depth", k);
-        _airportLightMaterial.SetShaderParameter("px_per_depth", k);
+        foreach (var (m, f) in SpriteSets(false))
+        {
+            m.SetShaderParameter("px_per_depth", k);
+            f.Set("px_per_depth", k);
+        }
     }
 
     /// <summary>
@@ -202,14 +246,13 @@ public sealed class TilePool
     public void SetWindowShares(float[] shares)
     {
         Variant a = shares; // PackedFloat32Array
-        _buildingMaterial.SetShaderParameter("window_share", a);
-        _buildingFadeMaterial.SetShaderParameter("window_share", a);
+        SetBuilding("window_share", a);
     }
 
     /// <summary>The <c>window_share</c> values currently on the plain (or the dithering) building material (tests: both must be equal).</summary>
     public float[] ReadWindowShares(bool fadeMaterial)
     {
-        var v = (fadeMaterial ? _buildingFadeMaterial : _buildingMaterial).GetShaderParameter("window_share");
+        var v = (fadeMaterial ? _buildingFades.Template : _buildingMaterial).GetShaderParameter("window_share");
         return v.VariantType == Variant.Type.PackedFloat32Array ? v.AsFloat32Array() : System.Array.Empty<float>();
     }
 
@@ -219,20 +262,16 @@ public sealed class TilePool
     /// </summary>
     public void SetFloodlight(Vector3 color, float strength, float fadeHeightM)
     {
-        foreach (var m in new[] { _buildingMaterial, _buildingFadeMaterial })
-        {
-            m.SetShaderParameter("floodlight_color", color);
-            m.SetShaderParameter("floodlight_strength", strength);
-            m.SetShaderParameter("floodlight_fade_height_m", fadeHeightM);
-        }
+        SetBuilding("floodlight_color", color);
+        SetBuilding("floodlight_strength", strength);
+        SetBuilding("floodlight_fade_height_m", fadeHeightM);
     }
 
     /// <summary>Window colour (linear) per light profile id 0..7, on both building materials (8 entries).</summary>
     public void SetProfileColors(Vector3[] colors)
     {
         Variant a = colors; // PackedVector3Array
-        _buildingMaterial.SetShaderParameter("profile_color", a);
-        _buildingFadeMaterial.SetShaderParameter("profile_color", a);
+        SetBuilding("profile_color", a);
     }
 
     /// <summary>Creates <paramref name="count"/> hidden node sets up front to avoid first-use hitches.</summary>
@@ -369,42 +408,63 @@ public sealed class TilePool
     }
 
     /// <summary>
-    /// Applies a poll_fades value (0..1, below 1) to a tile: switches the building and ground meshes to the dithering
-    /// material variants and sets their per-instance fade / fade_parity (parity = z &amp; 1 of the key). The light
-    /// sprites never dither; their brightness is scaled by the same value instead, so the two additive sides of a swap
+    /// Applies a poll_fades value (0..1, below 1) to a tile: gives each of its seven drawn nodes (building, ground, five sprite sets) its own clone of the
+    /// dithering variant (<see cref="FadeMaterials"/>) and writes fade / fade_parity (parity = z &amp; 1 of the key) into them as plain uniforms.
+    /// The light sprites never dither; their brightness is scaled by the same value instead (<c>fade_mul</c>), so the two additive sides of a swap
     /// sum to constant brightness (no double-bright flash while R3/R2 lights overlap).
     /// </summary>
     public void SetFade(TileNodes t, float fade)
     {
+        var m = t.FadeMats;
         if (!t.FadeMaterialActive)
         {
-            t.MeshInstance.MaterialOverride = _buildingFadeMaterial;
-            t.GroundInstance.MaterialOverride = _groundFadeMaterial;
-            t.FadeMaterialActive = true;
             float parity = TileKey.Z(t.Packed) & 1;
-            t.MeshInstance.SetInstanceShaderParameter(PFadeParity, parity);
-            t.GroundInstance.SetInstanceShaderParameter(PFadeParity, parity);
+            m[0] = _buildingFades.Rent();
+            m[1] = _groundFades.Rent();
+            m[0]!.SetShaderParameter(PFadeParity, parity);
+            m[1]!.SetShaderParameter(PFadeParity, parity);
+            m[2] = _lightFades.Rent();
+            m[3] = _streetFades.Rent();
+            m[4] = _poolFades.Rent();
+            m[5] = _beaconFades.Rent();
+            m[6] = _airportFades.Rent();
+            t.MeshInstance.MaterialOverride = m[0];
+            t.GroundInstance.MaterialOverride = m[1];
+            t.Lights.MaterialOverride = m[2];
+            t.StreetLights.MaterialOverride = m[3];
+            t.StreetPools.MaterialOverride = m[4];
+            t.Beacons.MaterialOverride = m[5];
+            t.AirportLights.MaterialOverride = m[6];
+            t.FadeMaterialActive = true;
         }
-        t.MeshInstance.SetInstanceShaderParameter(PFade, fade);
-        t.GroundInstance.SetInstanceShaderParameter(PFade, fade);
-        t.Lights.SetInstanceShaderParameter(PFadeMul, fade);
-        t.StreetLights.SetInstanceShaderParameter(PFadeMul, fade);
-        t.StreetPools.SetInstanceShaderParameter(PFadeMul, fade);
-        t.Beacons.SetInstanceShaderParameter(PFadeMul, fade);
-        t.AirportLights.SetInstanceShaderParameter(PFadeMul, fade);
+        m[0]!.SetShaderParameter(PFade, fade);
+        m[1]!.SetShaderParameter(PFade, fade);
+        for (int i = 2; i < FadeNodes; i++) m[i]!.SetShaderParameter(PFadeMul, fade);
     }
 
-    /// <summary>Back to the opaque materials (no discard) once a tile left its transition, or when it is released.</summary>
+    /// <summary>Nodes of a tile set that dither or scale with a fade: building, ground, lights, street lamps, street pools, beacons, airport lights.</summary>
+    public const int FadeNodes = 7;
+
+    /// <summary>Back to the opaque materials (no discard) once a tile left its transition, or when it is released; the clones go back to their pools.</summary>
     public void EndFade(TileNodes t)
     {
         if (!t.FadeMaterialActive) return;
+        var m = t.FadeMats;
         t.MeshInstance.MaterialOverride = _buildingMaterial;
         t.GroundInstance.MaterialOverride = _groundMaterial;
-        t.Lights.SetInstanceShaderParameter(PFadeMul, 1f);
-        t.StreetLights.SetInstanceShaderParameter(PFadeMul, 1f);
-        t.StreetPools.SetInstanceShaderParameter(PFadeMul, 1f);
-        t.Beacons.SetInstanceShaderParameter(PFadeMul, 1f);
-        t.AirportLights.SetInstanceShaderParameter(PFadeMul, 1f);
+        t.Lights.MaterialOverride = _lightMaterial;
+        t.StreetLights.MaterialOverride = _streetLightMaterial;
+        t.StreetPools.MaterialOverride = _streetPoolMaterial;
+        t.Beacons.MaterialOverride = _beaconMaterial;
+        t.AirportLights.MaterialOverride = _airportLightMaterial;
+        _buildingFades.Return(m[0]!);
+        _groundFades.Return(m[1]!);
+        _lightFades.Return(m[2]!);
+        _streetFades.Return(m[3]!);
+        _poolFades.Return(m[4]!);
+        _beaconFades.Return(m[5]!);
+        _airportFades.Return(m[6]!);
+        for (int i = 0; i < FadeNodes; i++) m[i] = null;
         t.FadeMaterialActive = false;
     }
 

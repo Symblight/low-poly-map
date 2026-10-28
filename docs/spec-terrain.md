@@ -85,7 +85,7 @@ Pick: **Delatin**, vendored into `simworld-core/src/terrain/tin.rs` (ISC licence
 ### 3.5 Renderer facts that shape the design (Godot 4.7, Mobile renderer)
 
 - Screen-space derivatives (`dFdx`, `dFdy`) are GLSL ES 3.0 built-ins and already used by `ground.gdshader`: flat shading costs **no normal array**. `flat` varyings exist too but need unshared vertices to carry per-face data, so derivatives win.
-- Per-instance uniforms work in Forward+ and Mobile (RenderingDevice renderers; practical limit 16 per shader, no textures or arrays). The fade uniforms already use them; the terrain needs none beyond those.
+- Per-instance uniforms work in Forward+ and Mobile (RenderingDevice renderers; practical limit 16 per shader, no textures or arrays). The fade uniforms used them until the instance-uniform bug (a node without a slot reads 0; the buffer holds 4096 nodes per project, CHANGELOG, Unreleased): fades now use one dither material clone per fading tile (`FadeMaterials`), so the addon has no instance uniform and the terrain needs none.
 - `ArrayMesh` compressed attributes (`ARRAY_FLAG_COMPRESS_ATTRIBUTES`) pack positions into 16-bit unorm over the surface AABB: 0.3 m steps on a 22 km z10 tile, visible as seams. Terrain surfaces stay **uncompressed** (today's default for `AddSurfaceFromArrays`).
 - Godot stores a surface's index buffer with 16-bit indices when it has ≤ 65 536 vertices; terrain tiles stay far below that (triangle cap, section 5.3).
 - Godot 4.3+ uses a reversed-Z depth buffer in the RenderingDevice renderers, so pushing the camera far plane from 32 km to ~150 km for the far terrain bands is acceptable with near = 0.5 m (`docs/spec-night-rendering.md` "depth precision"). Check in T0 on the Mobile renderer with a Z-fighting shot at 10 km.

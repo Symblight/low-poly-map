@@ -31,7 +31,11 @@ uniform float fog_light_keep = 0.6;
 uniform float px_per_depth = 0.0014;
 
 global uniform float simworld_night_factor;
-instance uniform float fade_mul : hint_range(0.0, 1.0) = 1.0;
+#ifdef LOD_DITHER
+uniform float fade_mul : hint_range(0.0, 1.0) = 1.0; // per fading tile (one material each, see FadeMaterials); never an instance uniform
+#else
+const float fade_mul = 1.0;
+#endif
 
 varying vec3 v_col;
 varying float v_bright;

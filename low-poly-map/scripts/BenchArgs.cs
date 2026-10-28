@@ -94,6 +94,9 @@ public partial class BenchArgs : Node
         if (System.Linq.Enumerable.Contains(OS.GetCmdlineUserArgs(), "--hide-vector")) view.VectorVisible = false;
         if (System.Linq.Enumerable.Contains(OS.GetCmdlineUserArgs(), "--terrain-log")) view.TerrainDebugLog = true;
         if (System.Linq.Enumerable.Contains(OS.GetCmdlineUserArgs(), "--churn-log")) { view.ChurnLog = true; view.OriginShifted += sh => GD.Print($"[Churn] t={Time.GetTicksMsec() / 1000.0:0.00} origin shift {sh}"); view.Reconfigured += (ok, e) => GD.Print($"[Churn] t={Time.GetTicksMsec() / 1000.0:0.00} RECONFIGURE ok={ok} {e}"); }
+        if (FadeSelfTest.Requested()) { (View?.GetParent() ?? view).CallDeferred(Node.MethodName.AddChild, new FadeSelfTest { Name = "FadeSelfTest" }); return; }
+        if (HoleDetector.Requested(out double holeSecs)) HoleDetector.Attach(view, View?.GetParent(), holeSecs);
+        if (HoleFlight.Requested(out int holeSeed)) HoleFlight.Attach(view, View?.GetParent(), holeSeed);
         if (LodSelfTest.Requested()) LodSelfTest.Attach(view, View?.GetParent());
         if (SeedSpots.Requested() is { } spot) SeedSpotDriver.Attach(view, View?.GetParent(), spot);
         if (SeedSelfTest.Requested()) SeedSelfTest.Attach(view, View?.GetParent());

@@ -52,7 +52,7 @@ public partial class FreeFlyCamera : Camera3D, IWorldCameraSource
     private float _autoAgl = AutopilotAltitudeM;
 
     public Vector3 Velocity { get; private set; }
-    public bool Autopilot { get; private set; }
+    public bool Autopilot { get; set; }
     /// <summary>Vertical speed of the climb autopilot in m/s (0 = off).</summary>
     public float ClimbRate { get; private set; }
     private float _climbDir = 1f;

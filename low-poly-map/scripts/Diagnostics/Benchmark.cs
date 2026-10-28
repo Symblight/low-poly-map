@@ -106,12 +106,26 @@ public partial class Benchmark : Node
         return bench;
     }
 
+    /// <summary><c>fullscreen</c>, <c>WxH</c>, or empty for <see cref="WindowSize"/>; the result's machine block records the size used.</summary>
+    static void ApplyWindow(string spec)
+    {
+        if (spec == "fullscreen")
+        {
+            DisplayServer.WindowSetMode(DisplayServer.WindowMode.Fullscreen);
+            return;
+        }
+        var parts = spec.Split('x');
+        var size = parts.Length == 2 && int.TryParse(parts[0], out int w) && int.TryParse(parts[1], out int h) && w > 0 && h > 0
+            ? new Vector2I(w, h) : WindowSize;
+        DisplayServer.WindowSetSize(size);
+    }
+
     public override void _Ready()
     {
         _camera = (FreeFlyCamera)_view.Camera!;
         _camera.Scripted = true;
         if (!_args.Vsync) DisplayServer.WindowSetVsyncMode(DisplayServer.VSyncMode.Disabled);   // frame time must show the headroom, not the display rate
-        DisplayServer.WindowSetSize(WindowSize);
+        ApplyWindow(_args.Window);
         // A window hidden behind others is paced by the compositor (about the display rate) whatever the vsync mode says: keep it on top.
         DisplayServer.WindowSetFlag(DisplayServer.WindowFlags.AlwaysOnTop, true);
         DisplayServer.WindowMoveToForeground();

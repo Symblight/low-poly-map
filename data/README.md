@@ -53,6 +53,40 @@ Buildings that cross a tile edge appear in each tile they touch, with the same `
 Keeping every building at z13 costs size: the densest z13 tile (old town, 13/4671/2603) holds 4,452 buildings and is 290 kB raw / 168 kB gzipped.
 To cut z13, emit a centroid point per building there instead of the polygon (`geometry: polygon_centroid`), because R3 only needs one light point per building.
 
+## Two-level archive (Tiles and LOD v2, step T1b)
+
+`simworld-cli bake` re-tiles `out/vilnius.pmtiles` into the two data levels of the Tiles and LOD v2 spec, in one PMTiles v3 file (gzip MVT). No OSM / Docker step: it reads the z16 footprints (stitched back into whole buildings across the z16 tile edges), the z14 landuse / roads and the z13 major roads / landuse of the existing archive. From `rust/`:
+
+```
+cargo run --release -p simworld-cli -- bake ../data/out/vilnius.pmtiles ../data/out/vilnius-v2.pmtiles
+cargo run --release -p simworld-cli -- bake --verify ../data/out/vilnius-v2.pmtiles [--input ../data/out/vilnius.pmtiles]
+```
+
+Options: `--block-min-area <m²>` (default 150), `--block-gap <m>` (4), `--landmark-m <m>` (60). The bake takes ~2 s, prints the sizes below, then verifies its output against the source (exit 1 on a failure); `--verify` runs the same checks on any archive (with `--input`, also the per-building ones). Output is deterministic (same bytes on every run).
+
+| Level | Zoom | Layer (extent) | Content |
+|-------|------|----------------|---------|
+| detail | z14 | `buildings` (8192) | every non-landmark building, simplified 0.5 m, >= 20 m² after simplification, all source attributes (`id`, `osm_type`, `kind`, `height`, `levels`, `min_height`, `colour`, `historic`, `man_made`, `windows`, `ruins`, `disused`, `abandoned`). No `building:part` (the source has none). Buffer 4/256. |
+| | | `landuse`, `roads` (8192) | the source's z14 layers as they are (all road classes) |
+| overview | z11 | `blocks` (4096) | non-landmark buildings within 4 m merged (buffer 2 m, union, shrink 2 m), simplified 5 m, >= 150 m²; `id` (smallest member OSM id), `kind` (by area), `height` (area-weighted mean of the resolved roof heights, rounded to 5 m, min 5), `count` |
+| | | `landmarks` (16384) | buildings whose tagged roof (height, else levels x 3 m) is >= 60 m: full footprint (0.1 m simplification), all source attributes; they are not in detail |
+| | | `lights` (4096) | one point per building (landmarks too) at its footprint centroid, in exactly one tile. OSM id / type only in the feature id (`id * 10 + 2` way, `+ 3` relation); `kind`, the state tags; `height` (rounded to 5 m) and `area` (m²) only for tagged heights; `landuse` = the fallback landuse kind at the centroid |
+| | | `roads` (4096) | motorway, trunk, primary, secondary (+ links) from z13, cut at the z13 edges, simplified 3 m |
+| | | `landuse` (4096) | z13 polygons, pieces of one id unioned; water >= 2000 m², the rest >= 1 ha; simplified 5 m |
+
+Every building is in exactly one of detail `buildings` / `landmarks`, or in neither when its footprint is under 20 m² (it keeps its light point); blocks and lights are derived. Metadata: `simworld_levels` = `{"detail":14,"overview":11}`, `attribution` (© OpenStreetMap contributors), `simworld_bake` (all parameters, read back by `--verify`), `vector_layers`.
+
+Checks (`--verify`): only zooms 11 and 14; layer names and extents per level; metadata keys; no id in both detail and landmarks; landmarks >= 60 m and detail < 60 m; detail footprints >= 20 m² and blocks >= the minimum (area summed over tiles inside each tile proper, minus the grid rounding tolerance); block and light heights in 5 m steps; one light point per building, inside its tile; with `--input`: every source building in exactly one level (or dropped by the minimum area) with exactly one light, no unknown ids. `cargo test -p simworld-cli` runs the bake end to end on a synthetic source (and the runtime's `mvt::decode_tile` on a detail tile); `SIMWORLD_BAKE_INPUT=<path> cargo test --release -p simworld-cli vilnius -- --ignored` runs it on the real archive and checks the stitching.
+
+Result for `vilnius.pmtiles` (247,629 buildings, 2026-10-28):
+
+| Level | Tiles | Total (gz) | p50 | p95 | Max |
+|-------|-------|------------|-----|-----|-----|
+| detail z14 | 1,518 | 14.74 MB | 5.1 kB | 37.7 kB | 115 kB (14/9342/5207) |
+| overview z11 | 36 | 4.28 MB | 53 kB | 459 kB | 757 kB (11/1167/650, central Vilnius) |
+
+Archive 19.0 MB (29.8 % of the 63.9 MB source). 232,471 detail footprints, 18 landmarks, 15,140 under 20 m² (lights only). Blocks: 72,877 from 196,804 clusters; 45.2 % of the buildings (77.9 % of the footprint area) end in a kept block (min area 200 m²: 33.1 % / 67.8 %, 100 m²: 61.7 % / 88.6 %). The `lights` layer is 42.6 % of the overview gz bytes (1.82 MB).
+
 ## Hosting
 
 `serve.sh` is only for local development. We haven't chosen the production host yet (any static host or CDN with range-request support, such as S3 + CloudFront or Cloudflare R2). Never use public OSM tile servers.

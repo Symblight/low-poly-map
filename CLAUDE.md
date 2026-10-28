@@ -26,6 +26,7 @@ The Rust side has a `cargo test` baseline of 219 passed, 0 failed, 9 ignored (20
 - Run the test bench: `$G --path .` (add user arguments after `--`, see `low-poly-map/CLAUDE.md`).
 - Hot reload: keep the editor open, `cargo build`, refocus the editor window (`reloadable = true` in `simplane_world.gdextension`). `WorldStreamer` is not a tool class, so it only runs in-game, not in the editor.
 - Tile build: `data/build_tiles.sh` (Docker, planetiler 0.10.2) writes `data/out/vilnius.pmtiles`; `data/serve.sh` serves it with Range support at `http://127.0.0.1:8787/`. See `data/README.md`.
+- Two-level bake (Tiles and LOD v2, T1b; from `rust/`): `cargo run --release -p simworld-cli -- bake ../data/out/vilnius.pmtiles ../data/out/vilnius-v2.pmtiles` (detail z14 + overview z11 with blocks / lights / landmarks, prints sizes, verifies); `bake --verify <file> [--input <src>]` checks an archive. See `data/README.md`.
 
 ## Docs
 

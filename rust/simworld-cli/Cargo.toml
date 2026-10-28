@@ -13,3 +13,11 @@ path = "src/main.rs"
 [dependencies]
 simworld-core = { path = "../simworld-core" }
 serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
+# `bake` (Tiles and LOD v2, step T1b): re-tiles an archive into the two data levels. Pure Rust and
+# CLI-only (never a simworld-core dependency): mvt-reader decodes the input (the runtime's decoder),
+# geo does the block buffer / union / simplify, pmtiles writes the v3 archive.
+mvt-reader = "2.5.0"
+geo = { version = "0.33.1", default-features = false }
+pmtiles = { version = "0.25.0", default-features = false, features = ["write"] }
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+rayon = "1.12"

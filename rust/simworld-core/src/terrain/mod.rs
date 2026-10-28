@@ -22,8 +22,12 @@
 //! * [`tin`] (phase 2, the terrain-mesh layer): a vendored Delatin greedy-insertion TIN over a
 //!   tile's patch, curvature seeds, skirts, optional smooth normals ([`tin::build_terrain_tile`]).
 //!
+//! * [`height`] (Terrain v2 G1, not wired yet): `HeightTile` (one 64-quad height grid per tile,
+//!   parent-sample copy, world-wide R16) and the pure per-key `ErrorProxy` for the SSE cover.
+//!
 //! Units: meters; local `y` = meters above mean sea level.
 
+pub mod height;
 pub mod noise;
 pub mod sample;
 pub mod tin;

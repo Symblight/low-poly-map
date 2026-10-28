@@ -64,7 +64,8 @@ impl Scheduler {
         let inputs = PlanInputs { roots: self.stack.iter().map(|s| s.0).collect(), sse_m_per_m: self.sse_m_per_m, guard_m: self.guard_m };
         let entries = &self.entries;
         let split = |k: TileKey| entries.get(&k).is_some_and(|e| e.split);
-        if self.plan_memo.still_valid(&inputs, views, grounds, self.layer.hysteresis, split) {
+        let probe_gen = self.probe_generation();
+        if self.plan_memo.still_valid(&inputs, views, grounds, self.layer.hysteresis, probe_gen, split) {
             self.plan_memo.reused += 1;
             (self.balance_forced, self.budget_skipped) = self.plan_memo.counters;
             #[cfg(test)]
@@ -151,10 +152,11 @@ impl Scheduler {
         self.balance_forced = split.len() - planned;
         self.budget_skipped = skipped;
         // Without the budget binding the plan is the unordered set (no decision but the
-        // recorded ones changes it): reusable.
-        // A plan that met a value still on the way (async boxes) is recomputed next frame.
-        let reusable = !self.plan_incomplete && (budget == 0 || (limit == budget && roots.len() + 3 * planned <= budget));
-        self.plan_memo.finish(reusable, (self.balance_forced, skipped));
+        // recorded ones changes it): reusable. A plan that met a value still on the way (async
+        // boxes) is reusable until the next probe batch arrives (`PlanMemo::still_valid`).
+        let reusable = budget == 0 || (limit == budget && roots.len() + 3 * planned <= budget);
+        let waits_on = self.plan_incomplete.then(|| self.probe_generation());
+        self.plan_memo.finish(reusable, waits_on, (self.balance_forced, skipped));
         self.t_split = split;
         self.t_roots = roots;
         self.t_work = work;

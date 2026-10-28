@@ -359,6 +359,9 @@ pub struct StreetLights {
     pub alt_share: f64,
     /// Distance between lamps along a road centerline (m).
     pub spacing_m: f64,
+    /// Multiplier of `spacing_m` per band R0..R3 (api 1.11): a lamp of a band with scale `k` stands for `k` lamps (alpha
+    /// `intensity(k)`), so the far bands carry fewer, brighter sprites. Default `[1, 1, 1, 2]`.
+    pub spacing_scale: [f64; 4],
     /// Lamp height above the road (m).
     pub height_m: f64,
     /// Roads of this class or a more important one (1 motorway .. 5 residential, 6 other) get lamps without a `lit` tag;
@@ -374,6 +377,7 @@ impl Default for StreetLights {
             alt_color: [0.78, 0.86, 1.0],
             alt_share: 0.3,
             spacing_m: 35.0,
+            spacing_scale: [1.0, 1.0, 1.0, 2.0],
             height_m: 9.0,
             untagged_max_class: 5,
         }
@@ -1384,6 +1388,7 @@ pub const RANGES: &[(&str, f64, f64)] = &[
     ("lights.street.alt_color[]", 0.0, 1.0),
     ("lights.street.alt_share", 0.0, 1.0),
     ("lights.street.spacing_m", 5.0, 1000.0),
+    ("lights.street.spacing_scale[]", 1.0, 16.0),
     ("lights.street.height_m", 0.0, 100.0),
     ("lights.street.untagged_max_class", 0.0, 6.0),
     ("lights.beacons.min_ring", 0.0, 4.0),

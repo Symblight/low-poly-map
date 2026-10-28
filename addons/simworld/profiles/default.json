@@ -148,6 +148,7 @@
       "alt_color": [0.78, 0.86, 1.0],
       "alt_share": 0.3,
       "spacing_m": 35.0,
+      "spacing_scale": [1.0, 1.0, 1.0, 2.0],
       "height_m": 9.0,
       "untagged_max_class": 5
     },

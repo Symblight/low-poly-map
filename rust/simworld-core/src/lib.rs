@@ -32,6 +32,7 @@ pub mod latency;
 pub mod lights;
 pub mod lock;
 pub mod math;
+pub mod mesh_data;
 pub mod mesher;
 pub mod mvt;
 pub(crate) mod polyclip;
@@ -41,6 +42,7 @@ pub mod cover_budget;
 pub mod scheduler;
 pub mod seed;
 pub mod status;
+pub mod surface;
 pub mod synthetic;
 pub mod terrain;
 pub mod worker;
@@ -62,6 +64,10 @@ mod lifecycle_tests;
 mod perf_tests;
 #[cfg(test)]
 mod perf_stream_tests;
+#[cfg(test)]
+mod perf_flight_tests;
+#[cfg(test)]
+mod perf_surface_tests;
 
 pub use diag::{Diagnostics, Log, NullLog};
 pub use profile::{Profile, WorldProfile, PROFILE_VERSION};

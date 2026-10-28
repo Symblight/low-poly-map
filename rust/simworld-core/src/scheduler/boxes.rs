@@ -49,12 +49,15 @@ pub(super) struct BoxRequests {
     early: Vec<(TileKey, Probe)>,
     /// Keys requested since the scheduler started.
     pub requested: u64,
+    /// Probe batches taken in since the scheduler started: the known boxes and error proxies
+    /// change only when this does (a terrain plan that waited on a probe stays valid until then).
+    generation: u64,
 }
 
 impl BoxRequests {
     fn new() -> Self {
         let (reply, results) = crossbeam_channel::unbounded();
-        Self { reply, results, pending: AHashSet::new(), want: Vec::new(), early: Vec::new(), requested: 0 }
+        Self { reply, results, pending: AHashSet::new(), want: Vec::new(), early: Vec::new(), requested: 0, generation: 0 }
     }
 
     fn ask(&mut self, k: TileKey) {
@@ -90,6 +93,11 @@ impl Scheduler {
     /// No probe requested or on the way (the cover is final as far as boxes go).
     pub(super) fn probes_idle(&self) -> bool {
         self.box_requests.as_ref().is_none_or(|r| r.pending.is_empty() && r.want.is_empty())
+    }
+
+    /// Probe batches taken in so far (0 inline): what a plan that waited on a probe depends on.
+    pub(super) fn probe_generation(&self) -> u64 {
+        self.box_requests.as_ref().map_or(0, |r| r.generation)
     }
 
     /// Probes requested and not answered yet (tests, stats).
@@ -187,6 +195,7 @@ impl Scheduler {
         let Some(r) = self.box_requests.as_mut() else { return };
         let mut got: Vec<(TileKey, Probe)> = std::mem::take(&mut r.early);
         while let Ok(batch) = r.results.try_recv() {
+            r.generation += 1;
             for (k, p) in batch {
                 r.pending.remove(&k);
                 if let Some(p) = p {

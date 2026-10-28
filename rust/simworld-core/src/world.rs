@@ -44,8 +44,11 @@ use crate::terrain::Terrain;
 use crate::status::{Health, Status, StatusState, MSG_NOT_CONFIGURED, MSG_SHUT_DOWN};
 use crate::worker::{Job, Worker, WorkerMsg};
 
+mod call_profile;
 pub mod lod;
 mod poll_profile;
+
+pub use call_profile::CallTimer;
 
 /// Bounded wait of `shutdown` and of a re-configure that replaces a worker using a disk cache
 /// (until the old cache thread has flushed and closed its file).
@@ -98,6 +101,9 @@ pub struct WorldOptions {
     /// the manifest's folder). `None` = the file system (Rust hosts, tests, CLI); the Godot
     /// binding reads through `FileAccess` (`res://`, `user://`).
     pub seed_reader: Option<SeedFileReader>,
+    /// Deliver meshes as engine surfaces instead of arrays (`configure_world` option
+    /// `engine_surfaces`, api 1.11; `crate::surface`).
+    pub engine_surfaces: bool,
 }
 
 /// Host file reader for the seed world's files (see [`WorldOptions::seed_reader`]).
@@ -221,7 +227,7 @@ pub struct ConfigureResult {
 }
 
 /// An empty mesh (the `terrain` of vector tiles).
-static EMPTY_MESH: MeshData = MeshData { positions: Vec::new(), normals: Vec::new(), colors: Vec::new(), uvs: Vec::new(), indices: Vec::new() };
+static EMPTY_MESH: MeshData = MeshData { positions: Vec::new(), normals: Vec::new(), colors: Vec::new(), uvs: Vec::new(), indices: Vec::new(), surface: None };
 
 /// Lower bound of `set_terrain_detail`.
 pub const TERRAIN_DETAIL_MIN: f64 = 0.25;
@@ -805,6 +811,7 @@ impl World {
             Ok(mut w) => {
                 w.set_terrain(self.terrain.clone());
                 w.set_seed(self.seed.clone());
+                w.set_engine_surfaces(o.engine_surfaces);
                 let mut s =
                     Scheduler::new(frame, w.is_synthetic(), self.profile.clone()).with_terrain(self.terrain.clone()).with_async_boxes();
                 s.set_lod_view(&self.lod_view, self.cover_quality());
@@ -1044,10 +1051,8 @@ impl World {
     /// `take_origin_shift`, which this does not consume), `None` if there was none.
     pub fn update_camera(&mut self, local_pos: [f64; 3], velocity: [f64; 3], alt_agl_m: f64) -> Option<[f64; 3]> {
         self.scheduler.as_ref()?;
-        let profile = self.diag.profile;
-        let t_start = Instant::now();
+        let timer = self.call_timer();
         self.redelivered_this_frame = 0;
-        let cpu_start = if profile { thread_cpu_us() } else { 0 };
         self.drain_worker();
         let t_drained = Instant::now();
         let (x, z) = (local_pos[0], local_pos[2]);
@@ -1083,19 +1088,12 @@ impl World {
         self.order_jobs();
         self.submit_jobs();
         self.submit_probes();
-        if profile {
-            let us = |a: Instant, b: Instant| b.duration_since(a).as_micros();
+        if let Some(t) = timer {
             let end = Instant::now();
-            if us(t_start, end) > 1000 {
-                self.log.info(&format!(
-                    "WorldStreamer profile: update_camera {}us wall, {}us thread CPU (drain {}us, scheduler {}us, submit {}us)",
-                    us(t_start, end),
-                    thread_cpu_us().saturating_sub(cpu_start),
-                    us(t_start, t_drained),
-                    us(t_drained, t_updated),
-                    us(t_updated, end)
-                ));
-            }
+            self.end_call_with("update_camera", timer, || {
+                let (a, b) = (t.us_until(t_drained), t.us_until(t_updated));
+                format!("(drain {a}us, scheduler {}us, submit {}us)", b - a, t.us_until(end) - b)
+            });
             if end.duration_since(self.latency_logged) >= LATENCY_LOG_EVERY {
                 self.latency_logged = end;
                 if let Some(l) = self.latency() {
@@ -1118,7 +1116,7 @@ impl World {
     /// re-deliveries, then strictly by slant distance from the camera (ties: vector world);
     /// re-deliveries of both layers share the per-frame limit.
     pub fn pop_ready(&mut self, max: usize, mut f: impl FnMut(ReadyTileView<'_>)) -> usize {
-        let t_start = Instant::now();
+        let timer = self.call_timer();
         self.drain_worker();
         let t_drained = Instant::now();
         let mut tris = 0usize;
@@ -1159,19 +1157,11 @@ impl World {
                 self.poll_profile.record(thread_cpu_us().saturating_sub(cpu0), tile_tris);
             }
         }
-        if self.diag.profile {
-            let end = Instant::now();
-            let total = end.duration_since(t_start).as_micros();
-            if total > 1000 {
-                self.log.info(&format!(
-                    "WorldStreamer profile: poll_ready {}us (drain {}us, convert {} tiles / {} tris {}us)",
-                    total,
-                    t_drained.duration_since(t_start).as_micros(),
-                    n,
-                    tris,
-                    end.duration_since(t_drained).as_micros()
-                ));
-            }
+        if let Some(t) = timer {
+            self.end_call_with("poll_ready", timer, || {
+                let d = t.us_until(t_drained);
+                format!("(drain {d}us, convert {n} tiles / {tris} tris {}us)", t.us_until(Instant::now()) - d)
+            });
         }
         // A delivery can drop a refined parent whose re-fetch was in flight (`try_drop`).
         self.cancel_orphans();

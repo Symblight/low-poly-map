@@ -15,6 +15,7 @@
 //! `memory.recent_tiles_mb`: over it, entries of tiles the host still holds go first (oldest
 //! delivery first; they may never come back), then the oldest departures. 0 MB = off.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -83,7 +84,7 @@ pub struct RecentStats {
     pub bytes: u64,
 }
 
-/// The cache (see the module docs).
+/// One kept output.
 #[derive(Debug)]
 struct Entry {
     /// Delivery time while held, then the time it left the host.
@@ -93,9 +94,15 @@ struct Entry {
     bytes: u64,
 }
 
+/// The cache (see the module docs). Entries are also ordered by age (perf review 3 item 2):
+/// `held` by delivery time, `gone` by departure time (ties by key), so an eviction takes the
+/// first entry of `held`, else of `gone` (the order `(gone, at, key)`), and the age limit only
+/// looks at the front of `gone`: both cost O(log n) per entry removed, not a scan of the map.
 #[derive(Debug)]
 pub(super) struct RecentTiles {
     map: AHashMap<TileKey, Entry>,
+    held: BTreeSet<(Instant, TileKey)>,
+    gone: BTreeSet<(Instant, TileKey)>,
     bytes: u64,
     cap: u64,
     max_age: Duration,
@@ -108,6 +115,8 @@ impl RecentTiles {
     pub fn new(cap_mb: f64, max_age_s: f64) -> Self {
         Self {
             map: AHashMap::new(),
+            held: BTreeSet::new(),
+            gone: BTreeSet::new(),
             bytes: 0,
             cap: (cap_mb.max(0.0) * 1_048_576.0) as u64,
             max_age: Duration::from_secs_f64(max_age_s.max(0.0)),
@@ -126,13 +135,12 @@ impl RecentTiles {
             self.remove(k);
             return;
         }
-        if let Some(old) = self.map.insert(k, Entry { at: now, gone: false, kept, bytes: b }) {
-            self.bytes -= old.bytes;
-            self.released.push(old.kept);
-        }
+        self.remove(k);
+        self.map.insert(k, Entry { at: now, gone: false, kept, bytes: b });
+        self.held.insert((now, k));
         self.bytes += b;
         while self.bytes > self.cap {
-            let Some(first) = self.map.iter().min_by_key(|(key, e)| (e.gone, e.at, **key)).map(|(key, _)| *key) else { break };
+            let Some(&(_, first)) = self.held.first().or_else(|| self.gone.first()) else { break };
             self.remove(first);
         }
     }
@@ -140,8 +148,11 @@ impl RecentTiles {
     /// `k` left the host now (dropped or unloaded): its age limit starts.
     pub fn left(&mut self, k: TileKey, now: Instant) {
         if let Some(e) = self.map.get_mut(&k) {
+            let order = if e.gone { &mut self.gone } else { &mut self.held };
+            order.remove(&(e.at, k));
             e.at = now;
             e.gone = true;
+            self.gone.insert((now, k));
         }
     }
 
@@ -155,20 +166,21 @@ impl RecentTiles {
         Some(e.kept.clone())
     }
 
-    /// Drop the departed entries past the age limit.
+    /// Drop the departed entries past the age limit (the oldest departures first; nothing to
+    /// visit when the oldest is young enough).
     pub fn expire(&mut self, now: Instant) {
-        if self.map.is_empty() {
-            return;
-        }
-        let max = self.max_age;
-        let old: Vec<TileKey> = self.map.iter().filter(|(_, e)| e.gone && now.saturating_duration_since(e.at) > max).map(|(k, _)| *k).collect();
-        for k in old {
+        while let Some(&(at, k)) = self.gone.first() {
+            if now.saturating_duration_since(at) <= self.max_age {
+                break;
+            }
             self.remove(k);
         }
     }
 
     fn remove(&mut self, k: TileKey) {
         if let Some(e) = self.map.remove(&k) {
+            let order = if e.gone { &mut self.gone } else { &mut self.held };
+            order.remove(&(e.at, k));
             self.bytes -= e.bytes;
             self.released.push(e.kept);
         }

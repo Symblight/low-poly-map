@@ -218,7 +218,9 @@ pub(crate) fn golden_keys() -> Vec<(TileKey, usize)> {
 }
 
 /// Golden values for `golden_keys()` with `Profile::default()` (key, ring, hash). Last regenerated
-/// for Tiles and LOD v2 step T2c (every hash changed once, intended): the synthetic city streams
+/// for perf review 3 item 3 (`lights.street.spacing_scale` default [1, 1, 1, 2]: R3 street lamps
+/// every 70 m at intensity(2); only the two R3 hashes changed, here and in `GOLDEN_TERRAIN`).
+/// Before that for Tiles and LOD v2 step T2c (every hash changed once, intended): the synthetic city streams
 /// through the data-tile path as a two-level source; R0 / R1 are cut from a generated detail z14
 /// tile (the same lots unthinned, in z14 pixels; buildings with a tagged roof >= 60 m left out),
 /// R2 / R3 from a generated overview z11 tile (street-block blocks with 5 m height steps instead
@@ -238,8 +240,8 @@ const GOLDEN: &[(&str, usize, u64)] = &[
     ("15/18686/10414", 1, 0x88bb442529ea9bdb),
     ("14/9342/5206", 2, 0xd7f24dee1cf3f31b),
     ("14/9343/5207", 2, 0x8c7f7504ede9e2a7),
-    ("13/4671/2603", 3, 0xf8888332c6901c8e),
-    ("13/4672/2604", 3, 0xed38216f0ccbee16),
+    ("13/4671/2603", 3, 0x8ff0d8ad5edc69dd),
+    ("13/4672/2604", 3, 0x2b1cb8a827e3ef4a),
 ];
 
 #[test]
@@ -442,8 +444,8 @@ const GOLDEN_TERRAIN: &[(&str, usize, u64)] = &[
     ("15/18686/10414", 1, 0x532456df36b4eb51),
     ("14/9342/5206", 2, 0x61903659d117bcb3),
     ("14/9343/5207", 2, 0xe74fa946c2fddcfc),
-    ("13/4671/2603", 3, 0xcd3ef97883ad4850),
-    ("13/4672/2604", 3, 0x0714e35766092747),
+    ("13/4671/2603", 3, 0x554f1769be17565e),
+    ("13/4672/2604", 3, 0x4a1e6aa3833665b3),
 ];
 
 /// Golden cover on the synthetic relief for `COVER_CAMERAS`.

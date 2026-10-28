@@ -346,7 +346,7 @@ pub fn build_chunk_with(
         (lights.positions, lights.colors, lights.clustered_positions, lights.clustered_colors) = (p, c, cp, cc);
     }
     if ring >= profile.lights.street.min_ring as usize {
-        lights.set_streets(&dt.ground.roads, &proj, profile);
+        lights.set_streets(&dt.ground.roads, &proj, ring, profile);
     }
     if ring >= profile.lights.beacons.min_ring as usize {
         // Beacons from footprint geometry: detail footprints, and landmarks drawn here (never

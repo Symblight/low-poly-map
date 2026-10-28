@@ -144,7 +144,7 @@ pub fn build_terrain_tile_until(
     // The patch's lattice (`terrain::sample`): sample (i, j) of `cells` per side.
     let mut heights = Vec::with_capacity(n * n);
     for j in 0..n as i64 {
-        if j as usize % STOP_ROWS == 0 && stop() {
+        if (j as usize).is_multiple_of(STOP_ROWS) && stop() {
             return Ok(None);
         }
         for i in 0..n as i64 {

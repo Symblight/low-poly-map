@@ -619,10 +619,12 @@ fn terrain_center_keeps_the_relief_across_a_reconfigure_and_status_reports_the_l
     assert!(!w.status().terrain_active);
 }
 
-/// `set_terrain_detail`: clamped to [0.25, detail_scale_max]; every held terrain key is
-/// re-delivered exactly once (same keys, nothing unloaded), the vector world is untouched.
+/// `set_terrain_detail` (api 1.10, Terrain v2 G2): clamped to [0.25, detail_scale_max]; a
+/// tau scale of the terrain cover. 2 coarsens it through ordinary swaps: fewer terrain tiles,
+/// no re-delivery of a held key (nothing is re-meshed), terrain unloads; the vector world is
+/// untouched. Back to 1 restores the finer cover.
 #[test]
-fn set_terrain_detail_redelivers_each_held_terrain_key_once() {
+fn set_terrain_detail_scales_the_terrain_cover() {
     let mut w = world();
     assert_eq!(w.set_terrain_detail(0.1), 0.25);
     assert_eq!(w.set_terrain_detail(10.0), 2.0, "the default profile's detail_scale_max");
@@ -633,20 +635,24 @@ fn set_terrain_detail_redelivers_each_held_terrain_key_once() {
     assert_eq!(w.set_terrain_detail(1.0), 1.0);
     let mut h = Host::default();
     h.settle_terrain(&mut w);
-    let held: BTreeSet<LayerKey> = h.held.iter().filter(|k| k.layer == crate::rings::LayerKind::Terrain).copied().collect();
+    let terrain = |h: &Host| -> BTreeSet<LayerKey> { h.held.iter().filter(|k| k.layer == crate::rings::LayerKind::Terrain).copied().collect() };
+    let held = terrain(&h);
     assert!(held.len() >= 20);
     let (nd, nu) = (h.deliveries.len(), h.unloads.len());
     assert_eq!(w.set_terrain_detail(2.0), 2.0);
     h.settle_terrain(&mut w);
-    let re: Vec<(LayerKey, bool)> =
+    let coarse = terrain(&h);
+    let new: Vec<(LayerKey, bool)> =
         h.deliveries[nd..].iter().filter(|(k, _)| k.layer == crate::rings::LayerKind::Terrain).copied().collect();
-    assert!(re.iter().all(|(_, again)| *again), "only re-deliveries");
-    let keys: BTreeSet<LayerKey> = re.iter().map(|r| r.0).collect();
-    assert_eq!(keys, held, "every held terrain key");
-    assert_eq!(re.len(), held.len(), "each exactly once");
-    assert!(h.unloads[nu..].iter().all(|k| k.layer == crate::rings::LayerKind::World), "no terrain unloads");
+    assert!(new.iter().all(|(_, again)| !*again), "no re-deliveries");
+    assert!(new.iter().all(|(k, _)| !held.contains(k)), "no held key delivered again");
+    assert!(h.unloads[nu..].iter().any(|k| k.layer == crate::rings::LayerKind::Terrain), "children unloaded");
+    assert!(coarse.len() < held.len(), "detail 2 holds fewer terrain tiles: {} vs {}", coarse.len(), held.len());
     assert!(h.deliveries[nd..].iter().filter(|(k, _)| k.layer == crate::rings::LayerKind::World).all(|(_, again)| !*again));
     assert_eq!(w.terrain_detail(), 2.0);
+    assert_eq!(w.set_terrain_detail(1.0), 1.0);
+    h.settle_terrain(&mut w);
+    assert_eq!(terrain(&h), held, "scale 1 again: the same cover as before");
 }
 
 #[test]

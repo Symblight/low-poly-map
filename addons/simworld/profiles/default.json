@@ -260,6 +260,7 @@
     "water_snap_m": 0.0,
     "drape_step_m": 25.0,
     "detail_scale_max": 2.0,
+    "tau_px": 0.9,
     "skirt_m": 0.0,
     "shading": "flat",
     "horizon_cull": true,

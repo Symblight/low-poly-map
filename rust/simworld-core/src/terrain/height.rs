@@ -1,8 +1,8 @@
 //! Terrain v2 step G1: [`HeightTile`] (one regular height grid per terrain tile) and the pure
 //! per-key error proxy [`ErrorProxy`] the SSE cover (G2) will refine by.
 //!
-//! Not wired yet: nothing in the scheduler, the worker or the contract reads this module.
-//! `ground_height_at`, the drape and building bases stay on the exact height function
+//! Wired since G2: the terrain layer's cover refines by [`ErrorProxy`] (`scheduler`); the
+//! HeightTile is not used yet (render path G3). `ground_height_at`, the drape and building bases stay on the exact height function
 //! ([`Terrain::height`]); a HeightTile is for drawing (R16 texture layer) and collision.
 //!
 //! # Lattice
@@ -378,6 +378,9 @@ pub struct ErrorProxy {
     root_zoom: u8,
     comps: Vec<Comp>,
     memo: HashMap<TileKey, f64>,
+    /// Apply the edit floors (default). Off for the TIN-path cover (G2, see
+    /// [`ErrorProxy::without_edit_floor`]).
+    edit_floor: bool,
 }
 
 /// Memo entries kept before the memo is cleared (a few MB at most).
@@ -416,7 +419,27 @@ impl ErrorProxy {
                 comps.push(Comp { amp: e * f.plateau_share * 0.5, lambda: 2.0 * width, crease: false });
             }
         }
-        Self { terrain: terrain.clone(), root_zoom, comps, memo: HashMap::new() }
+        Self { terrain: terrain.clone(), root_zoom, comps, memo: HashMap::new(), edit_floor: true }
+    }
+
+    /// The proxy without the edit floors: every tile takes the unedited formula
+    /// (`min(R, base)`), edited or not. The terrain cover of the TIN render path uses it
+    /// (Terrain v2 G2): the TIN of an edited tile is exact on a levelled airport fence
+    /// (`lift_weight` scaling) and pins water vertices at their level, so an edit adds no drawn
+    /// error beyond the band's `max_error_m` and needs no forced refinement; with the floors the
+    /// two-cities seed world held about 2100..3200 terrain tiles instead of about 350. It also
+    /// leaves the overlapping-strip height step (2.28 m, see the type docs) to the analytic cap,
+    /// so it never drives refinement. The grid render path (G3) draws the 64-quad grid itself
+    /// and switches the floors back on.
+    pub fn without_edit_floor(mut self) -> Self {
+        self.edit_floor = false;
+        self.memo.clear();
+        self
+    }
+
+    /// Whether the edit floors apply.
+    pub fn edit_floor(&self) -> bool {
+        self.edit_floor
     }
 
     /// [`ErrorProxy::new`] with the root zoom of a resolved profile (`terrain.far_zoom`).
@@ -439,6 +462,30 @@ impl ErrorProxy {
             return e;
         }
         let raw = self.raw_error_m(key);
+        self.finish(key, raw)
+    }
+
+    /// [`ErrorProxy::error_m`] with the key's probe already taken (`probe` must be
+    /// `self.probe(key)`; the scheduler shares it with [`Terrain::tile_range`]). Same value.
+    pub fn error_m_probed(&mut self, key: TileKey, probe: &Probe) -> f64 {
+        if let Some(&e) = self.memo.get(&key) {
+            return e;
+        }
+        let raw = self.raw_from_probe(key, probe);
+        self.finish(key, raw)
+    }
+
+    /// Whether `key` is memoized.
+    pub fn contains(&self, key: TileKey) -> bool {
+        self.memo.contains_key(&key)
+    }
+
+    /// The terrain the proxy samples.
+    pub fn terrain(&self) -> &Terrain {
+        &self.terrain
+    }
+
+    fn finish(&mut self, key: TileKey, raw: f64) -> f64 {
         let e = if key.z > self.root_zoom && key.z > 0 { raw.min(self.error_m(parent_key(key))) } else { raw };
         if self.memo.len() >= MEMO_CAP {
             self.memo.clear();
@@ -502,9 +549,16 @@ impl ErrorProxy {
         if !self.terrain.is_active() {
             return 0.0;
         }
-        let pr = self.probe(key);
+        self.raw_from_probe(key, &self.probe(key))
+    }
+
+    /// [`ErrorProxy::raw_error_m`] from the key's probe.
+    fn raw_from_probe(&self, key: TileKey, pr: &Probe) -> f64 {
+        if !self.terrain.is_active() {
+            return 0.0;
+        }
         let range = pr.range();
-        let edited = self.edit_touch(key).any();
+        let edited = self.edit_floor && self.edit_touch(key).any();
         if edited && key.z < EDIT_MIN_ZOOM {
             return range;
         }

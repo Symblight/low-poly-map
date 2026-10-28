@@ -496,9 +496,9 @@ impl WorldStreamer {
         self.world.ground_height_at(local_x, local_z)
     }
 
-    /// Terrain detail (api 1.5): multiplies every terrain band's `max_error_m` by `scale`,
-    /// clamped to [0.25, `terrain.detail_scale_max`] (1 = the profile). Held terrain tiles are
-    /// re-meshed and re-delivered under the same keys, nearest first, at the re-delivery rate.
+    /// Terrain detail (api 1.5; since 1.10 the terrain cover's tau scale, `terrain.tau_px` x
+    /// `scale`), clamped to [0.25, `terrain.detail_scale_max`] (1 = the profile, 2 = coarser).
+    /// The cover follows through ordinary swaps; held terrain tiles are not re-delivered.
     /// Returns the scale in effect.
     #[func]
     fn set_terrain_detail(&mut self, scale: f64) -> f64 {

@@ -752,6 +752,7 @@ impl World {
                     self.terrain_detail = self.clamp_detail(self.terrain_detail);
                     let mut t = Scheduler::new_terrain(frame, self.profile.clone(), self.terrain.clone());
                     t.set_detail(self.terrain_detail);
+                    t.set_lod_view(&self.lod_view, self.lod_quality);
                     self.terrain_sched = Some(t);
                 }
                 self.worker = Some(w);
@@ -1188,12 +1189,14 @@ impl World {
         scale.clamp(TERRAIN_DETAIL_MIN, self.profile.terrain.detail_scale_max.max(TERRAIN_DETAIL_MIN))
     }
 
-    /// Contract `set_terrain_detail(scale)` (api 1.5): multiply every terrain band's
-    /// `max_error_m` by `scale`, clamped to `[0.25, terrain.detail_scale_max]` (1 = the profile).
-    /// Held terrain tiles are re-meshed and re-delivered under the same keys, nearest first, at
-    /// the re-delivery rate; the vector world is untouched. The scale is kept across
-    /// `configure_world` (re-clamped to the new profile). Non-finite input is ignored. Returns
-    /// the scale in effect.
+    /// Contract `set_terrain_detail(scale)` (api 1.5; meaning changed in 1.10, Terrain v2 G2):
+    /// the terrain cover's SSE threshold is `terrain.tau_px` x `scale`, clamped to
+    /// `[0.25, terrain.detail_scale_max]` (1 = the profile; 2 = coarser, fewer tiles). The cover
+    /// follows from the next `update_camera` through ordinary refines and coarsens (new keys,
+    /// fades, unloads); held terrain tiles are NOT re-meshed or re-delivered any more (a tile's
+    /// TIN uses its band's `max_error_m` at every scale). The vector world is untouched. The
+    /// scale is kept across `configure_world` (re-clamped to the new profile). Non-finite input
+    /// is ignored. Returns the scale in effect.
     pub fn set_terrain_detail(&mut self, scale: f64) -> f64 {
         if scale.is_finite() {
             self.terrain_detail = self.clamp_detail(scale);
@@ -1238,6 +1241,10 @@ impl World {
     fn apply_lod_view(&mut self) {
         if let Some(s) = &mut self.scheduler {
             s.set_lod_view(&self.lod_view, self.lod_quality);
+        }
+        // Terrain (G2): the SSE view, and the foundation guard from the vector edges.
+        if let Some(t) = &mut self.terrain_sched {
+            t.set_lod_view(&self.lod_view, self.lod_quality);
         }
     }
 

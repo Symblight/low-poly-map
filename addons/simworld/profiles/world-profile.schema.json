@@ -1393,10 +1393,16 @@
           "maximum": 200
         },
         "detail_scale_max": {
-          "description": "Upper bound of the runtime terrain detail scale (terrain-mesh phase); sizes the drape lift: lift(band) = largest max_error_m x detail_scale_max of the terrain bands within that band's reach.",
+          "description": "Upper bound of the runtime terrain detail scale (set_terrain_detail). Since api 1.10 (Terrain v2 G2) the scale multiplies terrain.tau_px: 2 = coarser terrain cover.",
           "type": "number",
           "minimum": 1,
           "maximum": 8
+        },
+        "tau_px": {
+          "description": "Screen-space error threshold (px) of the terrain layer's cover (Terrain v2 G2, api 1.10): a terrain tile refines when its error proxy would show more than tau_px x the set_terrain_detail scale pixels at its slant distance in the host's view (set_view); it coarsens at that / bands.hysteresis. A foundation guard still refines coarse tiles near buildings. The bands' edge_m no longer refine; the last edge stays the layer's outer limit.",
+          "type": "number",
+          "minimum": 0.5,
+          "maximum": 64
         },
         "skirt_m": {
           "description": "Skirt depth of terrain tiles, meters; 0 = automatic (terrain-mesh phase).",

@@ -519,13 +519,17 @@ const GOLDEN_TERRAIN_MESH: &[(&str, usize, u64)] = &[
 ];
 
 /// Golden terrain-layer cover for `COVER_CAMERAS` on the golden relief, then a tall-peak relief
-/// (amplitude 1200 m, ridges, peaks near 2 km) seen from 3000 m AGL.
+/// (amplitude 1200 m, ridges, peaks near 2 km) seen from 3000 m AGL. Regenerated 2026-10-28
+/// (Terrain v2 G2, api 1.10) for the intended change "the terrain cover refines by screen-space
+/// error" (`terrain.tau_px`, error proxy without edit floors, foundation guard, 2:1 balance): the low golden
+/// relief (120 m) holds far fewer tiles, the tall peaks far more; the TIN hashes above are
+/// unchanged.
 const GOLDEN_TERRAIN_LAYER_COVER: &[(&[usize], u64)] = &[
-    (&[28, 36, 108, 140, 101], 0x0ad674628ca4762d),
-    (&[36, 36, 100, 140, 100], 0x4c9258a8f3cc96e1),
-    (&[24, 44, 104, 144, 130], 0x2a26054e873e2b3e),
-    (&[0, 32, 100, 140, 128], 0x606dd9c7be01c641),
-    (&[4, 36, 108, 140, 128], 0x59c971a44de2df01),
+    (&[8, 20, 20, 48, 101], 0x2df0d8c81d2e9aa9),
+    (&[8, 16, 16, 48, 100], 0xbee2ccd02070c305),
+    (&[0, 12, 20, 48, 130], 0xc365cf6aa4595fc6),
+    (&[0, 0, 16, 48, 128], 0x0b994d3c0d1b91ad),
+    (&[516, 736, 908, 480, 128], 0xbd2b2be67d839825),
 ];
 
 #[test]
@@ -664,4 +668,43 @@ fn golden_seed_world_tiles() {
     assert_eq!(got, want, "seed golden tile hashes changed; new table:\n{table}");
     let want_t: Vec<(String, usize, u64)> = GOLDEN_SEED_TERRAIN.iter().map(|(k, r, h)| (k.to_string(), *r, *h)).collect();
     assert_eq!(got_t, want_t, "seed golden terrain hashes changed; new table:\n{ttable}");
+}
+
+/// Seed terrain cover (Terrain v2 G2): the terrain layer's SSE cover of the two-cities seed
+/// world after one `update` (tiles per terrain ring, hash of the sorted keys) for cameras
+/// over Vilnius, at EYKA and over the Baltic coast, 300 and 3000 m AGL. A pure function of
+/// camera, view and profile: two fresh schedulers give the same table.
+const GOLDEN_SEED_TERRAIN_COVER: &[(&[usize], u64)] = &[
+    (&[60, 72, 108, 88, 128], 0xd7dabd71fc1d0b55),
+    (&[36, 60, 108, 88, 128], 0xaa81df653f1ddec5),
+    (&[56, 72, 104, 96, 128], 0x712e2c3eeae11d01),
+    (&[44, 72, 104, 96, 128], 0x7b1a8f387fbb0fc9),
+    (&[32, 52, 64, 96, 129], 0xa4da94d2d884ddaf),
+    (&[24, 52, 60, 96, 133], 0x6110cb4d863cbbf5),
+];
+
+#[test]
+fn golden_seed_terrain_cover() {
+    let (p, t, _) = crate::seed::world::test_world();
+    let arc = std::sync::Arc::new(p.clone());
+    let spots = [(54.6872, 25.2797), (54.9639, 24.0848), (55.85, 21.06)];
+    let run = move || -> Vec<(Vec<usize>, u64)> {
+        let mut out = Vec::new();
+        for &(lat, lon) in &spots {
+            for alt in [300.0, 3000.0] {
+                let mut s = crate::scheduler::Scheduler::new_terrain(Frame::new(lat, lon), arc.clone(), t.clone());
+                out.push(terrain_cover_signature(&mut s, [0.0, 0.0, alt], [0.0; 3]));
+            }
+        }
+        out
+    };
+    let covers = run.clone()();
+    assert_eq!(covers, std::thread::spawn(run).join().unwrap(), "seed terrain cover depends on the run");
+    let ctable: String = covers.iter().map(|(c, h)| format!("    (&{c:?}, 0x{h:016x}),\n")).collect();
+    if std::env::var("SIMWORLD_UPDATE_GOLDEN").is_ok_and(|v| v == "1") {
+        println!("const GOLDEN_SEED_TERRAIN_COVER: &[(&[usize], u64)] = &[\n{ctable}];");
+        return;
+    }
+    let want: Vec<(Vec<usize>, u64)> = GOLDEN_SEED_TERRAIN_COVER.iter().map(|(c, h)| (c.to_vec(), *h)).collect();
+    assert_eq!(covers, want, "seed terrain golden cover changed; new table:\n{ctable}");
 }

@@ -110,6 +110,7 @@ use crate::latency::{Latency, Stage, TileTimes};
 use crate::mesher::MeshData;
 use crate::profile::Profile;
 use crate::rings::{above_horizon, children, horizon_line_m, look_ahead, Layer, LayerKind, ViewPoint, MAX_BOX_HEIGHT_M, MAX_RINGS, RING_COUNT};
+use crate::terrain::height::ErrorProxy;
 use crate::terrain::Terrain;
 use crate::jobs::Priority;
 use crate::worker::{DataRef, Job, Payload, WorkerMsg};
@@ -165,10 +166,26 @@ pub struct Scheduler {
     cam_view: Option<ViewPoint>,
     /// Stage latencies of fresh deliveries, per band.
     latency: Latency,
-    /// Terrain layer: detail scale of new jobs and its generation (bumped by
-    /// `set_terrain_detail`).
+    /// Terrain layer: `set_terrain_detail` scale (since G2 a multiplier of `terrain.tau_px`)
+    /// and the generation of the meshes the host holds (never bumped since G2: the TIN no longer
+    /// depends on the scale, so nothing is re-meshed).
     detail: f64,
     detail_gen: u32,
+    /// Terrain layer (G2): the pure per-key error proxy the cover refines by.
+    proxy: Option<ErrorProxy>,
+    /// Terrain layer: the host's view (`set_view`) and the refine distance per meter of error,
+    /// `H / (2 tan(fov_y / 2) tau_eff)` with tau_eff = `terrain.tau_px` x `detail`.
+    terrain_view: crate::rings::LodView,
+    sse_m_per_m: f64,
+    /// Terrain layer: foundation guard per ring (`terrain::foundation_guard_m`): a tile refines
+    /// inside this distance whatever its error.
+    guard_m: [f64; MAX_RINGS],
+    /// Terrain layer: this frame's target split set (SSE plan + 2:1 balance) and the roots in
+    /// the cover (reused buffers), and how many splits the balance added.
+    t_split: ahash::AHashSet<TileKey>,
+    t_roots: ahash::AHashSet<TileKey>,
+    t_work: Vec<TileKey>,
+    balance_forced: usize,
     /// Worker CPU per ring.
     cpu: CpuStats,
     /// Tiles v2 data tiles (archive sources only; `None` = every tile fetched on its own).
@@ -189,18 +206,59 @@ impl Scheduler {
     /// Vector layer: set the band edges from the host's view and the quality scale (contract
     /// `set_view` / `set_lod_quality`, api 1.10; [`rings::BandParams::edges_for`]). The next
     /// `update` uses them; the hysteresis, look-ahead clamp and fade gap follow the new edges.
-    /// No-op on the terrain layer (fixed bands until step G2).
+    /// Terrain layer (G2): the view of the SSE cover (`quality` is the vector layer's
+    /// `set_lod_quality` and does not apply; the terrain's scale is `set_detail`) and the
+    /// foundation guard from the vector edges of that view and quality.
     pub fn set_lod_view(&mut self, view: &crate::rings::LodView, quality: f64) {
-        if self.layer.kind == LayerKind::World {
-            let e = self.profile.bands().edges_for(view, quality);
-            self.layer.edge_m[..RING_COUNT].copy_from_slice(&e);
+        match self.layer.kind {
+            LayerKind::World => {
+                let e = self.profile.bands().edges_for(view, quality);
+                self.layer.edge_m[..RING_COUNT].copy_from_slice(&e);
+            }
+            LayerKind::Terrain => {
+                self.terrain_view = *view;
+                let b = self.profile.bands();
+                let edges = b.edges_for(view, quality);
+                self.guard_m = crate::terrain::foundation_guard_m(&self.profile.terrain.bands, &edges, b.hysteresis);
+                self.update_sse_scale();
+            }
         }
     }
 
-    /// The terrain-mesh layer of `profile` on `terrain` (active): no fetch stage, terrain jobs.
+    /// The terrain-mesh layer of `profile` on `terrain` (active): no fetch stage, terrain jobs,
+    /// the SSE cover at the default view and scale 1 (see [`Scheduler::set_lod_view`],
+    /// [`Scheduler::set_detail`]).
     pub fn new_terrain(frame: Frame, profile: Arc<Profile>, terrain: Terrain) -> Self {
         let layer = Layer::terrain(&profile.terrain, profile.bands());
-        Self::with_layer(frame, true, profile, layer).with_terrain(terrain)
+        let mut s = Self::with_layer(frame, true, profile, layer).with_terrain(terrain);
+        // TIN render path: no edit floors (see `ErrorProxy::without_edit_floor`).
+        s.proxy = Some(ErrorProxy::new(&s.terrain, s.layer.root_zoom).without_edit_floor());
+        s.set_lod_view(&crate::rings::LodView::default(), 1.0);
+        s
+    }
+
+    fn update_sse_scale(&mut self) {
+        let tau = self.profile.terrain.tau_px * self.detail;
+        self.sse_m_per_m = crate::rings::sse_refine_distance(1.0, &self.terrain_view, tau);
+    }
+
+    /// Terrain layer: the refine distance (m) of tile `k` of ring `ring` (> 0): the SSE refine
+    /// distance of its error proxy, at least the foundation guard. Pure in key, view, scale and
+    /// profile.
+    pub fn terrain_refine_m(&mut self, k: TileKey, ring: usize) -> f64 {
+        let e = self.terrain_error_m(k);
+        (e * self.sse_m_per_m).max(self.guard_m[ring])
+    }
+
+    /// Terrain layer: the error proxy of `k` (m; 0 on the vector layer). Memoized; the probe
+    /// is normally taken once with the tile's box ([`Scheduler::terrain_box_of`]).
+    pub fn terrain_error_m(&mut self, k: TileKey) -> f64 {
+        self.proxy.as_mut().map_or(0.0, |p| p.error_m(k))
+    }
+
+    /// Terrain layer: the foundation guard per ring (m).
+    pub fn foundation_guard(&self) -> [f64; MAX_RINGS] {
+        self.guard_m
     }
 
     fn with_layer(frame: Frame, synthetic: bool, profile: Arc<Profile>, layer: Layer) -> Self {
@@ -236,6 +294,14 @@ impl Scheduler {
             latency: Latency::default(),
             detail: 1.0,
             detail_gen: 0,
+            proxy: None,
+            terrain_view: crate::rings::LodView::default(),
+            sse_m_per_m: 0.0,
+            guard_m: [0.0; MAX_RINGS],
+            t_split: ahash::AHashSet::new(),
+            t_roots: ahash::AHashSet::new(),
+            t_work: Vec::new(),
+            balance_forced: 0,
             cpu: CpuStats::default(),
             data: None,
             data_needs: Vec::new(),
@@ -343,31 +409,17 @@ impl Scheduler {
         self.detail
     }
 
-    /// Terrain layer: mesh new jobs at `scale` times the bands' `max_error_m` (the caller clamps)
-    /// and re-mesh every tile the host holds, re-delivered under the same key (pending work is
-    /// restarted; hidden split parents are refreshed if they ever show again). Returns whether
-    /// anything changed (no-op on the vector layer and for the current scale).
+    /// Terrain layer (G2): the `set_terrain_detail` scale, a multiplier of `terrain.tau_px`
+    /// (the caller clamps; 2 = coarser cover). The cover follows from the next `update` through
+    /// the usual refines and coarsens; held tiles are not re-meshed (the TIN of a tile does not
+    /// depend on the scale). Returns whether anything changed (no-op on the vector layer and
+    /// for the current scale).
     pub fn set_detail(&mut self, scale: f64) -> bool {
         if self.layer.kind != LayerKind::Terrain || !scale.is_finite() || scale == self.detail {
             return false;
         }
         self.detail = scale;
-        self.detail_gen += 1;
-        let mut next = self.next_job;
-        for e in self.entries.values_mut() {
-            match e.state {
-                TileState::Decoding | TileState::Ready(_) | TileState::Fetched(_) => {
-                    // Built (or being built) at the old detail: orphan the result, build again.
-                    orphan_job(&mut self.cancelled, e);
-                    e.state = TileState::Queued;
-                    e.job = next;
-                    next += 1;
-                }
-                TileState::Idle if e.held && !e.split => e.state = TileState::Queued,
-                _ => {}
-            }
-        }
-        self.next_job = next;
+        self.update_sse_scale();
         true
     }
 
@@ -415,7 +467,15 @@ impl Scheduler {
         if self.terrain_cache.len() >= 8192 {
             self.terrain_cache.clear();
         }
-        let g = self.terrain.tile_range(k);
+        let g = match &mut self.proxy {
+            // Terrain layer: one probe for the box and the error proxy.
+            Some(p) => {
+                let pr = p.probe(k);
+                p.error_m_probed(k, &pr);
+                self.terrain.range_from_probe(pr.lo, pr.hi, pr.step)
+            }
+            None => self.terrain.tile_range(k),
+        };
         self.terrain_cache.insert(k, g);
         g
     }
@@ -509,6 +569,9 @@ impl Scheduler {
                 self.stack.push((k, default_h, false));
             }
         }
+        if kind == LayerKind::Terrain {
+            self.plan_terrain_splits(&views, &grounds);
+        }
         while let Some((k, inherited_h, frozen)) = self.stack.pop() {
             let Some(ring) = l.ring_for_zoom(k.z) else { continue };
             if frozen {
@@ -532,7 +595,8 @@ impl Scheduler {
                 && children(k).iter().any(|c| self.entries.get(c).is_some_and(|e| e.split));
             // Horizon cull of whole sibling groups: split only while one of the 4 children is
             // above the horizon (seen from the finer band's look-ahead point).
-            let group_visible = ring == 0 || l.horizon_margin_m.is_none() || {
+            // (Terrain: decided by the plan, `plan_terrain_splits`.)
+            let group_visible = ring == 0 || kind == LayerKind::Terrain || l.horizon_margin_m.is_none() || {
                 let current = self.entries.get(&k).is_some_and(|e| e.split);
                 let mut any = false;
                 for c in children(k) {
@@ -547,8 +611,16 @@ impl Scheduler {
             let mut orphan = false;
             let mut cancel: Option<u64> = None;
             let mut retarget: Option<bool> = None;
+            // Refine distance: the band edge (vector layer) or the tile's SSE distance (terrain).
+            let refine_m = match (ring, kind) {
+                (0, _) => 0.0,
+                (_, LayerKind::World) => l.edge_m[ring - 1],
+                (_, LayerKind::Terrain) => self.terrain_refine_m(k, ring),
+            };
+            let planned = kind == LayerKind::Terrain && ring > 0 && self.t_split.contains(&k);
             let (split, freeze, h) = {
                 let e = self.touch(k, ring);
+                e.refine_m = refine_m;
                 e.frozen = false;
                 let h = e.height.map_or(inherited_h, |h| h as f64);
                 e.box_h = h;
@@ -556,7 +628,10 @@ impl Scheduler {
                 e.prio_m = views[ring].slant_box_m(k, lo, hi);
                 e.cam_d = cam_view.slant_box_m(k, lo, hi);
                 e.split_d = if ring > 0 { views[ring - 1].slant_box_m(k, lo, hi) } else { 0.0 };
-                let want = ring > 0 && group_visible && l.inside(e.split_d, l.edge_m[ring - 1], e.split);
+                let want = match kind {
+                    LayerKind::World => ring > 0 && group_visible && l.inside(e.split_d, refine_m, e.split),
+                    LayerKind::Terrain => planned,
+                };
                 let mut freeze = false;
                 if want {
                     if e.coarsening {
@@ -695,6 +770,89 @@ impl Scheduler {
         self.dispatch(jobs);
     }
 
+    /// Terrain layer: the target split set of this frame (`t_split`), before the stateful pass.
+    ///
+    /// 1. SSE plan from the roots in the cover (`self.stack`): a node of ring > 0 splits when
+    ///    its slant distance from the finer ring's look-ahead point is inside its refine distance
+    ///    ([`Scheduler::terrain_refine_m`], with the hysteresis of its current state) and one of
+    ///    its children is above the horizon (whole sibling groups).
+    /// 2. 2:1 balance: wherever a split node's edge neighbour (same zoom) is not in the tree,
+    ///    the neighbour's parent is split too, until nothing changes (the least balanced
+    ///    superset: unique, independent of the order). So two terrain leaves that share an edge
+    ///    differ by at most one zoom, as with the 1.7 distance bands: the skirts (sized for the
+    ///    next coarser band, contract 9a) close every seam. Neighbours whose root is outside the
+    ///    cover are skipped.
+    fn plan_terrain_splits(&mut self, views: &[ViewPoint; MAX_RINGS], grounds: &[f64; MAX_RINGS]) {
+        let l = self.layer;
+        let mut split = std::mem::take(&mut self.t_split);
+        let mut roots = std::mem::take(&mut self.t_roots);
+        let mut work = std::mem::take(&mut self.t_work);
+        split.clear();
+        roots.clear();
+        work.clear();
+        roots.extend(self.stack.iter().map(|s| s.0));
+        work.extend(self.stack.iter().map(|s| s.0));
+        while let Some(k) = work.pop() {
+            let Some(ring) = l.ring_for_zoom(k.z) else { continue };
+            if ring == 0 {
+                continue;
+            }
+            let current = self.entries.get(&k).is_some_and(|e| e.split);
+            let group_visible = l.horizon_margin_m.is_none() || {
+                let mut any = false;
+                for c in children(k) {
+                    let g = self.terrain_box_of(c);
+                    if self.horizon_ok(&views[ring - 1], grounds[ring - 1], c, g, current) {
+                        any = true;
+                        break;
+                    }
+                }
+                any
+            };
+            if !group_visible {
+                continue;
+            }
+            let g = self.terrain_box_of(k);
+            let d = views[ring - 1].slant_box_m(k, g[0], g[1]);
+            let refine = self.terrain_refine_m(k, ring);
+            if l.inside(d, refine, current) {
+                split.insert(k);
+                work.extend(children(k));
+            }
+        }
+        // 2:1 balance (closure).
+        let planned = split.len();
+        work.extend(split.iter().copied());
+        while let Some(c) = work.pop() {
+            let n = 1i64 << c.z;
+            for (dx, dy) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)] {
+                let (x, y) = (c.x as i64 + dx, c.y as i64 + dy);
+                if x < 0 || y < 0 || x >= n || y >= n {
+                    continue;
+                }
+                let nb = TileKey::new(c.z, x as u32, y as u32);
+                if c.z == l.root_zoom {
+                    continue; // a root neighbour is in the cover or beyond its reach
+                }
+                let p = TileKey::new(c.z - 1, nb.x / 2, nb.y / 2);
+                if split.contains(&p) || (p.z == l.root_zoom && !roots.contains(&p)) {
+                    continue;
+                }
+                split.insert(p);
+                work.push(p);
+            }
+        }
+        self.balance_forced = split.len() - planned;
+        self.t_split = split;
+        self.t_roots = roots;
+        self.t_work = work;
+    }
+
+    /// Terrain layer: splits the 2:1 balance added to the SSE plan in the last `update`.
+    pub fn balance_forced(&self) -> usize {
+        self.balance_forced
+    }
+
     fn update_light_mode(&mut self, agl: f64) {
         let (on, off) = (self.profile.lights.cluster_on_agl_m, self.profile.lights.cluster_off_agl_m);
         let want = if agl > on {
@@ -805,7 +963,8 @@ impl Scheduler {
                 self.decode_inflight[ring] += 1;
                 match self.layer.kind {
                     LayerKind::World => jobs.push(Job::Decode { key, ring, job: e.job, payload }),
-                    LayerKind::Terrain => jobs.push(Job::Terrain { key, ring, job: e.job, detail: self.detail }),
+                    // The TIN tolerance is the band's `max_error_m` (detail 1) since G2.
+                    LayerKind::Terrain => jobs.push(Job::Terrain { key, ring, job: e.job, detail: 1.0 }),
                 }
             } else {
                 if self.fetch_inflight[ring] >= max_fetch {
@@ -930,14 +1089,8 @@ impl Scheduler {
                         e.attempts = 0;
                         e.decode_failures = 0;
                         e.height = Some(data.max_height);
-                        // The delivered surface replaces the 9 x 9 estimate where it is wider
-                        // (never narrower: a tighter box would only churn the cover). The TIN
-                        // is within `max_error` of the height function.
-                        if let Some(t) = &data.terrain {
-                            let err = t.max_error as f64;
-                            e.terrain_box[0] = e.terrain_box[0].min(t.h_min as f64 - err);
-                            e.terrain_box[1] = e.terrain_box[1].max(t.h_max as f64 + err);
-                        }
+                        // Terrain tiles keep their 9 x 9 box (G2): widening it by the delivered
+                        // TIN (as until 1.7) made the cover depend on which tiles were built.
                         e.times.ready = Some(now);
                         e.times.cpu_us = data.cpu_us;
                         e.state = TileState::Ready(Box::new(data));
@@ -1094,7 +1247,9 @@ impl Scheduler {
         let (entries, cam, layer, cap) = (&self.entries, &self.cam_view, &self.layer, self.fade_cap);
         for (k, f) in self.fades.iter_mut() {
             let (Some(e), Some(v)) = (entries.get(k), cam) else { continue };
-            if f.advance(v.slant_box_m(*k, e.terrain_box[0], e.terrain_box[1] + e.box_h), fade_gap_m(layer, e.ring), now, cap) {
+            // Terrain (G2): the gap of the tile's own refine distance.
+            let gap = if layer.kind == LayerKind::Terrain { e.refine_m * (layer.hysteresis - 1.0) } else { fade_gap_m(layer, e.ring) };
+            if f.advance(v.slant_box_m(*k, e.terrain_box[0], e.terrain_box[1] + e.box_h), gap, now, cap) {
                 done.push((*k, f.refine));
             }
         }

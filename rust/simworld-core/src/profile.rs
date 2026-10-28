@@ -40,6 +40,11 @@ use crate::rings::{BandParams, RING_COUNT};
 /// `default.json`, the JSON Schema and `CHANGELOG.md`).
 pub const PROFILE_VERSION: u32 = 7;
 
+/// Default `terrain.tau_px` (Terrain v2 G2): calibrated so the default view (60 deg, 1080 px)
+/// over the default relief (amplitude 450 m) holds about as many terrain tiles as the fixed
+/// T0..T4 bands did (`scheduler::tests::terrain_cover_counts`).
+pub const TERRAIN_TAU_PX_DEFAULT: f64 = 0.9;
+
 // ---------------------------------------------------------------------------------------------
 // Data tree
 
@@ -561,8 +566,16 @@ pub struct TerrainProfile {
     pub water_snap_m: f64,
     /// Max edge length of draped ground geometry where the surface is not flat (m).
     pub drape_step_m: f64,
-    /// Upper bound of the runtime terrain detail scale (`set_terrain_detail`); sizes the drape lift.
+    /// Upper bound of the runtime terrain detail scale (`set_terrain_detail`, since G2 a
+    /// multiplier of `tau_px`: 2 = coarser cover).
     pub detail_scale_max: f64,
+    /// Screen-space error threshold (px) of the terrain layer's cover (Terrain v2 G2): a terrain
+    /// tile refines when its error proxy (`terrain::height::ErrorProxy`) would show more than
+    /// `tau_px` x the `set_terrain_detail` scale pixels at its slant distance in the host's view
+    /// (`set_view`), and coarsens again at that / `bands.hysteresis`. The terrain bands'
+    /// `edge_m` no longer refine (the last one stays the layer's outer limit; every edge still
+    /// sizes the ring's look-ahead clamp).
+    pub tau_px: f64,
     /// Skirt depth of terrain tiles (m; 0 = automatic: `2 * max_error_m * detail + 1`, at most 60).
     pub skirt_m: f64,
     /// Terrain mesh shading (smooth adds a NORMAL array).
@@ -587,7 +600,9 @@ pub struct TerrainProfile {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct TerrainBand {
-    /// Outer slant-distance edge (m); strictly increasing over the array.
+    /// Outer slant-distance edge (m); strictly increasing over the array. Since api 1.10 (G2)
+    /// only the last one acts on the cover (the terrain layer's outer limit); every edge still
+    /// sizes its ring's look-ahead clamp. The terrain cover refines by `terrain.tau_px`.
     pub edge_m: f64,
     /// Max vertical error of the terrain mesh (m): the low-poly knob.
     pub max_error_m: f64,
@@ -1255,6 +1270,7 @@ impl Default for TerrainProfile {
             water_snap_m: 0.0,
             drape_step_m: 25.0,
             detail_scale_max: 2.0,
+            tau_px: TERRAIN_TAU_PX_DEFAULT,
             skirt_m: 0.0,
             shading: TerrainShading::Flat,
             horizon_cull: true,
@@ -1374,6 +1390,7 @@ pub const RANGES: &[(&str, f64, f64)] = &[
     ("terrain.water_snap_m", 0.0, 200.0),
     ("terrain.drape_step_m", 5.0, 200.0),
     ("terrain.detail_scale_max", 1.0, 8.0),
+    ("terrain.tau_px", 0.5, 64.0),
     ("terrain.skirt_m", 0.0, 200.0),
     ("terrain.horizon_margin_m", 0.0, 50_000.0),
     ("terrain.max_fetch", 1.0, 16.0),

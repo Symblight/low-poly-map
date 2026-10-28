@@ -127,6 +127,9 @@ pub struct Entry {
     /// Slant distance (m) of the box from the finer band's look-ahead point (split decision;
     /// 0 for R0).
     pub split_d: f64,
+    /// Refine distance (m) used this frame: the band edge of the next finer ring (vector layer)
+    /// or the tile's SSE refine distance (terrain layer, G2); 0 for ring 0.
+    pub refine_m: f64,
     /// Box height (m) used this frame (own, or inherited while unknown).
     pub box_h: f64,
     /// Terrain [min, max] under the tile (m above MSL; `Terrain::tile_range`, computed once when
@@ -214,6 +217,7 @@ impl Entry {
             coarsening: false,
             frozen: false,
             split_d: 0.0,
+            refine_m: 0.0,
             box_h,
             terrain_box: [0.0, 0.0],
             rect,

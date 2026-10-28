@@ -35,7 +35,7 @@ pub mod tin;
 pub use sample::PatchSampler;
 
 use crate::geo::TileKey;
-use crate::profile::TerrainProfile;
+use crate::profile::{TerrainBand, TerrainProfile};
 use crate::rings::RING_COUNT;
 
 /// Sphere radius of the noise domain (mean Earth radius, m). Not a geodesy constant: it only
@@ -445,6 +445,15 @@ impl Terrain {
                 }
             }
         }
+        self.range_from_probe(lo, hi, step)
+    }
+
+    /// [`Terrain::tile_range`] from its 9 x 9 probe (`lo`, `hi`, largest neighbour step), e.g.
+    /// [`height::ErrorProxy::probe`] (the same lattice): bit-identical to `tile_range`.
+    pub fn range_from_probe(&self, lo: f64, hi: f64, step: f64) -> [f64; 2] {
+        if !self.active {
+            return [0.0, 0.0];
+        }
         let pad = 0.5 * step;
         [(lo - pad).max(self.bounds[0]), (hi + pad).min(self.bounds[1])]
     }
@@ -486,6 +495,29 @@ pub struct DrapeReference {
 /// foundations R0 3, R1 7, R2 17, R3 41 m.
 pub const DRAPE_REFERENCE: DrapeReference =
     DrapeReference { margin_m: [0.125, 0.375, 1.0, 2.5], foundation_m: [3.0, 7.0, 17.0, 41.0] };
+
+/// Foundation guard of the terrain layer's SSE cover (Terrain v2 G2): per terrain ring, the
+/// slant distance (m) inside which a tile of that ring must refine whatever its screen-space
+/// error, so the terrain mesh under a building never sinks deeper than the frozen foundation
+/// ([`DRAPE_REFERENCE`]). A terrain tile of ring r has a TIN error of at most
+/// `bands[r].max_error_m` and lies at most twice that under the height function (contract 9a),
+/// while a foundation of depth F covers `(F - 1) / 2` of error (the 1.7 rule `F = 2 e + 1`).
+/// So ring r may not show inside the reach (`edge x hysteresis`) of any vector band whose
+/// allowance is below its error: the guard is the largest such reach (0 = no guard). This is
+/// the 1.7 `band_error_rule` read the other way round (box distances, the same approximation).
+/// `vector_edges` = the vector layer's live edges (R0..R3). Ring 0 never refines (entry 0).
+pub fn foundation_guard_m(bands: &[TerrainBand], vector_edges: &[f64; RING_COUNT], hysteresis: f64) -> [f64; crate::rings::MAX_RINGS] {
+    let mut g = [0.0; crate::rings::MAX_RINGS];
+    for (r, b) in bands.iter().enumerate().take(crate::rings::MAX_RINGS).skip(1) {
+        for (i, &edge) in vector_edges.iter().enumerate() {
+            let allowance = (DRAPE_REFERENCE.foundation_m[i] as f64 - 1.0) * 0.5;
+            if b.max_error_m > allowance {
+                g[r] = f64::max(g[r], edge * hysteresis);
+            }
+        }
+    }
+    g
+}
 
 /// The 1.7 derivation of [`DRAPE_REFERENCE`] from live profile data, kept only so a test can show
 /// that the frozen table equals it at the default profile (provenance). Not used by the library.

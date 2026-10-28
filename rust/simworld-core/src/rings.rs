@@ -22,6 +22,8 @@
 
 use crate::geo::{lat_to_tile_y, lon_to_tile_x, TileKey, MERCATOR_CIRCUMFERENCE};
 
+pub use crate::cover_budget::estimate_cover_tiles;
+
 /// Structural (tileset contract, not tuning): 4 bands over zooms 13..16.
 pub const RING_COUNT: usize = 4;
 /// Coarsest zoom (R3); tiles of this zoom are the roots of the cover.
@@ -322,6 +324,10 @@ pub struct BandParams {
     pub look_ahead_clamp: f64,
     /// Box height (m) of a tile whose own and ancestors' heights are still unknown.
     pub default_tile_height_m: f64,
+    /// Tile budget of the cover (`lod.max_tiles`; 0 = no cap): when the estimated cover of a
+    /// view and quality ([`estimate_cover_tiles`]) exceeds it, tau rises until it fits
+    /// ([`BandParams::capped_quality`]).
+    pub max_tiles: f64,
 }
 
 impl BandParams {

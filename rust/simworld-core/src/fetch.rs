@@ -459,6 +459,8 @@ enum Cmd {
     /// Read / write one `meta` key (the archive's data levels).
     GetMeta(&'static str, tokio::sync::oneshot::Sender<Option<String>>),
     SetMeta(&'static str, String),
+    /// Whether any tile is cached (offline level inference).
+    HasTiles(tokio::sync::oneshot::Sender<bool>),
     Clear,
     Flush(crossbeam_channel::Sender<()>),
     /// Flush, checkpoint, close the file and end the thread; reply when done (if asked).
@@ -567,6 +569,15 @@ impl DiskCache {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.tx.send(Cmd::GetMeta(k, tx)).ok()?;
         rx.await.ok().flatten()
+    }
+
+    /// Whether the cache holds any tile (pending writes included).
+    pub async fn has_tiles(&self) -> bool {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.tx.send(Cmd::HasTiles(tx)).is_err() {
+            return false;
+        }
+        rx.await.unwrap_or(false)
     }
 
     /// Set a value of the `meta` table (fire and forget).
@@ -752,6 +763,12 @@ impl CacheThread {
                 use rusqlite::OptionalExtension;
                 let v = self.conn.as_ref().and_then(|c| c.query_row("SELECT v FROM meta WHERE k = ?1", [k], |r| r.get(0)).optional().ok().flatten());
                 let _ = reply.send(v);
+            }
+            Cmd::HasTiles(reply) => {
+                use rusqlite::OptionalExtension;
+                let stored = !self.pending.is_empty()
+                    || self.conn.as_ref().is_some_and(|c| c.query_row("SELECT 1 FROM tiles LIMIT 1", [], |_| Ok(())).optional().ok().flatten().is_some());
+                let _ = reply.send(stored);
             }
             Cmd::SetMeta(k, v) => {
                 if let Some(c) = self.conn.as_ref() {
@@ -1306,9 +1323,18 @@ impl Fetcher {
     }
 
     /// The data levels recorded by an earlier session in the disk cache (offline start).
+    ///
+    /// A cache written before api 1.11 has no `levels` row; its tiles come from a
+    /// compatibility archive (the only kind those libraries accepted). Since 1.11 the row is
+    /// written before the first tile of a source (the archive must be open to fetch one), so
+    /// tiles without the row mean a pre-1.11 cache: reported as [`DataLevels::COMPAT`], so an
+    /// offline start on it still renders the cached tiles (review H1).
     pub async fn cached_levels(&self) -> Option<DataLevels> {
         let d = self.disk().await?;
-        parse_levels(&d.get_meta("levels").await?)
+        if let Some(v) = d.get_meta("levels").await {
+            return parse_levels(&v);
+        }
+        d.has_tiles().await.then_some(DataLevels::COMPAT)
     }
 
     /// Minimum wait before re-opening an archive that failed to open.

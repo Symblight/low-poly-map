@@ -102,6 +102,10 @@ pub struct Bands {
 pub struct Lod {
     /// SSE threshold (px) at quality 1.
     pub tau_px: f64,
+    /// Tile budget of the vector cover (estimated tiles, all rings; 0 = no cap): a view or
+    /// quality whose cover would exceed it runs with a higher tau (`rings::BandParams::
+    /// capped_quality`; review M1). The default view needs about 450.
+    pub max_tiles: u32,
     /// Geometric error per coarse level (m): what is lost when that chunk is not refined.
     pub error_m: LodErrors,
     /// Rear-hemisphere tau multiplier (stored; used from step T4).
@@ -476,7 +480,9 @@ pub struct LanduseFallback {
 pub struct Streaming {
     /// Fetches in flight per band.
     pub max_fetch_per_band: u32,
-    /// Mesh (decode) jobs in flight per band.
+    /// Mesh (decode) jobs in flight per band. Default 8 since review M2 (was 2: results come
+    /// back a frame later, so a band built at most ~2 chunks per frame and a cold fill of ~250
+    /// R3 chunks took ~2 s at 60 Hz although every data tile was resident after 0.2 s).
     pub max_mesh_per_band: u32,
     /// Light-mode re-deliveries per frame.
     pub redeliveries_per_frame: u32,
@@ -525,6 +531,9 @@ pub struct Cache {
 pub struct Memory {
     /// Budget (MiB).
     pub budget_mb: f64,
+    /// A decoded data tile no tile of the cover maps to is dropped after this long (s; review
+    /// M3). 0 = at once. The budget still evicts by priority on top.
+    pub data_idle_s: f64,
 }
 
 /// Procedural terrain (profile_version 5). Heights come from a seeded function
@@ -576,6 +585,10 @@ pub struct TerrainProfile {
     /// `edge_m` no longer refine (the last one stays the layer's outer limit; every edge still
     /// sizes the ring's look-ahead clamp).
     pub tau_px: f64,
+    /// Tile budget of the terrain cover (leaves; 0 = no cap; review M1): over it the plan
+    /// skips the splits with the smallest screen error (the foundation guard's never, the 2:1
+    /// balance may add a few on top).
+    pub max_tiles: u32,
     /// Skirt depth of terrain tiles (m; 0 = automatic: `2 * max_error_m * detail + 1`, at most 60).
     pub skirt_m: f64,
     /// Terrain mesh shading (smooth adds a NORMAL array).
@@ -865,7 +878,7 @@ impl Default for Lod {
     /// 7000.0 at the default view (1080 px, 60 deg): the default cover is the old one bit for bit
     /// (2.566 / 10.69 / 29.94 rounded would move the R2 edge by 0.78 m and change the golden cover).
     fn default() -> Self {
-        Self { tau_px: 4.0, error_m: LodErrors::default(), rear_tau_scale: 2.0, adaptive: LodAdaptive::default() }
+        Self { tau_px: 4.0, max_tiles: 1000, error_m: LodErrors::default(), rear_tau_scale: 2.0, adaptive: LodAdaptive::default() }
     }
 }
 
@@ -1222,7 +1235,7 @@ impl Default for LanduseFallback {
 
 impl Default for Streaming {
     fn default() -> Self {
-        Self { max_fetch_per_band: 4, max_mesh_per_band: 2, redeliveries_per_frame: 1, retry_base_s: 0.5, retry_max_s: 30.0 }
+        Self { max_fetch_per_band: 4, max_mesh_per_band: 8, redeliveries_per_frame: 1, retry_base_s: 0.5, retry_max_s: 30.0 }
     }
 }
 
@@ -1246,7 +1259,7 @@ impl Default for Cache {
 
 impl Default for Memory {
     fn default() -> Self {
-        Self { budget_mb: 512.0 }
+        Self { budget_mb: 512.0, data_idle_s: 20.0 }
     }
 }
 
@@ -1271,6 +1284,7 @@ impl Default for TerrainProfile {
             drape_step_m: 25.0,
             detail_scale_max: 2.0,
             tau_px: TERRAIN_TAU_PX_DEFAULT,
+            max_tiles: 1500,
             skirt_m: 0.0,
             shading: TerrainShading::Flat,
             horizon_cull: true,
@@ -1304,6 +1318,7 @@ pub const RANGES: &[(&str, f64, f64)] = &[
     ("bands.look_ahead_clamp", 0.0, 1.0),
     ("bands.default_tile_height_m", 0.0, 400.0),
     ("lod.tau_px", 0.5, 64.0),
+    ("lod.max_tiles", 0.0, 1_000_000.0),
     ("lod.error_m.*", 0.01, 1000.0),
     ("lod.rear_tau_scale", 1.0, 16.0),
     ("lod.adaptive.frame_budget_ms", 1.0, 1000.0),
@@ -1375,6 +1390,7 @@ pub const RANGES: &[(&str, f64, f64)] = &[
     ("cache.open_retry_s", 0.0, 3600.0),
     ("cache.validate_retry_s", 1.0, 86_400.0),
     ("memory.budget_mb", 32.0, 65_536.0),
+    ("memory.data_idle_s", 0.0, 3600.0),
     ("terrain.seed", 0.0, 4_294_967_295.0),
     ("terrain.amplitude_m", 0.0, 3000.0),
     ("terrain.feature_size_m", 200.0, 200_000.0),
@@ -1391,6 +1407,7 @@ pub const RANGES: &[(&str, f64, f64)] = &[
     ("terrain.drape_step_m", 5.0, 200.0),
     ("terrain.detail_scale_max", 1.0, 8.0),
     ("terrain.tau_px", 0.5, 64.0),
+    ("terrain.max_tiles", 0.0, 1_000_000.0),
     ("terrain.skirt_m", 0.0, 200.0),
     ("terrain.horizon_margin_m", 0.0, 50_000.0),
     ("terrain.max_fetch", 1.0, 16.0),
@@ -1862,6 +1879,7 @@ impl Profile {
                     look_ahead_s: b.look_ahead_s,
                     look_ahead_clamp: b.look_ahead_clamp,
                     default_tile_height_m: b.default_tile_height_m,
+                    max_tiles: lod.max_tiles as f64,
                 };
                 bp.edge_m = bp.edges_for(&crate::rings::LodView::default(), 1.0);
                 bp
@@ -2010,6 +2028,11 @@ impl Profile {
         let max_ms = (s.retry_max_s * 1000.0).round() as u64;
         let ms = base_ms.saturating_mul(1u64 << attempts.saturating_sub(1).min(6));
         std::time::Duration::from_millis(ms.min(max_ms))
+    }
+
+    /// Idle time after which an unneeded decoded data tile is dropped (`memory.data_idle_s`).
+    pub fn data_idle(&self) -> std::time::Duration {
+        std::time::Duration::from_secs_f64(self.world.memory.data_idle_s)
     }
 }
 
@@ -2307,7 +2330,7 @@ mod tests {
         assert_eq!(p.cluster_cell_m(), 100.0f32);
         let w = p.world();
         assert_eq!((w.lights.cluster_on_agl_m, w.lights.cluster_off_agl_m), (3300.0, 2700.0));
-        assert_eq!((w.streaming.max_fetch_per_band, w.streaming.max_mesh_per_band, w.streaming.redeliveries_per_frame), (4, 2, 1));
+        assert_eq!((w.streaming.max_fetch_per_band, w.streaming.max_mesh_per_band, w.streaming.redeliveries_per_frame), (4, 8, 1));
         assert_eq!(w.fades.cap_s, 0.75);
         assert_eq!(w.origin.recenter_distance_m, 5000.0);
         assert_eq!((w.cache.cap_mb * 1024.0 * 1024.0) as u64, 300 * 1024 * 1024);

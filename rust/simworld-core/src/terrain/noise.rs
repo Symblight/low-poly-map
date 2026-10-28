@@ -44,7 +44,10 @@ pub fn value3(p: [f64; 3], seed: u64) -> f64 {
 
 /// Per-octave seed and lattice offset (the offsets keep the octaves' lattice planes apart, so
 /// their flat spots at lattice points never line up).
+/// The literals are pinned by the height goldens: they are not meant as pi / 10 and pi / 4 (the
+/// lint's guess), and swapping in `FRAC_PI_4` would change the last bits of every height.
 #[inline]
+#[allow(clippy::approx_constant)]
 fn octave(seed: u64, o: u32) -> (u64, [f64; 3]) {
     let s = splitmix64(seed ^ (o as u64 + 1).wrapping_mul(0xD1B5_4A32_D192_ED03));
     let k = (o + 1) as f64;

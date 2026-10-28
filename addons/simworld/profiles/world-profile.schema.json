@@ -58,6 +58,12 @@
           "minimum": 0.5,
           "maximum": 64
         },
+        "max_tiles": {
+          "description": "Tile budget of the vector cover (estimated tiles over all four bands on flat ground; 0 = no cap). When the cover of the current view (set_view) and quality (set_lod_quality) would exceed it, tau_eff rises until it fits, so a narrow field of view or a tall viewport cannot multiply the tile count without bound. The default view needs about 450 tiles, fov 30 deg about 860, fov 15 deg would need about 1970.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
         "error_m": {
           "description": "Geometric error per coarse level, meters: what is lost when a chunk of that ring is not refined to the next finer one (r1 = the R1 chunk against R0). Strictly increasing r1 < r2 < r3.",
           "type": "object",
@@ -1192,7 +1198,7 @@
           "maximum": 64
         },
         "max_mesh_per_band": {
-          "description": "Decode and mesh jobs in flight per band (count).",
+          "description": "Decode and mesh jobs in flight per band (count). Default 8 (2 before api 1.11: results come back a frame later, so 2 capped a band at about 2 tiles per frame and a cold start of ~250 R3 chunks took ~2 s at 60 Hz). The jobs share one priority-ordered worker pool; lower it to bound queued work on a slow device.",
           "type": "integer",
           "minimum": 1,
           "maximum": 64
@@ -1296,6 +1302,12 @@
           "type": "number",
           "minimum": 32,
           "maximum": 65536
+        },
+        "data_idle_s": {
+          "description": "Seconds after which a decoded data tile that no tile of the cover maps to (held, wanted, split or frozen) is dropped from memory (0 = at once). Keeps the data_tiles pool at the cover's working set on long flights instead of growing to the budget; the budget still evicts by priority on top. Default 20.",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 3600
         }
       },
       "additionalProperties": false
@@ -1403,6 +1415,12 @@
           "type": "number",
           "minimum": 0.5,
           "maximum": 64
+        },
+        "max_tiles": {
+          "description": "Tile budget of the terrain cover (leaf tiles; 0 = no cap). Over it the cover skips the splits with the smallest screen-space error; the foundation guard's splits are always kept and the 2:1 balance may add a few on top. The default relief at 60 deg holds about 370 tiles, at 30 deg about 920; fov 15 deg (about 2530), set_terrain_detail 0.25 (about 2220) or a 1200 m relief at 30 deg (about 3770) are capped.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
         },
         "skirt_m": {
           "description": "Skirt depth of terrain tiles, meters; 0 = automatic (terrain-mesh phase).",

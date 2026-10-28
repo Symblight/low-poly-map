@@ -216,8 +216,8 @@ const DT: f64 = 1.0 / 30.0;
 
 /// One harness frame in contract order: update -> poll_ready(2) -> poll_fades ->
 /// poll_unload, applied to the simulated Godot side. Returns (delivered, unloaded).
-struct Harness {
-    s: Scheduler,
+pub(super) struct Harness {
+    pub(super) s: Scheduler,
     w: FakeWorker,
     /// Memory budget of the data tiles (Tiles v2 tests; synced like `World` does).
     mem: Option<crate::budget::MemoryBudget>,
@@ -556,7 +556,7 @@ impl Harness {
         !self.g.present(self.root_of(p))
     }
 
-    fn settle(&mut self, cam: [f64; 3], max_frames: usize) -> usize {
+    pub(super) fn settle(&mut self, cam: [f64; 3], max_frames: usize) -> usize {
         for i in 0..max_frames {
             let (_, un) = self.frame(cam, [0.0; 3]);
             self.check_frame(&un, "settle");
@@ -1565,7 +1565,7 @@ fn ground_draw_order_is_bottom_level_first() {
 
 // ---- Terrain layer (api 1.5) ---------------------------------------------------------
 
-fn terrain_setup(f: impl FnOnce(&mut crate::profile::TerrainProfile)) -> (Arc<Profile>, Terrain) {
+pub(super) fn terrain_setup(f: impl FnOnce(&mut crate::profile::TerrainProfile)) -> (Arc<Profile>, Terrain) {
     let mut w = crate::profile::WorldProfile::default();
     w.terrain.enabled = true;
     f(&mut w.terrain);
@@ -1574,7 +1574,7 @@ fn terrain_setup(f: impl FnOnce(&mut crate::profile::TerrainProfile)) -> (Arc<Pr
     (Arc::new(p), t)
 }
 
-fn terrain_harness(p: Arc<Profile>, t: Terrain) -> Harness {
+pub(super) fn terrain_harness(p: Arc<Profile>, t: Terrain) -> Harness {
     let mut h = Harness::new();
     h.s = Scheduler::new_terrain(Frame::new(VILNIUS.0, VILNIUS.1), p, t);
     h.l = *h.s.layer();

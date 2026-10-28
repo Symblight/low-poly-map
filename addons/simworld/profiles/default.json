@@ -9,6 +9,7 @@
   },
   "lod": {
     "tau_px": 4.0,
+    "max_tiles": 1000,
     "error_m": { "r1": 2.5660011963983367, "r2": 10.691671651659735, "r3": 29.93668062464726 },
     "rear_tau_scale": 2.0,
     "adaptive": { "enabled": true, "frame_budget_ms": 33.3, "min_scale": 0.5, "max_scale": 3.0, "smoothing_s": 2.0 }
@@ -221,7 +222,7 @@
   },
   "streaming": {
     "max_fetch_per_band": 4,
-    "max_mesh_per_band": 2,
+    "max_mesh_per_band": 8,
     "redeliveries_per_frame": 1,
     "retry_base_s": 0.5,
     "retry_max_s": 30.0
@@ -241,7 +242,8 @@
     "validate_retry_s": 30.0
   },
   "memory": {
-    "budget_mb": 512.0
+    "budget_mb": 512.0,
+    "data_idle_s": 20.0
   },
   "terrain": {
     "enabled": false,
@@ -261,6 +263,7 @@
     "drape_step_m": 25.0,
     "detail_scale_max": 2.0,
     "tau_px": 0.9,
+    "max_tiles": 1500,
     "skirt_m": 0.0,
     "shading": "flat",
     "horizon_cull": true,

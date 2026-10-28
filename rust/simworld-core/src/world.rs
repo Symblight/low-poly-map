@@ -44,6 +44,8 @@ use crate::terrain::Terrain;
 use crate::status::{Health, Status, StatusState, MSG_NOT_CONFIGURED, MSG_SHUT_DOWN};
 use crate::worker::{Job, Worker, WorkerMsg};
 
+mod lod;
+
 /// Bounded wait of `shutdown` and of a re-configure that replaces a worker using a disk cache
 /// (until the old cache thread has flushed and closed its file).
 pub const STOP_WAIT: Duration = Duration::from_secs(1);
@@ -288,6 +290,8 @@ pub struct WorldStats {
     pub terrain_fetching: [i32; MAX_RINGS],
     pub terrain_meshing: [i32; MAX_RINGS],
     pub terrain_loaded: [i32; MAX_RINGS],
+    /// Terrain splits the tile budget (`terrain.max_tiles`) left out of the last cover plan.
+    pub terrain_budget_skipped: usize,
     pub terrain_tris: u64,
     /// Shared CPU job pool (both layers): jobs queued (ready or waiting on dependencies),
     /// running, and cancelled since the world was configured. Zero when not running.
@@ -298,6 +302,11 @@ pub struct WorldStats {
     /// decodes since the world was configured (a re-decode after an eviction counts again).
     pub data_tiles_loaded: u32,
     pub data_tiles_decoded: u64,
+    /// Data tiles dropped after `memory.data_idle_s` unneeded / evicted by the memory budget,
+    /// and decodes of a tile evicted before (review M3).
+    pub data_tiles_evicted_idle: u64,
+    pub data_tiles_evicted_budget: u64,
+    pub data_tiles_redecoded: u64,
     /// Data tile fetches completed since configure (disk cache or network).
     pub data_tiles_fetched: u64,
     /// Of those: overview tiles, and tiles absent from the archive (empty).
@@ -776,7 +785,7 @@ impl World {
                 w.set_terrain(self.terrain.clone());
                 w.set_seed(self.seed.clone());
                 let mut s = Scheduler::new(frame, w.is_synthetic(), self.profile.clone()).with_terrain(self.terrain.clone());
-                s.set_lod_view(&self.lod_view, self.lod_quality);
+                s.set_lod_view(&self.lod_view, self.cover_quality());
                 // Tiles v2: chunks are cut from data tiles. An archive's levels are known once it
                 // opened (`WorkerMsg::Levels`: two-level, or the compatibility levels of an archive
                 // without `simworld_levels`); the synthetic city is a two-level source generated
@@ -796,7 +805,7 @@ impl World {
                     self.terrain_detail = self.clamp_detail(self.terrain_detail);
                     let mut t = Scheduler::new_terrain(frame, self.profile.clone(), self.terrain.clone());
                     t.set_detail(self.terrain_detail);
-                    t.set_lod_view(&self.lod_view, self.lod_quality);
+                    t.set_lod_view(&self.lod_view, self.cover_quality());
                     self.terrain_sched = Some(t);
                 }
                 self.worker = Some(w);
@@ -1216,11 +1225,15 @@ impl World {
             terrain_fetching: tst.fetching,
             terrain_meshing: tst.meshing,
             terrain_loaded: tst.loaded,
+            terrain_budget_skipped: self.terrain_sched.as_ref().map_or(0, |t| t.budget_skipped()),
             terrain_tris: tst.tris,
             jobs: self.worker.as_ref().map(|w| w.job_stats()).unwrap_or_default(),
             memory: self.memory.stats(),
             data_tiles_loaded: data.loaded,
             data_tiles_decoded: data.decoded,
+            data_tiles_evicted_idle: data.evicted_idle,
+            data_tiles_evicted_budget: data.evicted_budget,
+            data_tiles_redecoded: data.redecoded,
             data_tiles_fetched: data.fetched,
             data_tiles_fetched_overview: data.fetched_overview,
             data_tiles_fetched_empty: data.fetched_empty,
@@ -1266,68 +1279,6 @@ impl World {
             }
         }
         self.terrain_detail
-    }
-
-    /// Contract `set_view(fov_y_deg, viewport_h_px, forward)` (api 1.10): the view the
-    /// screen-space error is measured in. `fov_y_deg` in [1, 179], `viewport_h_px` (physical
-    /// pixels) in [1, 65536], `forward` (local axes) finite and non-zero; anything else is
-    /// ignored with a rate-limited warning and no state change (returns false). Until it is
-    /// called the default view applies (60 deg, 1080 px, -Z). Kept across `configure_world`;
-    /// the cover follows from the next `update_camera`, no reconfigure. `forward` is stored for
-    /// the rear-hemisphere relaxation (step T4) and does not move the cover yet.
-    pub fn set_view(&mut self, fov_y_deg: f64, viewport_h_px: f64, forward: [f64; 3]) -> bool {
-        let Some(v) = LodView::new(fov_y_deg, viewport_h_px, forward) else {
-            self.warn(&format!(
-                "WorldStreamer: set_view({fov_y_deg}, {viewport_h_px}, {forward:?}) ignored: needs fov_y_deg in [1, 179], viewport_h_px in [1, 65536] and a finite non-zero forward"
-            ));
-            return false;
-        };
-        self.lod_view = v;
-        self.apply_lod_view();
-        true
-    }
-
-    /// Contract `set_lod_quality(scale)` (api 1.10): live multiplier of `lod.tau_px` (tau_eff =
-    /// `tau_px` x scale; 2 = half the refine distances, coarser and cheaper), clamped to
-    /// [0.25, 4]. Non-finite input is ignored. Kept across `configure_world`; the cover follows
-    /// from the next `update_camera`. Returns the scale in effect.
-    pub fn set_lod_quality(&mut self, scale: f64) -> f64 {
-        if scale.is_finite() {
-            self.lod_quality = scale.clamp(LOD_QUALITY_MIN, LOD_QUALITY_MAX);
-            self.apply_lod_view();
-        }
-        self.lod_quality
-    }
-
-    fn apply_lod_view(&mut self) {
-        if let Some(s) = &mut self.scheduler {
-            s.set_lod_view(&self.lod_view, self.lod_quality);
-        }
-        // Terrain (G2): the SSE view, and the foundation guard from the vector edges.
-        if let Some(t) = &mut self.terrain_sched {
-            t.set_lod_view(&self.lod_view, self.lod_quality);
-        }
-    }
-
-    /// The view in effect (see [`World::set_view`]).
-    pub fn lod_view(&self) -> LodView {
-        self.lod_view
-    }
-
-    /// The `set_lod_quality` scale in effect.
-    pub fn lod_quality(&self) -> f64 {
-        self.lod_quality
-    }
-
-    /// Effective SSE threshold (px): `lod.tau_px` x the quality scale (adaptive factors: T5).
-    pub fn tau_eff(&self) -> f64 {
-        self.profile.lod.tau_px * self.lod_quality
-    }
-
-    /// The vector layer's band edges in effect (m, R0..R3; R3 = `bands.max_distance_m`): the
-    /// SSE refine distances of the current view and tau_eff.
-    pub fn lod_edges_m(&self) -> [f64; RING_COUNT] {
-        self.profile.bands().edges_for(&self.lod_view, self.lod_quality)
     }
 
     /// The terrain detail scale in effect (see [`World::set_terrain_detail`]).

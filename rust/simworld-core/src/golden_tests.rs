@@ -560,6 +560,8 @@ const GOLDEN_TERRAIN_LAYER_COVER: &[(&[usize], u64)] = &[
     (&[0, 12, 20, 48, 130], 0xc365cf6aa4595fc6),
     (&[0, 0, 16, 48, 128], 0x0b994d3c0d1b91ad),
     (&[516, 736, 908, 480, 128], 0xbd2b2be67d839825),
+    // Added for review M1: the peaks above under the default `terrain.max_tiles` (1500 leaves).
+    (&[332, 500, 600, 396, 128], 0xe75464ccb6e91af9),
 ];
 
 #[test]
@@ -576,11 +578,16 @@ fn golden_terrain_mesh_and_layer_cover() {
     assert_eq!(again, got[2].2);
     let peak_profile = crate::profile::resolve(
         None,
-        Some(&serde_json::json!({ "terrain": { "enabled": true, "amplitude_m": 1200.0, "ridge_share": 1.0, "flat_radius_m": 0.0, "flat_blend_m": 0.0 } })),
+        Some(&serde_json::json!({ "terrain": { "enabled": true, "amplitude_m": 1200.0, "ridge_share": 1.0, "flat_radius_m": 0.0, "flat_blend_m": 0.0, "max_tiles": 0 } })),
         &crate::NullLog,
     )
     .unwrap();
     let peak = Terrain::from_profile(&peak_profile, VILNIUS.0, VILNIUS.1);
+    // The same peaks under the default tile budget (`terrain.max_tiles`, review M1); the row
+    // above pins the uncapped plan (the ordered plan is the old set when the budget is off).
+    let mut capped_json = peak_profile.world().clone();
+    capped_json.terrain.max_tiles = crate::profile::WorldProfile::default().terrain.max_tiles;
+    let capped_profile = std::sync::Arc::new(crate::profile::Profile::new(capped_json).unwrap());
     let arc = std::sync::Arc::new(profile.clone());
     let mut covers: Vec<(Vec<usize>, u64)> = COVER_CAMERAS
         .iter()
@@ -589,7 +596,9 @@ fn golden_terrain_mesh_and_layer_cover() {
             terrain_cover_signature(&mut s, cam, vel)
         })
         .collect();
-    let mut s = crate::scheduler::Scheduler::new_terrain(frame, std::sync::Arc::new(peak_profile), peak);
+    let mut s = crate::scheduler::Scheduler::new_terrain(frame, std::sync::Arc::new(peak_profile), peak.clone());
+    covers.push(terrain_cover_signature(&mut s, [0.0, 0.0, 3000.0], [0.0; 3]));
+    let mut s = crate::scheduler::Scheduler::new_terrain(frame, capped_profile, peak.clone());
     covers.push(terrain_cover_signature(&mut s, [0.0, 0.0, 3000.0], [0.0; 3]));
     let table: String = got.iter().map(|(k, r, h)| format!("    (\"{k}\", {r}, 0x{h:016x}),\n")).collect();
     let ctable: String = covers.iter().map(|(c, h)| format!("    (&{c:?}, 0x{h:016x}),\n")).collect();

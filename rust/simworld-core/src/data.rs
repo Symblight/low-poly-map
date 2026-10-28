@@ -319,7 +319,7 @@ pub fn build_chunk_with(
     profile: &Profile,
     stop: &dyn Fn() -> bool,
 ) -> Result<Option<TileData>, String> {
-    let t0 = Instant::now();
+    let t0 = crate::diag::CpuClock::start();
     let proj = dt.proj.cut(chunk).ok_or_else(|| format!("chunk {chunk} is not inside data tile {}", dt.key))?;
     let r = proj.rect();
     let sel = select(&dt.buildings, &dt.bboxes, r);
@@ -396,7 +396,7 @@ pub fn build_chunk_with(
         mesh,
         ground,
         max_height,
-        cpu_us: t0.elapsed().as_micros() as u64,
+        cpu_us: t0.us(),
         terrain: None,
     }))
 }
@@ -408,7 +408,7 @@ pub fn build_chunk_with(
 /// never re-delivers a landmark tile) and its beacons. No ground, no street lamps. An overview
 /// tile without landmarks gives an empty [`TileData`] (`building_count` 0: not delivered).
 pub fn build_landmark_tile(dt: &DataTile, profile: &Profile, stop: &dyn Fn() -> bool) -> Result<Option<TileData>, String> {
-    let t0 = Instant::now();
+    let t0 = crate::diag::CpuClock::start();
     if dt.landmarks.is_empty() {
         return Ok(Some(TileData::default()));
     }
@@ -434,7 +434,7 @@ pub fn build_landmark_tile(dt: &DataTile, profile: &Profile, stop: &dyn Fn() -> 
         mesh,
         ground: MeshData::default(),
         max_height,
-        cpu_us: t0.elapsed().as_micros() as u64,
+        cpu_us: t0.us(),
         terrain: None,
     }))
 }
@@ -500,8 +500,8 @@ pub(crate) mod fixture {
             props: vec![("id", Val::D(6001.0)), ("osm_type", Val::S("way")), ("kind", Val::S("office")), ("height", Val::D(24.0))],
         });
         // A courtyard (hole) in a building crossing the z16 edge at x = 3072. The hole itself
-        // stays off the edge: a hole cut by a clip edge is triangulated over (earcut sees a hole
-        // touching the outer ring), the same in the per-tile path; see the T2a notes.
+        // stays off the edge (per-ring clip path, pinned by the goldens); a hole reaching a clip
+        // edge is clipped with its outer ring as a whole since `polyclip` (3c751bd).
         let mut hole = rect(3085, 2600, 40, 50);
         hole.reverse();
         b.push(Feat {

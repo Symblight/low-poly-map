@@ -14,11 +14,11 @@ use crate::geo::TileKey;
 use crate::rings::{children, LayerKind};
 use crate::world::{World, WorldOptions};
 
-const VILNIUS: (f64, f64) = crate::data::fixture::VILNIUS;
+pub(crate) const VILNIUS: (f64, f64) = crate::data::fixture::VILNIUS;
 
 /// A `.pmtiles` (v3) of today's layout (zooms 13..16, no `simworld_levels`): the fixture area in
 /// the z14 tile under the origin and in its z15 / z16 children, an empty z13 parent.
-fn archive() -> Vec<u8> {
+pub(crate) fn archive() -> Vec<u8> {
     use pmtiles::{TileCoord, TileId};
     let k14 = key14();
     let mut tiles: BTreeMap<u64, (TileKey, Vec<u8>)> = BTreeMap::new();
@@ -82,7 +82,7 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 /// Serve `bytes` at `http://127.0.0.1:<port>/t.pmtiles` with HTTP/1.1 Range support (206), one
 /// thread per connection, keep-alive. Returns the URL and the request counter. The server lives
 /// until the test process ends.
-fn serve(bytes: Vec<u8>) -> (String, Arc<AtomicU64>) {
+pub(crate) fn serve(bytes: Vec<u8>) -> (String, Arc<AtomicU64>) {
     let (url, n, _) = serve_counted(bytes);
     (url, n)
 }
@@ -148,16 +148,16 @@ fn serve_counted(bytes: Vec<u8>) -> (String, Arc<AtomicU64>, Arc<AtomicU64>) {
     (url, count, sent)
 }
 
-fn world() -> World {
+pub(crate) fn world() -> World {
     World::new(Arc::new(crate::NullLog), crate::Diagnostics::default(), "test")
 }
 
-fn opts(url: &str) -> WorldOptions {
+pub(crate) fn opts(url: &str) -> WorldOptions {
     WorldOptions { origin_lat: VILNIUS.0, origin_lon: VILNIUS.1, tile_url: url.into(), ..WorldOptions::default() }
 }
 
 /// Bits of a mesh (positions, colors, indices) for equality across runs.
-fn mesh_hash(m: &crate::mesher::MeshData) -> u64 {
+pub(crate) fn mesh_hash(m: &crate::mesher::MeshData) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     let mut eat = |v: u64| h = (h ^ v).wrapping_mul(0x100_0000_01b3);
     for p in m.positions.iter().flatten().chain(m.colors.iter().flatten()) {
@@ -171,7 +171,7 @@ fn mesh_hash(m: &crate::mesher::MeshData) -> u64 {
 
 /// Run the camera at 300 m AGL over the origin until nothing is queued, fetching or meshing.
 /// Returns (key -> mesh hash of its last delivery, deliveries).
-fn settle(w: &mut World) -> (BTreeMap<TileKey, (u64, u64)>, usize) {
+pub(crate) fn settle(w: &mut World) -> (BTreeMap<TileKey, (u64, u64)>, usize) {
     let mut got = BTreeMap::new();
     let mut n = 0;
     let t0 = Instant::now();

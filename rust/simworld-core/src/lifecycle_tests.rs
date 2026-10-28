@@ -161,13 +161,36 @@ fn two_synthetic_worlds_run_side_by_side() {
     let mut b = world();
     assert!(a.configure_world(synthetic(VILNIUS.0, VILNIUS.1)).ok);
     assert!(b.configure_world(synthetic(VILNIUS.0, VILNIUS.1)).ok);
-    let (_, da) = run_until(&mut a, 30);
-    let (_, db) = run_until(&mut b, 30);
-    assert!(da.len() >= 30 && db.len() >= 30, "{} / {}", da.len(), db.len());
-    // Same inputs, same cover: the first deliveries are the same tiles.
-    let ka: BTreeSet<_> = da.iter().map(|d| d.0).collect();
-    let kb: BTreeSet<_> = db.iter().map(|d| d.0).collect();
-    assert!(ka.intersection(&kb).count() >= 20);
+    // Same inputs, same cover: once both are idle they hold the same tiles. (Which tiles arrive
+    // first depends on the worker threads' timing, more so with 8 build slots per band.)
+    let settle = |w: &mut World| {
+        let mut held = BTreeSet::new();
+        let (t0, mut idle_since) = (Instant::now(), None::<Instant>);
+        while t0.elapsed() < Duration::from_secs(30) {
+            w.update_camera([0.0, 300.0, 0.0], [0.0; 3], 300.0);
+            w.pop_ready(64, |t| {
+                held.insert(t.layer_key());
+            });
+            let _ = w.drain_fades();
+            for k in w.drain_unload() {
+                held.remove(k);
+            }
+            let s = w.stats();
+            let busy = s.queued.iter().chain(&s.fetching).chain(&s.meshing).any(|n| *n > 0);
+            // Idle for longer than any fade (`fades.cap_s`): the swaps have completed too.
+            match (busy, idle_since) {
+                (true, _) => idle_since = None,
+                (false, None) => idle_since = Some(Instant::now()),
+                (false, Some(t)) if t.elapsed() > Duration::from_millis(1500) => break,
+                _ => {}
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        held
+    };
+    let (ha, hb) = (settle(&mut a), settle(&mut b));
+    assert!(ha.len() >= 30, "{}", ha.len());
+    assert_eq!(ha, hb);
     // Neither holds a cache lock (synthetic city).
     assert!(a.locked_cache_dir().is_none() && b.locked_cache_dir().is_none());
     assert_eq!(a.status().state, StatusState::Ok);

@@ -86,3 +86,24 @@ pub fn thread_cpu_us() -> u64 {
     }
     0
 }
+
+/// The worker's own time of a job (latency stage `cpu`): thread CPU time where the platform has
+/// it (review M5: wall time made a preempted 2 ms chunk read as a 1 s build), else wall time.
+pub struct CpuClock {
+    wall: std::time::Instant,
+    cpu_us: u64,
+}
+
+impl CpuClock {
+    pub fn start() -> Self {
+        Self { wall: std::time::Instant::now(), cpu_us: thread_cpu_us() }
+    }
+    pub fn us(&self) -> u64 {
+        let now = thread_cpu_us();
+        if self.cpu_us > 0 && now >= self.cpu_us {
+            now - self.cpu_us
+        } else {
+            self.wall.elapsed().as_micros() as u64
+        }
+    }
+}

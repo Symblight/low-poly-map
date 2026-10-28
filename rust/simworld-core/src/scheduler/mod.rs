@@ -98,48 +98,23 @@
 //! (`set_terrain_detail`: held tiles are re-meshed and handed out again under the same key).
 
 mod data;
+mod data_mem;
+mod data_needs;
 mod fade;
 mod landmarks;
 pub mod sim;
 mod state;
-/// A terrain split candidate of the plan (`plan_terrain_splits`): max-heap order = guard splits
-/// first, then the largest `refine / distance`, then the key (deterministic).
-#[derive(Clone, Copy, Debug)]
-struct SplitCandidate {
-    prio: f64,
-    guarded: bool,
-    key: TileKey,
-}
-
-impl SplitCandidate {
-    fn order_key(&self) -> (bool, u8, u32, u32) {
-        (self.guarded, self.key.z, self.key.x, self.key.y)
-    }
-}
-
-impl PartialEq for SplitCandidate {
-    fn eq(&self, o: &Self) -> bool {
-        self.cmp(o) == std::cmp::Ordering::Equal
-    }
-}
-impl Eq for SplitCandidate {}
-impl PartialOrd for SplitCandidate {
-    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(o))
-    }
-}
-impl Ord for SplitCandidate {
-    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
-        self.guarded.cmp(&o.guarded).then(self.prio.total_cmp(&o.prio)).then_with(|| o.order_key().cmp(&self.order_key()))
-    }
-}
-
+mod terrain_plan;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod budget_tests;
 
 pub use data::{DataStats, DataStore};
 pub use landmarks::LandmarkStats;
 use landmarks::{LandmarkLayer, LmState};
+use data_needs::Need;
+use terrain_plan::SplitCandidate;
 pub use fade::{fade_gap_m, Fade};
 use data::DataState;
 pub use state::{CpuStats, Entry, ReadyTile, Stats, TileState};
@@ -242,7 +217,7 @@ pub struct Scheduler {
     /// Tiles v2 data tiles (archive sources only; `None` = every tile fetched on its own).
     data: Option<DataStore>,
     /// Reused buffers of the data needs pass and of the data jobs.
-    data_needs: Vec<(TileKey, f64, bool)>,
+    data_needs: Vec<(TileKey, f64, Need)>,
     data_decodes: Vec<(TileKey, u64, bytes::Bytes)>,
     data_fetches: Vec<(TileKey, u64)>,
     /// The host draws the landmark layer (`layers` option `"landmarks"`, api 1.11): landmarks
@@ -376,7 +351,7 @@ impl Scheduler {
     pub fn with_data_levels(mut self, levels: DataLevels) -> Self {
         if self.layer.kind == LayerKind::World {
             let max = self.profile.streaming.max_fetch_per_band * 2;
-            self.data = Some(DataStore::new(Some(levels), max, self.synthetic));
+            self.data = Some(DataStore::new(Some(levels), max, self.synthetic, self.profile.data_idle()));
         }
         self
     }
@@ -386,7 +361,7 @@ impl Scheduler {
     pub fn with_data_pending(mut self) -> Self {
         if self.layer.kind == LayerKind::World && !self.synthetic {
             let max = self.profile.streaming.max_fetch_per_band * 2;
-            self.data = Some(DataStore::new(None, max, false));
+            self.data = Some(DataStore::new(None, max, false, self.profile.data_idle()));
         }
         self
     }
@@ -493,45 +468,6 @@ impl Scheduler {
     /// Delivery order of the nearest chunk waiting for data tile `k` (infinite if none).
     pub fn data_distance(&self, k: TileKey) -> f64 {
         self.data.as_ref().and_then(|d| d.get(k)).map_or(f64::INFINITY, |e| e.want)
-    }
-
-    /// Data needs of this frame: which data tiles the chunks of the cover wait for or use;
-    /// cancels the data work nobody needs (see [`DataStore::end_needs`]).
-    fn update_data_needs(&mut self, now: Instant) {
-        if self.data.is_none() || self.data_pending() {
-            return;
-        }
-        let mut needs = std::mem::take(&mut self.data_needs);
-        needs.clear();
-        for e in self.entries.values() {
-            for dk in self.data_keys(e.key).into_iter().flatten() {
-                match e.state {
-                    TileState::Queued | TileState::WaitData if !e.frozen => needs.push((dk, self.order_key(e).0, false)),
-                    TileState::Decoding => needs.push((dk, f64::INFINITY, true)),
-                    _ => {}
-                }
-            }
-        }
-        // Landmark tiles: their key is their overview data tile.
-        for le in self.landmarks.entries.values() {
-            match le.state {
-                LmState::Wait => needs.push((le.key, le.cam_d, false)),
-                LmState::Building => needs.push((le.key, f64::INFINITY, true)),
-                _ => {}
-            }
-        }
-        let cam = self.cam_view;
-        let ds = self.data.as_mut().expect("checked");
-        ds.begin_needs(now);
-        for &(dk, order, in_use) in &needs {
-            if in_use {
-                ds.use_tile(dk);
-            } else {
-                ds.want(dk, order);
-            }
-        }
-        ds.end_needs(&mut self.cancelled, |k| cam.map_or(f64::INFINITY, |v| v.slant_box_m(k, 0.0, 0.0)));
-        self.data_needs = needs;
     }
 
     pub fn layer(&self) -> &Layer {
@@ -915,142 +851,6 @@ impl Scheduler {
         self.dispatch(jobs);
     }
 
-    /// Terrain layer: the target split set of this frame (`t_split`), before the stateful pass.
-    ///
-    /// 1. SSE plan from the roots in the cover (`self.stack`): a node of ring > 0 splits when
-    ///    its slant distance from the finer ring's look-ahead point is inside its refine distance
-    ///    ([`Scheduler::terrain_refine_m`], with the hysteresis of its current state) and one of
-    ///    its children is above the horizon (whole sibling groups). Candidates split in order of
-    ///    `refine / distance` (largest screen error first; ties by key), the foundation guard's
-    ///    first, while the leaves (roots + 3 per split) stay within `terrain.max_tiles` (0 = no
-    ///    cap; review M1): over the budget the remaining SSE splits are skipped, guard splits
-    ///    never. Without the budget hitting, the plan is the same set as an unordered walk.
-    ///    When the balance (step 2) takes a capped plan over the budget, the plan runs once more
-    ///    with the budget lowered by that overshoot.
-    /// 2. 2:1 balance: wherever a split node's edge neighbour (same zoom) is not in the tree,
-    ///    the neighbour's parent is split too, until nothing changes (the least balanced
-    ///    superset: unique, independent of the order). So two terrain leaves that share an edge
-    ///    differ by at most one zoom, as with the 1.7 distance bands: the skirts (sized for the
-    ///    next coarser band, contract 9a) close every seam. Neighbours whose root is outside the
-    ///    cover are skipped.
-    fn plan_terrain_splits(&mut self, views: &[ViewPoint; MAX_RINGS], grounds: &[f64; MAX_RINGS]) {
-        let l = self.layer;
-        let mut split = std::mem::take(&mut self.t_split);
-        let mut roots = std::mem::take(&mut self.t_roots);
-        let mut work = std::mem::take(&mut self.t_work);
-        let mut heap = std::mem::take(&mut self.t_heap);
-        split.clear();
-        roots.clear();
-        work.clear();
-        heap.clear();
-        roots.extend(self.stack.iter().map(|s| s.0));
-        let budget = self.profile.terrain.max_tiles as usize;
-        let mut limit = budget;
-        let (mut planned, mut skipped);
-        loop {
-            split.clear();
-            heap.clear();
-            work.clear();
-            work.extend(self.stack.iter().map(|s| s.0));
-            let mut leaves = roots.len();
-            skipped = 0;
-            loop {
-                // Candidates of this round (the roots, then the children of each split).
-                while let Some(k) = work.pop() {
-                    if let Some(c) = self.split_candidate(k, views, grounds) {
-                        heap.push(c);
-                    }
-                }
-                let Some(c) = heap.pop() else { break };
-                if limit > 0 && !c.guarded && leaves + 3 > limit {
-                    skipped += 1;
-                    continue;
-                }
-                split.insert(c.key);
-                leaves += 3;
-                work.extend(children(c.key));
-            }
-            // 2:1 balance (closure).
-            planned = split.len();
-            work.extend(split.iter().copied());
-            while let Some(c) = work.pop() {
-                let n = 1i64 << c.z;
-                for (dx, dy) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)] {
-                    let (x, y) = (c.x as i64 + dx, c.y as i64 + dy);
-                    if x < 0 || y < 0 || x >= n || y >= n {
-                        continue;
-                    }
-                    let nb = TileKey::new(c.z, x as u32, y as u32);
-                    if c.z == l.root_zoom {
-                        continue; // a root neighbour is in the cover or beyond its reach
-                    }
-                    let p = TileKey::new(c.z - 1, nb.x / 2, nb.y / 2);
-                    if split.contains(&p) || (p.z == l.root_zoom && !roots.contains(&p)) {
-                        continue;
-                    }
-                    split.insert(p);
-                    work.push(p);
-                }
-            }
-            // Over the budget only through the balance: plan once more with the budget lowered
-            // by that overshoot (so the balanced cover lands near `max_tiles`).
-            let total = roots.len() + 3 * split.len();
-            if skipped == 0 || limit < budget || total <= budget {
-                break;
-            }
-            limit = budget.saturating_sub(total - budget).max(1);
-        }
-        self.balance_forced = split.len() - planned;
-        self.budget_skipped = skipped;
-        self.t_split = split;
-        self.t_roots = roots;
-        self.t_work = work;
-        self.t_heap = heap;
-    }
-
-    /// Terrain layer: `k` as a split candidate of the plan (`None` = it does not want to split:
-    /// ring 0, no child above the horizon, or outside its refine distance).
-    fn split_candidate(&mut self, k: TileKey, views: &[ViewPoint; MAX_RINGS], grounds: &[f64; MAX_RINGS]) -> Option<SplitCandidate> {
-        let l = self.layer;
-        let ring = l.ring_for_zoom(k.z)?;
-        if ring == 0 {
-            return None;
-        }
-        let current = self.entries.get(&k).is_some_and(|e| e.split);
-        let group_visible = l.horizon_margin_m.is_none() || {
-            let mut any = false;
-            for c in children(k) {
-                let g = self.terrain_box_of(c);
-                if self.horizon_ok(&views[ring - 1], grounds[ring - 1], c, g, current) {
-                    any = true;
-                    break;
-                }
-            }
-            any
-        };
-        if !group_visible {
-            return None;
-        }
-        let g = self.terrain_box_of(k);
-        let d = views[ring - 1].slant_box_m(k, g[0], g[1]);
-        let refine = self.terrain_refine_m(k, ring);
-        if !l.inside(d, refine, current) {
-            return None;
-        }
-        let guarded = l.inside(d, self.guard_m[ring], current);
-        Some(SplitCandidate { prio: refine / d.max(1e-3), guarded, key: k })
-    }
-
-    /// Terrain layer: SSE splits left out of the last plan by `terrain.max_tiles`.
-    pub fn budget_skipped(&self) -> usize {
-        self.budget_skipped
-    }
-
-    /// Terrain layer: splits the 2:1 balance added to the SSE plan in the last `update`.
-    pub fn balance_forced(&self) -> usize {
-        self.balance_forced
-    }
-
     fn update_light_mode(&mut self, agl: f64) {
         let (on, off) = (self.profile.lights.cluster_on_agl_m, self.profile.lights.cluster_off_agl_m);
         let want = if agl > on {
@@ -1232,15 +1032,17 @@ impl Scheduler {
                 return;
             }
         };
+        // Latency: `fetch_*` = waiting for the data tile (fetch + decode), when it had to wait;
+        // the wait for a build slot after that is `mesh_wait` (review M2: it was counted as
+        // fetch, which made a slot-bound cold fill look like a slow overview fetch).
+        if e.times.fetch_start.is_some() && e.times.fetched.is_none() {
+            e.times.fetched = Some(now);
+            e.times.source = main.1;
+        }
         if self.decode_inflight[ring] >= max_decode {
             return;
         }
-        let (data, source) = main;
-        // Latency: `fetch_*` = waiting for the data tile (fetch + decode), when it had to wait.
-        if e.times.fetch_start.is_some() {
-            e.times.fetched = Some(now);
-            e.times.source = source;
-        }
+        let (data, _) = main;
         e.state = TileState::Decoding;
         e.job = self.next_job;
         e.times.decode_start = Some(now);
@@ -1830,8 +1632,9 @@ impl Scheduler {
         let (kind, gen) = (self.layer.kind, self.detail_gen);
         let e = self.entries.get_mut(&k)?;
         if !redelivery && !e.held {
-            self.latency.record_delivery(e.ring, &e.times, Instant::now());
+            self.latency.record_delivery(e.ring, &e.times, Instant::now(), !e.delivered_once);
         }
+        e.delivered_once = true;
         let (mesh, ground, lights, terrain) = match std::mem::replace(&mut e.state, TileState::Idle) {
             TileState::Ready(data) => {
                 let d = *data;

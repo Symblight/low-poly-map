@@ -36,6 +36,7 @@ pub mod mvt;
 pub(crate) mod polyclip;
 pub mod profile;
 pub mod rings;
+pub mod cover_budget;
 pub mod scheduler;
 pub mod seed;
 pub mod status;
@@ -46,6 +47,8 @@ pub mod world;
 
 #[cfg(test)]
 mod data_world_tests;
+#[cfg(test)]
+mod streaming_review_tests;
 #[cfg(test)]
 mod golden_tests;
 #[cfg(test)]

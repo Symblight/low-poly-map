@@ -143,6 +143,8 @@ pub struct Entry {
     pub times: TileTimes,
     /// When the node was split (latency stat `swap`, taken when its refine fade starts).
     pub split_at: Option<Instant>,
+    /// Delivered at least once since the entry was created (latency `first`, review M2).
+    pub delivered_once: bool,
     /// Terrain layer: detail generation of the version the host holds.
     pub detail_gen: u32,
     /// Triangles of the version the host holds (terrain layer; 0 for vector tiles).
@@ -223,6 +225,7 @@ impl Entry {
             rect,
             center,
             times: TileTimes::default(),
+            delivered_once: false,
             split_at: None,
             detail_gen: 0,
             tris: 0,

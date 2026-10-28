@@ -222,7 +222,7 @@
   },
   "streaming": {
     "max_fetch_per_band": 4,
-    "max_mesh_per_band": 2,
+    "max_mesh_per_band": 8,
     "redeliveries_per_frame": 1,
     "retry_base_s": 0.5,
     "retry_max_s": 30.0
@@ -242,7 +242,8 @@
     "validate_retry_s": 30.0
   },
   "memory": {
-    "budget_mb": 512.0
+    "budget_mb": 512.0,
+    "data_idle_s": 20.0
   },
   "terrain": {
     "enabled": false,

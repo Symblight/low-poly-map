@@ -10,6 +10,12 @@
 //! effective, for the host's per-frame poll budget, finer bands first), `total` wanted ->
 //! delivered. `swap` is sampled on the coarse tile: split decided -> refine fade started (all 4
 //! children uploaded), i.e. how long the coarse tile stood in for its children.
+//!
+//! Two sets of windows (review M2): every fresh delivery ([`Latency::all`], contract `latency`),
+//! and first deliveries only ([`Latency::first`], `latency_first`): a tile delivered for the
+//! first time since it entered the cover. A coarsening parent delivered again (guarantee 4) is
+//! fresh but not first; its data tile is usually resident, so it is fast and, during flight,
+//! the most frequent sample, which hid the cold path of new area in `total`.
 
 use std::time::{Duration, Instant};
 
@@ -119,9 +125,17 @@ impl Window {
     }
 }
 
+/// One window per stage and band.
+#[derive(Default)]
+pub struct Windows {
+    win: [[Window; RING_COUNT]; STAGES.len()],
+}
+
+/// The latency windows of a scheduler: all fresh deliveries and first deliveries.
 #[derive(Default)]
 pub struct Latency {
-    win: [[Window; RING_COUNT]; STAGES.len()],
+    all: Windows,
+    first: Windows,
 }
 
 fn ms(d: Duration) -> f32 {
@@ -133,14 +147,49 @@ fn between(a: Option<Instant>, b: Option<Instant>) -> Option<f32> {
 }
 
 impl Latency {
+    /// A sample of every fresh delivery (`swap` is recorded here only).
     pub fn record(&mut self, stage: Stage, ring: usize, ms: f32) {
+        self.all.record(stage, ring, ms);
+    }
+
+    /// Samples every stage of a fresh delivery at `delivered`; `first` = the tile's first
+    /// delivery since it entered the cover (also sampled into [`Latency::first`]).
+    pub fn record_delivery(&mut self, ring: usize, t: &TileTimes, delivered: Instant, first: bool) {
+        self.all.record_delivery(ring, t, delivered);
+        if first {
+            self.first.record_delivery(ring, t, delivered);
+        }
+    }
+
+    /// Every fresh delivery (contract `latency`).
+    pub fn all(&self) -> &Windows {
+        &self.all
+    }
+
+    /// First deliveries only (contract `latency_first`, api 1.11).
+    pub fn first(&self) -> &Windows {
+        &self.first
+    }
+
+    /// Summary over every fresh delivery.
+    pub fn summary(&self, stage: Stage, ring: usize) -> Summary {
+        self.all.summary(stage, ring)
+    }
+
+    /// Both tables, for logs and the CLI.
+    pub fn report(&self) -> String {
+        format!("{}\n{}", self.all.report("latency ms p50/p95/max (n) by band:"), self.first.report("first deliveries only:"))
+    }
+}
+
+impl Windows {
+    fn record(&mut self, stage: Stage, ring: usize, ms: f32) {
         if ring < RING_COUNT && ms.is_finite() {
             self.win[stage as usize][ring].push(ms.max(0.0));
         }
     }
 
-    /// Samples every stage of a fresh delivery at `delivered`.
-    pub fn record_delivery(&mut self, ring: usize, t: &TileTimes, delivered: Instant) {
+    fn record_delivery(&mut self, ring: usize, t: &TileTimes, delivered: Instant) {
         // The synthetic city has no fetch: its queue ends at the mesh dispatch.
         let dispatched = t.fetch_start.or(t.decode_start);
         if let Some(v) = between(t.queued, dispatched) {
@@ -169,9 +218,9 @@ impl Latency {
         self.win[stage as usize][ring].summary()
     }
 
-    /// One line per stage with samples: `total p50/p95/max ms R0 .. R3`, for logs and the CLI.
-    pub fn report(&self) -> String {
-        let mut out = String::from("latency ms p50/p95/max (n) by band:");
+    /// One line per stage with samples: `total p50/p95/max ms R0 .. R3`, under `title`.
+    pub fn report(&self, title: &str) -> String {
+        let mut out = String::from(title);
         for st in STAGES {
             if (0..RING_COUNT).all(|r| self.win[st as usize][r].len == 0) {
                 continue;
@@ -228,7 +277,7 @@ mod tests {
             cpu_us: 40_000,
         };
         let mut l = Latency::default();
-        l.record_delivery(3, &t, t0 + Duration::from_millis(100));
+        l.record_delivery(3, &t, t0 + Duration::from_millis(100), true);
         let p = |st| l.summary(st, 3).p50.round();
         assert_eq!(
             [p(Stage::Queue), p(Stage::FetchNet), p(Stage::MeshWait), p(Stage::Mesh), p(Stage::Cpu), p(Stage::Deliver), p(Stage::Total)],
@@ -238,9 +287,14 @@ mod tests {
         // Synthetic: no fetch, the queue ends at the mesh dispatch.
         let s = TileTimes { queued: at(0), decode_start: at(25), ready: at(30), ..TileTimes::default() };
         let mut l = Latency::default();
-        l.record_delivery(0, &s, t0 + Duration::from_millis(40));
+        l.record_delivery(0, &s, t0 + Duration::from_millis(40), false);
         assert_eq!(l.summary(Stage::Queue, 0).p50.round(), 25.0);
         assert_eq!(l.summary(Stage::MeshWait, 0).n, 0);
         assert!(l.report().contains("total"));
+        // Review M2: a re-delivery (not first) is in `all` only.
+        assert_eq!((l.all().summary(Stage::Total, 0).n, l.first().summary(Stage::Total, 0).n), (1, 0));
+        l.record_delivery(0, &s, t0 + Duration::from_millis(40), true);
+        assert_eq!((l.all().summary(Stage::Total, 0).n, l.first().summary(Stage::Total, 0).n), (2, 1));
+        assert!(l.report().contains("first deliveries only"));
     }
 }

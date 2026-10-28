@@ -1198,7 +1198,7 @@
           "maximum": 64
         },
         "max_mesh_per_band": {
-          "description": "Decode and mesh jobs in flight per band (count).",
+          "description": "Decode and mesh jobs in flight per band (count). Default 8 (2 before api 1.11: results come back a frame later, so 2 capped a band at about 2 tiles per frame and a cold start of ~250 R3 chunks took ~2 s at 60 Hz). The jobs share one priority-ordered worker pool; lower it to bound queued work on a slow device.",
           "type": "integer",
           "minimum": 1,
           "maximum": 64
@@ -1302,6 +1302,12 @@
           "type": "number",
           "minimum": 32,
           "maximum": 65536
+        },
+        "data_idle_s": {
+          "description": "Seconds after which a decoded data tile that no tile of the cover maps to (held, wanted, split or frozen) is dropped from memory (0 = at once). Keeps the data_tiles pool at the cover's working set on long flights instead of growing to the budget; the budget still evicts by priority on top. Default 20.",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 3600
         }
       },
       "additionalProperties": false

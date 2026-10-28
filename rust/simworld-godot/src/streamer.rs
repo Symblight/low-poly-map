@@ -25,7 +25,7 @@ use godot::classes::INode;
 use godot::prelude::*;
 
 use simworld_core::budget::{Pool, MIB};
-use simworld_core::latency::{Latency, STAGES};
+use simworld_core::latency::{Windows, STAGES};
 use simworld_core::mesher::MeshData;
 use simworld_core::rings::{LayerKey, LayerKind, MAX_RINGS, RING_COUNT};
 use simworld_core::{AirportInfo, ConfigureResult, Log, RunwayEndInfo, SeedInfo, Status, World, API_MAJOR, API_MINOR};
@@ -116,7 +116,7 @@ fn per_terrain_ring(v: &[i32; MAX_RINGS], rings: usize) -> PackedInt32Array {
 }
 
 /// `debug_stats()["latency"]` (api 1.3): stage name -> { p50, p95, max (ms), n } per band.
-fn latency_dict(l: &Latency) -> VarDictionary {
+fn latency_dict(l: &Windows) -> VarDictionary {
     let mut out = VarDictionary::new();
     for st in STAGES {
         let s: [_; RING_COUNT] = std::array::from_fn(|r| l.summary(st, r));
@@ -457,6 +457,11 @@ impl WorldStreamer {
         // Tiles v2 data tiles (step T2a): resident now / decoded since configure.
         d.set("data_tiles_loaded", st.data_tiles_loaded as i64);
         d.set("data_tiles_decoded", st.data_tiles_decoded.min(i64::MAX as u64) as i64);
+        // api 1.11 (review M3): data tile evictions and re-decodes (thrash shows as a rising
+        // `data_tiles_redecoded`).
+        d.set("data_tiles_evicted_idle", st.data_tiles_evicted_idle.min(i64::MAX as u64) as i64);
+        d.set("data_tiles_evicted_budget", st.data_tiles_evicted_budget.min(i64::MAX as u64) as i64);
+        d.set("data_tiles_redecoded", st.data_tiles_redecoded.min(i64::MAX as u64) as i64);
         // api 1.11: the source's data levels (once known) and the landmark layer.
         if let Some(l) = st.data_levels {
             let mut dl = VarDictionary::new();
@@ -472,7 +477,10 @@ impl WorldStreamer {
             d.set("landmarks_empty", st.landmarks.empty as i64);
         }
         if let Some(l) = self.world.latency() {
-            d.set("latency", &latency_dict(l));
+            d.set("latency", &latency_dict(l.all()));
+            // api 1.11 (review M2): first deliveries only (new area), without the coarsening
+            // re-deliveries that dominate `latency` during flight.
+            d.set("latency_first", &latency_dict(l.first()));
         }
         // api 1.10: screen-space-error LOD (set_view / set_lod_quality).
         d.set("tau_eff", self.world.tau_eff());

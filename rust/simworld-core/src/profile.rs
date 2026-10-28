@@ -480,7 +480,9 @@ pub struct LanduseFallback {
 pub struct Streaming {
     /// Fetches in flight per band.
     pub max_fetch_per_band: u32,
-    /// Mesh (decode) jobs in flight per band.
+    /// Mesh (decode) jobs in flight per band. Default 8 since review M2 (was 2: results come
+    /// back a frame later, so a band built at most ~2 chunks per frame and a cold fill of ~250
+    /// R3 chunks took ~2 s at 60 Hz although every data tile was resident after 0.2 s).
     pub max_mesh_per_band: u32,
     /// Light-mode re-deliveries per frame.
     pub redeliveries_per_frame: u32,
@@ -529,6 +531,9 @@ pub struct Cache {
 pub struct Memory {
     /// Budget (MiB).
     pub budget_mb: f64,
+    /// A decoded data tile no tile of the cover maps to is dropped after this long (s; review
+    /// M3). 0 = at once. The budget still evicts by priority on top.
+    pub data_idle_s: f64,
 }
 
 /// Procedural terrain (profile_version 5). Heights come from a seeded function
@@ -1230,7 +1235,7 @@ impl Default for LanduseFallback {
 
 impl Default for Streaming {
     fn default() -> Self {
-        Self { max_fetch_per_band: 4, max_mesh_per_band: 2, redeliveries_per_frame: 1, retry_base_s: 0.5, retry_max_s: 30.0 }
+        Self { max_fetch_per_band: 4, max_mesh_per_band: 8, redeliveries_per_frame: 1, retry_base_s: 0.5, retry_max_s: 30.0 }
     }
 }
 
@@ -1254,7 +1259,7 @@ impl Default for Cache {
 
 impl Default for Memory {
     fn default() -> Self {
-        Self { budget_mb: 512.0 }
+        Self { budget_mb: 512.0, data_idle_s: 20.0 }
     }
 }
 
@@ -1385,6 +1390,7 @@ pub const RANGES: &[(&str, f64, f64)] = &[
     ("cache.open_retry_s", 0.0, 3600.0),
     ("cache.validate_retry_s", 1.0, 86_400.0),
     ("memory.budget_mb", 32.0, 65_536.0),
+    ("memory.data_idle_s", 0.0, 3600.0),
     ("terrain.seed", 0.0, 4_294_967_295.0),
     ("terrain.amplitude_m", 0.0, 3000.0),
     ("terrain.feature_size_m", 200.0, 200_000.0),
@@ -2023,6 +2029,11 @@ impl Profile {
         let ms = base_ms.saturating_mul(1u64 << attempts.saturating_sub(1).min(6));
         std::time::Duration::from_millis(ms.min(max_ms))
     }
+
+    /// Idle time after which an unneeded decoded data tile is dropped (`memory.data_idle_s`).
+    pub fn data_idle(&self) -> std::time::Duration {
+        std::time::Duration::from_secs_f64(self.world.memory.data_idle_s)
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2319,7 +2330,7 @@ mod tests {
         assert_eq!(p.cluster_cell_m(), 100.0f32);
         let w = p.world();
         assert_eq!((w.lights.cluster_on_agl_m, w.lights.cluster_off_agl_m), (3300.0, 2700.0));
-        assert_eq!((w.streaming.max_fetch_per_band, w.streaming.max_mesh_per_band, w.streaming.redeliveries_per_frame), (4, 2, 1));
+        assert_eq!((w.streaming.max_fetch_per_band, w.streaming.max_mesh_per_band, w.streaming.redeliveries_per_frame), (4, 8, 1));
         assert_eq!(w.fades.cap_s, 0.75);
         assert_eq!(w.origin.recenter_distance_m, 5000.0);
         assert_eq!((w.cache.cap_mb * 1024.0 * 1024.0) as u64, 300 * 1024 * 1024);

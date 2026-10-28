@@ -455,13 +455,35 @@ pub fn mesh_building_iter<'a>(
             foundation_m,
         };
         for poly in &b.polygons {
-            if prepare_polygon(poly, proj, &rect, needs_clip, tol_px, &mut s) {
-                emit_polygon(&mut m, &mut s, &res, color, b.base_m, walls, ground);
+            if needs_clip && crate::polyclip::hole_crosses(poly, &rect) {
+                // A hole reaches the clip boundary: clip the polygon as a whole (the hole notches
+                // the outer ring; its walls stay, the seam edges get none).
+                for piece in crate::polyclip::clip_polygon(poly, &rect) {
+                    if prepare_polygon(&piece, proj, &rect, Clip::Done, tol_px, &mut s) {
+                        emit_polygon(&mut m, &mut s, &res, color, b.base_m, walls, ground);
+                    }
+                }
+            } else {
+                let clip = if needs_clip { Clip::Rings } else { Clip::None };
+                if prepare_polygon(poly, proj, &rect, clip, tol_px, &mut s) {
+                    emit_polygon(&mut m, &mut s, &res, color, b.base_m, walls, ground);
+                }
             }
         }
     }
     m.shrink();
     m
+}
+
+/// How [`prepare_polygon`] treats the clip rect.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Clip {
+    /// Polygon inside the rect: no clip, no seams.
+    None,
+    /// Clip every ring on its own ([`clip_ring`]; right when no hole reaches the boundary).
+    Rings,
+    /// Already clipped as a whole ([`crate::polyclip::clip_polygon`]): seams and locks only.
+    Done,
 }
 
 /// Clip + simplify + project + orient one polygon into `s.rings` / `s.ring_flags`.
@@ -470,15 +492,16 @@ fn prepare_polygon(
     poly: &[Vec<[f64; 2]>],
     proj: &TileProjector,
     rect: &ClipRect,
-    needs_clip: bool,
+    clip: Clip,
     tol_px: f64,
     s: &mut Scratch,
 ) -> bool {
+    let needs_clip = clip != Clip::None;
     s.rings.clear();
     s.ring_flags.clear();
     s.ring_px.clear();
     for (ri, ring) in poly.iter().enumerate() {
-        if needs_clip {
+        if clip == Clip::Rings {
             clip_ring(ring, rect, &mut s.clip_a, &mut s.clip_b);
         } else {
             s.clip_a.clear();
@@ -1650,5 +1673,88 @@ mod tests {
         assert_eq!(out, vec![0, 2, 3, 4]);
         simplify_ring(&pts, &[false, true, false, false, false], 1.0, &mut keep, &mut out);
         assert!(out.contains(&1));
+    }
+
+    /// Roof area (m2, flat roofs facing up) and wall area (m2) of a mesh.
+    fn roof_wall_m2(m: &MeshData) -> (f64, f64) {
+        let (mut roof, mut wall) = (0.0f64, 0.0f64);
+        for t in m.indices.chunks_exact(3) {
+            let [a, b, c] = [t[0] as usize, t[1] as usize, t[2] as usize];
+            let g = cross(sub(m.positions[c], m.positions[a]), sub(m.positions[b], m.positions[a]));
+            let area = (dot(g, g) as f64).sqrt() / 2.0;
+            if m.normals[a][1] > 0.5 {
+                roof += area;
+            } else if m.normals[a][1].abs() < 0.5 {
+                wall += area;
+            }
+        }
+        (roof, wall)
+    }
+
+    /// Holes reaching the clip rect (courtyards cut by a tile or chunk edge): the roof is
+    /// outer ∩ rect − holes ∩ rect, courtyard walls stay, and the four z16 chunks of a z15 tile
+    /// add up to the tile (roof and walls).
+    #[test]
+    fn courtyards_crossing_the_clip_rect_stay_open() {
+        use crate::polyclip::fixtures;
+        let key = tile_for(VILNIUS.0, VILNIUS.1, 15);
+        let (lat, lon) = key.center_lat_lon();
+        let parent = TileProjector::new(key, Frame::new(lat, lon), 4096.0);
+        for (name, outer, holes) in fixtures::cases() {
+            let b = bld("yes", Some(30.0), None, vec![fixtures::rings(outer, &holes)]);
+            let whole = mesh_buildings(std::slice::from_ref(&b), &parent, parent.rect(), lod1(), &dp());
+            let (roof, wall) = roof_wall_m2(&whole);
+            let expect = fixtures::expected_m2(&parent, [0.0, 0.0, 4096.0, 4096.0], outer, &holes);
+            assert!((roof - expect).abs() / expect < 1e-6, "{name}: tile roof {roof} vs {expect}");
+            assert_winding(&whole);
+            let (mut roof4, mut wall4) = (0.0, 0.0);
+            for q in 0..4u32 {
+                let child = crate::geo::TileKey::new(key.z + 1, key.x * 2 + (q & 1), key.y * 2 + (q >> 1));
+                let p = parent.cut(child).unwrap();
+                let r = p.rect();
+                let m = mesh_buildings(std::slice::from_ref(&b), &p, r, lod0(), &dp());
+                let (rf, wl) = roof_wall_m2(&m);
+                let e = fixtures::expected_m2(&p, [r.x0, r.y0, r.x1, r.y1], outer, &holes);
+                assert!((rf - e).abs() <= 1e-6 * e.max(1.0), "{name} child {q}: roof {rf} vs {e}");
+                assert_winding(&m);
+                roof4 += rf;
+                wall4 += wl;
+            }
+            // Exact in tile pixels (`expected_m2` checks it); in ENU the tile lacks the chunk seam
+            // vertices and a straight pixel edge bends slightly (~2e-6 of the area at z15): 1e-5.
+            assert!((roof4 - roof).abs() / roof < 1e-5, "{name}: chunks {roof4} vs tile {roof}");
+            // Known limit (as before for outer walls): a wall lying exactly on a chunk seam is
+            // treated as the seam and dropped in both chunks, so a courtyard edge on x = 2048
+            // has no wall in the chunks; the walls only add up where no hole edge is on a seam.
+            let edge_on_seam = holes.iter().any(|h| h.contains(&2048.0));
+            if !edge_on_seam {
+                assert!((wall4 - wall).abs() / wall < 1e-5, "{name}: chunk walls {wall4} vs tile {wall}");
+            } else {
+                assert!(wall4 < wall, "{name}");
+            }
+        }
+        // The "one edge" courtyard (300 x 200 px) has its full walls in the tile (1 % allows
+        // for the scale change across the tile); the chunk sum above equals the tile, so its
+        // walls stay in both chunks where x = 2048 cuts it, and no seam gets one.
+        let (outer, holes) = (fixtures::cases()[0].1, fixtures::cases()[0].2.clone());
+        let b = bld("yes", Some(30.0), None, vec![fixtures::rings(outer, &holes)]);
+        let solid = bld("yes", Some(30.0), None, vec![fixtures::rings(outer, &[])]);
+        let ring_m = 2.0 * (300.0 + 200.0) * parent.m_per_px();
+        let (_, w_hole) = roof_wall_m2(&mesh_buildings(std::slice::from_ref(&b), &parent, parent.rect(), lod1(), &dp()));
+        let (_, w_solid) = roof_wall_m2(&mesh_buildings(std::slice::from_ref(&solid), &parent, parent.rect(), lod1(), &dp()));
+        assert!(((w_hole - w_solid) - ring_m * 30.0).abs() / (ring_m * 30.0) < 1e-2, "{w_hole} - {w_solid}");
+    }
+
+    #[test]
+    fn courtyard_clip_is_deterministic() {
+        use crate::polyclip::fixtures;
+        let (p, _) = setup();
+        for (_, outer, holes) in fixtures::cases() {
+            let b = bld("yes", Some(30.0), None, vec![fixtures::rings(outer, &holes)]);
+            for q in 0..4 {
+                let r = ClipRect::quadrant(4096.0, q);
+                assert_eq!(mesh_buildings(std::slice::from_ref(&b), &p, r, lod0(), &dp()), mesh_buildings(std::slice::from_ref(&b), &p, r, lod0(), &dp()));
+            }
+        }
     }
 }

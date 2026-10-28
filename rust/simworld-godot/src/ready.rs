@@ -11,6 +11,7 @@ use godot::prelude::*;
 
 use simworld_core::mesher::MeshData;
 use simworld_core::rings::{LayerKey, LayerKind};
+use simworld_core::surface::{EngineSurface, PRIMITIVE_TRIANGLES};
 use simworld_core::ReadyTileView;
 
 const _: () = assert!(std::mem::size_of::<Vector3>() == 12 && std::mem::align_of::<Vector3>() == 4);
@@ -46,7 +47,7 @@ pub(crate) fn key_string(k: LayerKey) -> GString {
 /// an empty Array when there is no geometry. TEX_UV stays nil when the mesh has no UVs (ground).
 fn mesh_array(m: &MeshData) -> VarArray {
     let mut a = VarArray::new();
-    if m.is_empty() {
+    if m.is_empty() || m.surface.is_some() {
         return a;
     }
     a.resize(ArrayType::MAX.ord() as usize, &Variant::nil());
@@ -66,7 +67,7 @@ fn mesh_array(m: &MeshData) -> VarArray {
 /// terrain mesh (vector tiles).
 fn terrain_array(m: &MeshData) -> VarArray {
     let mut a = VarArray::new();
-    if m.is_empty() {
+    if m.is_empty() || m.surface.is_some() {
         return a;
     }
     a.resize(ArrayType::MAX.ord() as usize, &Variant::nil());
@@ -106,5 +107,28 @@ pub(crate) fn ready_dict(t: &ReadyTileView<'_>) -> VarDictionary {
         d.set("h_min", t.h_min);
         d.set("h_max", t.h_max);
     }
+    // api 1.11 (`engine_surfaces`, contract section 4a): packed meshes as surface Dictionaries.
+    for (name, m) in [("mesh_surface", t.mesh), ("ground_surface", t.ground), ("terrain_surface", t.terrain)] {
+        if let Some(s) = &m.surface {
+            d.set(name, &surface_dict(s));
+        }
+    }
+    d
+}
+
+/// An engine surface as the Dictionary `RenderingServer.mesh_add_surface` and
+/// `ArrayMesh._surfaces` take (contract section 4a): one bulk copy per stream.
+fn surface_dict(s: &EngineSurface) -> VarDictionary {
+    let mut d = VarDictionary::new();
+    d.set("primitive", PRIMITIVE_TRIANGLES);
+    d.set("format", s.format as i64);
+    d.set("vertex_count", s.vertex_count as i64);
+    d.set("vertex_data", &PackedByteArray::from(&s.vertex_data[..]));
+    d.set("attribute_data", &PackedByteArray::from(&s.attribute_data[..]));
+    d.set("index_count", s.index_count as i64);
+    d.set("index_data", &PackedByteArray::from(&s.index_data[..]));
+    let [px, py, pz] = s.aabb_position;
+    let [sx, sy, sz] = s.aabb_size;
+    d.set("aabb", Aabb::new(Vector3::new(px, py, pz), Vector3::new(sx, sy, sz)));
     d
 }

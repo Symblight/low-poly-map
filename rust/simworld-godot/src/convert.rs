@@ -23,6 +23,7 @@ const OPTION_KEYS: &[&str] = &[
     "layers",
     "terrain_center",
     "seed_world",
+    "engine_surfaces",
 ];
 
 fn num(x: f64, path: &str) -> Result<Value, String> {
@@ -238,6 +239,12 @@ pub fn options_from_dict(d: &VarDictionary, current: &Diagnostics) -> Result<(Wo
     };
     // api 1.7: path of a seed world manifest (validated and loaded by the core).
     let seed_world = get_string(d, "seed_world")?.filter(|p| !p.trim().is_empty());
+    // api 1.11: meshes as engine surfaces (contract section 4a).
+    let engine_surfaces = match d.get("engine_surfaces") {
+        None => false,
+        Some(v) if v.is_nil() => false,
+        Some(v) => v.try_to::<bool>().map_err(|_| format!("engine_surfaces must be a bool, got {:?}", v.get_type()))?,
+    };
     let diagnostics = match d.get("diagnostics") {
         None => None,
         Some(v) if v.is_nil() => None,
@@ -281,6 +288,7 @@ pub fn options_from_dict(d: &VarDictionary, current: &Diagnostics) -> Result<(Wo
             terrain_center,
             seed_world,
             seed_reader: Some(SeedFileReader(Arc::new(read_seed_file))),
+            engine_surfaces,
         },
         warns,
     ))

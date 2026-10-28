@@ -101,6 +101,9 @@ pub struct WorldOptions {
     /// the manifest's folder). `None` = the file system (Rust hosts, tests, CLI); the Godot
     /// binding reads through `FileAccess` (`res://`, `user://`).
     pub seed_reader: Option<SeedFileReader>,
+    /// Deliver meshes as engine surfaces instead of arrays (`configure_world` option
+    /// `engine_surfaces`, api 1.11; `crate::surface`).
+    pub engine_surfaces: bool,
 }
 
 /// Host file reader for the seed world's files (see [`WorldOptions::seed_reader`]).
@@ -224,7 +227,7 @@ pub struct ConfigureResult {
 }
 
 /// An empty mesh (the `terrain` of vector tiles).
-static EMPTY_MESH: MeshData = MeshData { positions: Vec::new(), normals: Vec::new(), colors: Vec::new(), uvs: Vec::new(), indices: Vec::new() };
+static EMPTY_MESH: MeshData = MeshData { positions: Vec::new(), normals: Vec::new(), colors: Vec::new(), uvs: Vec::new(), indices: Vec::new(), surface: None };
 
 /// Lower bound of `set_terrain_detail`.
 pub const TERRAIN_DETAIL_MIN: f64 = 0.25;
@@ -808,6 +811,7 @@ impl World {
             Ok(mut w) => {
                 w.set_terrain(self.terrain.clone());
                 w.set_seed(self.seed.clone());
+                w.set_engine_surfaces(o.engine_surfaces);
                 let mut s =
                     Scheduler::new(frame, w.is_synthetic(), self.profile.clone()).with_terrain(self.terrain.clone()).with_async_boxes();
                 s.set_lod_view(&self.lod_view, self.cover_quality());

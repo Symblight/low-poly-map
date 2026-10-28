@@ -36,6 +36,7 @@ use crate::synthetic;
 mod levels_probe;
 mod probe;
 mod release;
+mod surfaces;
 
 /// Decoded tile, ready for conversion on the main thread. Only flat arrays cross the channel:
 /// the per-building structs are dropped on the worker (freeing thousands of small allocations
@@ -602,6 +603,8 @@ pub struct Worker {
     fetches: Arc<Mutex<AHashMap<u64, AbortHandle>>>,
     /// Ids of [`Worker::release`] jobs.
     release_seq: AtomicU64,
+    /// Pack built meshes into engine surfaces (`surfaces`, api 1.11).
+    engine_surfaces: bool,
 }
 
 impl Worker {
@@ -688,6 +691,7 @@ impl Worker {
             cache_cap,
             fetches: Arc::new(Mutex::new(AHashMap::new())),
             release_seq: AtomicU64::new(0),
+            engine_surfaces: false,
         })
     }
 
@@ -854,6 +858,7 @@ impl Worker {
                 );
             }
             Job::MeshChunk { key, ring, job, data, lm } => {
+                let packed = self.engine_surfaces;
                 let tx = self.tx.clone();
                 let profile = self.profile.clone();
                 let on_cancel = self.dropped_reply(LayerKind::World, key, ring, job);
@@ -898,7 +903,7 @@ impl Worker {
                         let result = match result {
                             Ok(None) => return JobEnd::Cancelled,
                             Ok(Some(_)) if ctx.is_cancelled() => return JobEnd::Cancelled,
-                            Ok(Some(d)) => Ok(d),
+                            Ok(Some(d)) => Ok(surfaces::pack(d, packed)),
                             Err(e) => Err(e),
                         };
                         let failed = result.is_err();
@@ -913,6 +918,7 @@ impl Worker {
                 );
             }
             Job::MeshLandmarks { key, job, data } => {
+                let packed = self.engine_surfaces;
                 let tx = self.tx.clone();
                 let profile = self.profile.clone();
                 let on_cancel = self.dropped_reply(LayerKind::Landmarks, key, 0, job);
@@ -937,7 +943,7 @@ impl Worker {
                         let result = match result {
                             Ok(None) => return JobEnd::Cancelled,
                             Ok(Some(_)) if ctx.is_cancelled() => return JobEnd::Cancelled,
-                            Ok(Some(d)) => Ok(d),
+                            Ok(Some(d)) => Ok(surfaces::pack(d, packed)),
                             Err(e) => Err(e),
                         };
                         let failed = result.is_err();
@@ -952,6 +958,7 @@ impl Worker {
                 );
             }
             Job::Decode { key, ring, job, payload } => {
+                let packed = self.engine_surfaces;
                 let tx = self.tx.clone();
                 let frame = self.frame;
                 let terrain = self.terrain.clone();
@@ -972,7 +979,7 @@ impl Worker {
                         let result = match result {
                             Ok(None) => return JobEnd::Cancelled,
                             Ok(Some(_)) if ctx.is_cancelled() => return JobEnd::Cancelled,
-                            Ok(Some(d)) => Ok(d),
+                            Ok(Some(d)) => Ok(surfaces::pack(d, packed)),
                             Err(e) => Err(e),
                         };
                         let failed = result.is_err();
@@ -987,6 +994,7 @@ impl Worker {
                 );
             }
             Job::Terrain { key, ring, job, detail } => {
+                let packed = self.engine_surfaces;
                 let tx = self.tx.clone();
                 let frame = self.frame;
                 let terrain = self.terrain.clone();
@@ -1006,7 +1014,7 @@ impl Worker {
                         let result = match result {
                             Ok(None) => return JobEnd::Cancelled,
                             Ok(Some(_)) if ctx.is_cancelled() => return JobEnd::Cancelled,
-                            Ok(Some(d)) => Ok(d),
+                            Ok(Some(d)) => Ok(surfaces::pack(d, packed)),
                             Err(e) => Err(e),
                         };
                         let failed = result.is_err();

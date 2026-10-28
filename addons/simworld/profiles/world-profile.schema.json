@@ -6,35 +6,17 @@
   "type": "object",
   "properties": {
     "profile_version": {
-      "description": "Profile schema version (integer). A file with the library's version or older is strict (an unknown key is an error); a newer file loads and unknown keys are ignored with a warning. The library reads version 7 (version 2 added buildings.r0..r2.min_height_m, version 3 added lights.min_ring, version 4 added the landmark and dark light profiles, lights.profiles.*.windows / floodlight, buildings.overrides, dark_states, slender_tower, min_window_wall_m, lights.street and lights.beacons, version 5 added the terrain section, version 6 added the seed section and fades.max_active, version 7 added memory.budget_mb; an older file loads with their defaults).",
+      "description": "Profile schema version (integer). A file with the library's version or older is strict (an unknown key is an error); a newer file loads and unknown keys are ignored with a warning. The library reads version 7 (version 2 added buildings.r0..r2.min_height_m, version 3 added lights.min_ring, version 4 added the landmark and dark light profiles, lights.profiles.*.windows / floodlight, buildings.overrides, dark_states, slender_tower, min_window_wall_m, lights.street and lights.beacons, version 5 added the terrain section, version 6 added the seed section and fades.max_active, version 7 added memory.budget_mb and the lod section and replaced bands.r0..r2_edge_m by it (bands.r3_edge_m became bands.max_distance_m); an older file loads with their defaults).",
       "type": "integer",
       "minimum": 1,
       "maximum": 1000000
     },
     "bands": {
-      "description": "LOD bands as a quadtree cover by 3D slant distance (camera to the nearest point of a tile's box). R0 = z16 ... R3 = z13.",
+      "description": "LOD bands as a quadtree cover by 3D slant distance (camera to the nearest point of a tile's box). R0 = z16 ... R3 = z13. Since profile_version 7 the edges of R0..R2 come from the screen-space error (lod); r0_edge_m, r1_edge_m and r2_edge_m are removed (refused in a version 7 file, dropped with a warning from an older one) and r3_edge_m is max_distance_m.",
       "type": "object",
       "properties": {
-        "r0_edge_m": {
-          "description": "Outer slant-distance edge of R0 (z16, full extrusion), meters. Must be below r1_edge_m.",
-          "type": "number",
-          "minimum": 50,
-          "maximum": 100000
-        },
-        "r1_edge_m": {
-          "description": "Outer slant-distance edge of R1 (z15), meters. Must be below r2_edge_m.",
-          "type": "number",
-          "minimum": 50,
-          "maximum": 100000
-        },
-        "r2_edge_m": {
-          "description": "Outer slant-distance edge of R2 (z14), meters. Must be below r3_edge_m.",
-          "type": "number",
-          "minimum": 50,
-          "maximum": 100000
-        },
-        "r3_edge_m": {
-          "description": "Outer slant-distance edge of R3 (z13, light points only) and of the whole cover, meters. Nothing is requested beyond it (times hysteresis for tiles already in).",
+        "max_distance_m": {
+          "description": "Outer limit of the whole cover (R3's edge, slant distance), meters: nothing is requested beyond it (times hysteresis for tiles already in). Was r3_edge_m before profile_version 7 (an older file migrates). The edges between R0..R3 come from the screen-space error (lod).",
           "type": "number",
           "minimum": 50,
           "maximum": 100000
@@ -62,6 +44,47 @@
           "type": "number",
           "minimum": 0,
           "maximum": 400
+        }
+      },
+      "additionalProperties": false
+    },
+    "lod": {
+      "description": "Screen-space-error LOD of the vector layer (profile_version 7, api 1.10). A tile of ring r > 0 refines while error_m.r{r} x H / (2 d tan(fov_y / 2)) > tau_eff and coarsens below tau_eff / bands.hysteresis (d = slant distance, H and fov_y from set_view, default 1080 px and 60 deg; tau_eff = tau_px x the set_lod_quality scale). The defaults reproduce the old 0.6 / 2.5 / 7 km edges at the default view; a narrower field of view or a taller viewport moves them out, a smaller viewport moves them in.",
+      "type": "object",
+      "properties": {
+        "tau_px": {
+          "description": "Screen-space error threshold, pixels, at quality 1. Larger = coarser, fewer tiles.",
+          "type": "number",
+          "minimum": 0.5,
+          "maximum": 64
+        },
+        "error_m": {
+          "description": "Geometric error per coarse level, meters: what is lost when a chunk of that ring is not refined to the next finer one (r1 = the R1 chunk against R0). Strictly increasing r1 < r2 < r3.",
+          "type": "object",
+          "properties": {
+            "r1": { "description": "Error of an R1 (z15) chunk against R0 (simplification, roof detail), meters.", "type": "number", "minimum": 0.01, "maximum": 1000 },
+            "r2": { "description": "Error of an R2 (z14) chunk against R1 (merged blocks), meters.", "type": "number", "minimum": 0.01, "maximum": 1000 },
+            "r3": { "description": "Error of an R3 (z13) chunk against R2 (no buildings, lights only), meters.", "type": "number", "minimum": 0.01, "maximum": 1000 }
+          },
+          "additionalProperties": false
+        },
+        "rear_tau_scale": {
+          "description": "Multiplier of tau for tiles behind the camera (rear hemisphere). Stored; takes effect with Tiles and LOD v2 step T4.",
+          "type": "number",
+          "minimum": 1,
+          "maximum": 16
+        },
+        "adaptive": {
+          "description": "Frame-budget scaling of tau (Tiles and LOD v2 step T5). Stored; not applied yet (tau_eff = tau_px x quality).",
+          "type": "object",
+          "properties": {
+            "enabled": { "description": "Scale tau by the measured frame time.", "type": "boolean" },
+            "frame_budget_ms": { "description": "Target frame time, milliseconds.", "type": "number", "minimum": 1, "maximum": 1000 },
+            "min_scale": { "description": "Lowest tau scale (finer than the profile), at most 1.", "type": "number", "minimum": 0.05, "maximum": 1 },
+            "max_scale": { "description": "Highest tau scale (coarser than the profile), at least 1.", "type": "number", "minimum": 1, "maximum": 16 },
+            "smoothing_s": { "description": "Smoothing time of the scale, seconds.", "type": "number", "minimum": 0, "maximum": 60 }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false

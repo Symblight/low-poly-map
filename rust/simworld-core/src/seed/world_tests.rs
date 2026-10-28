@@ -352,7 +352,7 @@ fn a_reconfigure_with_the_same_files_reuses_the_loaded_world() {
     // A teleport (new origin) and a vector-band change keep the world; a seed key rebuilds it.
     let mut o = seed_options(54.9, 23.9);
     o.profile_overrides =
-        Some(serde_json::json!({ "terrain": { "enabled": true, "flat_radius_m": 0.0, "flat_blend_m": 0.0 }, "bands": { "r2_edge_m": 6000.0 } }));
+        Some(serde_json::json!({ "terrain": { "enabled": true, "flat_radius_m": 0.0, "flat_blend_m": 0.0 }, "lod": { "error_m": { "r3": 25.0 } } }));
     assert!(world.configure_world(o).ok);
     assert!(Arc::ptr_eq(world.seed_world().unwrap(), &a));
     let mut o = seed_options(54.9, 23.9);

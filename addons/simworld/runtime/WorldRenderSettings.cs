@@ -28,6 +28,14 @@ public partial class WorldRenderSettings : Resource
     /// </summary>
     [ExportGroup("Level of detail")]
     [Export(PropertyHint.Range, "0.1,4,0.05")] public float LodPixelScale { get; set; } = 1f;
+    /// <summary>
+    /// True (default): the window / sprite cross-fade, the street light pool fade and the light sprites' far end follow the live LOD edges of the library
+    /// (<c>lod_edges_m</c>, api 1.10): with D = the R2 to R1 edge the blend runs <see cref="BlendStartShare"/> x D .. <see cref="BlendEndShare"/> x D, the pool fade
+    /// <see cref="PoolStartShare"/> x D .. <see cref="PoolEndShare"/> x D, and the sprites fade out <see cref="LightFadeShare"/> x .. 1 x <c>bands.max_distance_m</c>.
+    /// The shares reproduce the fixed values (900 / 2000, 1200 / 2500, 21000 / 25000 m) at D = 2500 m and a 25 km maximum distance. False = the fixed values below.
+    /// </summary>
+    [Export] public bool BlendFollowsLod { get; set; } = true;
+    public const float BlendStartShare = 0.36f, BlendEndShare = 0.8f, PoolStartShare = 0.48f, PoolEndShare = 1.0f, LightFadeShare = 0.84f;
 
     // ---- debug --------------------------------------------------------------------------------
     [ExportGroup("Debug")]

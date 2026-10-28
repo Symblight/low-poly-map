@@ -7,9 +7,9 @@ namespace LowPolyMap;
 
 /// <summary>
 /// F3-toggled settings panel (bottom-left; hidden at startup, launch arg <c>--settings-open</c> shows it): flight speed
-/// (live, two-way with <see cref="FreeFlyCamera.Speed"/>), the four band edges (how far each LOD ring of 3D buildings reaches)
-/// the per-ring minimum building height and, with a terrain-capable library (api 1.5), the terrain layer (enable toggle and hills amplitude
-/// apply with the world restart, the detail slider is live through set_terrain_detail without a teleport). Edges and heights are profile values the library reads at configure time, so
+/// (live, two-way with <see cref="FreeFlyCamera.Speed"/>), the level of detail (api 1.10: a live "Detail" slider = set_lod_quality, a restart-type
+/// "Max distance" = bands.max_distance_m and a read-only readout of the live refine distances; the fixed band edges are gone), the per-ring minimum building height and, with a terrain-capable library (api 1.5), the terrain layer (enable toggle and hills amplitude
+/// apply with the world restart, the detail slider is live through set_terrain_detail without a teleport). Max distance and heights are profile values the library reads at configure time, so
 /// they are applied by <see cref="WorldView.ApplyProfileOverrides"/> (world restart at the camera position): with the
 /// auto-apply box on, 0.6 s after the last change, otherwise with the Apply button. A rejected profile keeps the previous world
 /// running, shows the library's error in red and reverts the sliders. Controls never take keyboard focus (only the speed
@@ -21,28 +21,30 @@ public partial class SettingsMenu : PanelContainer
     private const float Margin = 12f;
     private const float Width = 420f;
     private const double AutoApplyDelay = 0.6;
-    private const double EdgeMinM = 50.0;
-    private const double EdgeMaxM = 100000.0;
-    /// <summary>Smallest allowed gap between neighbouring band edges (they must stay strictly increasing).</summary>
-    private const double EdgeGapM = 10.0;
+    private const double MaxDistMinM = 50.0;
+    private const double MaxDistMaxM = 100000.0;
+    private const double MaxDistDefaultM = 25000.0;
+    private const double QualityMin = 0.25, QualityMax = 4.0;
     private const double SpeedMin = 1.0;
     private const double SpeedMax = 2000.0;
     private const double SpeedDefault = 80.0;
     private const double MinHeightMax = 100.0;
     private const string Attribution = "© OpenStreetMap contributors";
 
-    private static readonly double[] EdgeDefaults = { 600.0, 2500.0, 7000.0, 25000.0 };
-    private static readonly string[] EdgeKeys = { "r0_edge_m", "r1_edge_m", "r2_edge_m", "r3_edge_m" };
-    private static readonly string[] EdgeNames = { "R0 detailed buildings", "R1 boxes", "R2 merged", "R3 lights only" };
 
     [Export] public WorldView? Bridge { get; set; }
     [Export] public FreeFlyCamera? Camera { get; set; }
 
     /// <summary>Apply range / filter changes 0.6 s after the last change (default on); off = Apply button only.</summary>
     public bool AutoApply { get; set; } = true;
-    /// <summary>Band edges in metres as shown on the panel (may be ahead of <see cref="AppliedEdges"/>).</summary>
-    public IReadOnlyList<double> Edges => _edges;
-    public IReadOnlyList<double> AppliedEdges => _appliedEdges;
+    /// <summary>bands.max_distance_m in metres (outer limit of the cover) as shown on the panel (may be ahead of <see cref="AppliedMaxDistance"/>) and as applied.</summary>
+    public double MaxDistance => _maxDist;
+    public double AppliedMaxDistance => _appliedMaxDist;
+    /// <summary>set_lod_quality scale as shown on the panel (live; the library clamps to 0.25..4) and whether the library has the method (api 1.10).</summary>
+    public double LodQuality => _quality;
+    public bool HasLodQuality { get; private set; }
+    /// <summary>True when the profile has bands.max_distance_m (profile_version 7).</summary>
+    public bool HasMaxDistance { get; private set; }
     public IReadOnlyList<double> MinHeights => _minH;
     public IReadOnlyList<double> AppliedMinHeights => _appliedMinH;
     /// <summary>True from <see cref="Apply"/> until the bridge reports the result.</summary>
@@ -76,8 +78,11 @@ public partial class SettingsMenu : PanelContainer
     private CheckBox _terrainCheck = null!;
     private HSlider _ampSlider = null!, _detailSlider = null!;
     private SpinBox _ampBox = null!, _detailBox = null!;
-    private readonly double[] _edges = new double[4];
-    private readonly double[] _appliedEdges = new double[4];
+    private double _maxDist = MaxDistDefaultM, _appliedMaxDist = MaxDistDefaultM;
+    private double _quality = 1.0;
+    private bool _qualityDirty;
+    private double _qualityTimer;
+    private Label _lodLabel = null!;
     private readonly double[] _minH = new double[3];
     private readonly double[] _appliedMinH = new double[3];
     private const int LightRingDefault = 2;
@@ -86,8 +91,8 @@ public partial class SettingsMenu : PanelContainer
     private SpinBox _ringBox = null!;
     private readonly StreamerStats _stats = new();
 
-    private readonly HSlider[] _edgeSlider = new HSlider[4];
-    private readonly SpinBox[] _edgeBox = new SpinBox[4];
+    private HSlider _qualitySlider = null!, _maxSlider = null!;
+    private SpinBox _qualityBox = null!, _maxBox = null!;
     private readonly HSlider[] _minSlider = new HSlider[3];
     private readonly SpinBox[] _minBox = new SpinBox[3];
     private HSlider _speedSlider = null!;
@@ -132,15 +137,18 @@ public partial class SettingsMenu : PanelContainer
         _speedSlider.DragEnded += _ => _speedDrag = false;
         _speedBox.ValueChanged += v => { if (!_syncing) SetSpeed(v); };
 
-        // -- generation range
-        AddHeading(col, "3D building range (band edges)", ResetRange);
-        for (int i = 0; i < 4; i++)
-        {
-            int ring = i;
-            (_edgeSlider[i], _edgeBox[i]) = AddRow(col, EdgeNames[i], System.Math.Log10(EdgeMinM), System.Math.Log10(EdgeMaxM), 0.001, EdgeMinM, EdgeMaxM, 1, " m");
-            _edgeSlider[i].ValueChanged += v => { if (!_syncing) SetEdge(ring, RoundEdge(System.Math.Pow(10, v))); };
-            _edgeBox[i].ValueChanged += v => { if (!_syncing) SetEdge(ring, v); };
-        }
+        // -- level of detail: screen-space error (api 1.10). Quality is live, the maximum distance restarts the world.
+        AddHeading(col, "Level of detail (screen-space error)", ResetRange);
+        (_qualitySlider, _qualityBox) = AddRow(col, "Detail (tau x)", System.Math.Log10(QualityMin), System.Math.Log10(QualityMax), 0.001, QualityMin, QualityMax, 0.05, "x");
+        _qualityBox.TooltipText = "set_lod_quality: multiplies the pixel error threshold tau; 2 halves every refine distance (coarser, fewer tiles), 0.5 doubles them; live, no restart";
+        _qualitySlider.ValueChanged += v => { if (!_syncing) SetQuality(System.Math.Round(System.Math.Pow(10, v), 2)); };
+        _qualityBox.ValueChanged += v => { if (!_syncing) SetQuality(v); };
+        (_maxSlider, _maxBox) = AddRow(col, "Max distance", System.Math.Log10(MaxDistMinM), System.Math.Log10(MaxDistMaxM), 0.001, MaxDistMinM, MaxDistMaxM, 1, " m");
+        _maxBox.TooltipText = "bands.max_distance_m: how far the cover reaches (R3 edge); applies with the world restart";
+        _maxSlider.ValueChanged += v => { if (!_syncing) SetMaxDistance(RoundDistance(System.Math.Pow(10, v))); };
+        _maxBox.ValueChanged += v => { if (!_syncing) SetMaxDistance(v); };
+        _lodLabel = new Label { AutowrapMode = TextServer.AutowrapMode.WordSmart, CustomMinimumSize = new Vector2(Width - 20, 0), Modulate = new Color(1f, 1f, 1f, 0.75f) };
+        col.AddChild(_lodLabel);
 
         // -- building filter
         AddHeading(col, "Hide buildings lower than", ResetFilter);
@@ -200,6 +208,8 @@ public partial class SettingsMenu : PanelContainer
         if (!HasMinHeight)
             for (int i = 0; i < 3; i++) { _minSlider[i].Editable = false; _minBox[i].Editable = false; }
         _ringSlider.Editable = _ringBox.Editable = HasLightMinRing;
+        _qualitySlider.Editable = _qualityBox.Editable = HasLodQuality;
+        _maxSlider.Editable = _maxBox.Editable = HasMaxDistance;
         _terrainCheck.Disabled = !HasTerrain;
         _ampSlider.Editable = _ampBox.Editable = HasTerrain;
         _detailSlider.Editable = _detailBox.Editable = HasTerrain && _appliedTerrainOn;
@@ -255,17 +265,16 @@ public partial class SettingsMenu : PanelContainer
         return s < 10 ? System.Math.Round(s * 10) / 10 : System.Math.Round(s);
     }
 
-    private static double RoundEdge(double m) => m < 1000 ? System.Math.Round(m / 5) * 5 : System.Math.Round(m / 10) * 10;
+    private static double RoundDistance(double m) => m < 1000 ? System.Math.Round(m / 5) * 5 : System.Math.Round(m / 10) * 10;
 
     /// <summary>Pushes the model into every slider and number box without raising their change signals.</summary>
     private void SyncWidgets()
     {
         _syncing = true;
-        for (int i = 0; i < 4; i++)
-        {
-            _edgeSlider[i].SetValueNoSignal(System.Math.Log10(_edges[i]));
-            _edgeBox[i].SetValueNoSignal(_edges[i]);
-        }
+        _qualitySlider.SetValueNoSignal(System.Math.Log10(_quality));
+        _qualityBox.SetValueNoSignal(_quality);
+        _maxSlider.SetValueNoSignal(System.Math.Log10(_maxDist));
+        _maxBox.SetValueNoSignal(_maxDist);
         for (int i = 0; i < 3; i++)
         {
             _minSlider[i].SetValueNoSignal(_minH[i]);
@@ -310,21 +319,38 @@ public partial class SettingsMenu : PanelContainer
         Camera.Speed = (float)System.Math.Clamp(v, 0.0, FreeFlyCamera.MaxSpeed);
     }
 
-    /// <summary>
-    /// Sets band edge <paramref name="ring"/> (0..3) in metres, clamped to 50..100000 and kept strictly increasing: neighbours that
-    /// would cross are pushed along. Marks the panel dirty (auto-apply starts its timer).
-    /// </summary>
-    public void SetEdge(int ring, double metres)
+    /// <summary>bands.max_distance_m in metres (50..100000): the outer limit of the cover. Marks the panel dirty (auto-apply starts its timer).</summary>
+    public void SetMaxDistance(double metres)
     {
-        metres = System.Math.Clamp(metres, EdgeMinM + ring * EdgeGapM, EdgeMaxM - (3 - ring) * EdgeGapM);
-        if (_edges[ring] == metres) return;
-        _edges[ring] = metres;
-        for (int j = ring + 1; j < 4; j++)
-            if (_edges[j] < _edges[j - 1] + EdgeGapM) _edges[j] = _edges[j - 1] + EdgeGapM;
-        for (int j = ring - 1; j >= 0; j--)
-            if (_edges[j] > _edges[j + 1] - EdgeGapM) _edges[j] = _edges[j + 1] - EdgeGapM;
+        if (!HasMaxDistance) return;
+        metres = System.Math.Clamp(metres, MaxDistMinM, MaxDistMaxM);
+        if (_maxDist == metres) return;
+        _maxDist = metres;
         SyncWidgets();
         MarkDirty();
+    }
+
+    /// <summary>set_lod_quality, live (no restart, no teleport): the pixel error threshold multiplier, clamped to 0.25..4; debounced 0.3 s while the slider moves.</summary>
+    public void SetQuality(double scale)
+    {
+        if (!HasLodQuality) return;
+        scale = System.Math.Clamp(scale, QualityMin, QualityMax);
+        if (_quality == scale) return;
+        _quality = scale;
+        _qualityDirty = true;
+        _qualityTimer = 0.3;
+        SyncWidgets();
+    }
+
+    /// <summary>Sends the panel's quality to the library now (the debounce skipped); returns the scale in effect.</summary>
+    public double ApplyQualityNow()
+    {
+        _qualityDirty = false;
+        if (Bridge == null || !HasLodQuality) return double.NaN;
+        double eff = Bridge.SetLodQuality(_quality);
+        if (!double.IsNaN(eff)) _quality = eff;
+        SyncWidgets();
+        return eff;
     }
 
     /// <summary>Hide buildings lower than <paramref name="metres"/> (0..100) in ring 0..2.</summary>
@@ -397,9 +423,10 @@ public partial class SettingsMenu : PanelContainer
 
     public void ResetRange()
     {
-        for (int i = 0; i < 4; i++) _edges[i] = EdgeDefaults[i];
+        if (HasMaxDistance) _maxDist = MaxDistDefaultM;
+        if (HasLodQuality) { _quality = 1.0; _qualityDirty = true; _qualityTimer = 0.0; }
         SyncWidgets();
-        MarkDirty();
+        if (HasMaxDistance) MarkDirty();
     }
 
     public void ResetFilter()
@@ -421,7 +448,11 @@ public partial class SettingsMenu : PanelContainer
     private void LoadFromProfile()
     {
         var profile = Bridge?.Streamer.WorldProfile();
-        System.Array.Copy(EdgeDefaults, _edges, 4);
+        Bridge?.ReadLod();
+        HasLodQuality = Bridge != null && Bridge.Streamer.IsAvailable && Bridge.Streamer.HasLodQuality;
+        _quality = HasLodQuality ? System.Math.Clamp(Bridge!.LodQuality, QualityMin, QualityMax) : 1.0;
+        HasMaxDistance = false;
+        _maxDist = MaxDistDefaultM;
         System.Array.Clear(_minH);
         HasMinHeight = false;
         HasLightMinRing = false;
@@ -436,8 +467,11 @@ public partial class SettingsMenu : PanelContainer
             if (profile.TryGetValue("bands", out var bv) && bv.VariantType == Variant.Type.Dictionary)
             {
                 var b = bv.AsGodotDictionary();
-                for (int i = 0; i < 4; i++)
-                    if (b.TryGetValue(EdgeKeys[i], out var e)) _edges[i] = System.Math.Clamp(e.AsDouble(), EdgeMinM, EdgeMaxM);
+                if (b.TryGetValue("max_distance_m", out var e))
+                {
+                    HasMaxDistance = true;
+                    _maxDist = System.Math.Clamp(e.AsDouble(), MaxDistMinM, MaxDistMaxM);
+                }
             }
             if (profile.TryGetValue("buildings", out var bd) && bd.VariantType == Variant.Type.Dictionary)
             {
@@ -464,7 +498,7 @@ public partial class SettingsMenu : PanelContainer
         }
         _appliedTerrainOn = _terrainOn;
         _appliedTerrainAmp = _terrainAmp;
-        System.Array.Copy(_edges, _appliedEdges, 4);
+        _appliedMaxDist = _maxDist;
         System.Array.Copy(_minH, _appliedMinH, 3);
         _appliedLightRing = _lightRing;
         _effective = Bridge != null && Bridge.Streamer.IsAvailable ? Bridge.EffectiveProfileText() : "no world";
@@ -472,13 +506,12 @@ public partial class SettingsMenu : PanelContainer
 
     // ---- apply --------------------------------------------------------------------------------
 
-    /// <summary>Queues a world restart with the panel's band edges and minimum heights (see <see cref="WorldView.ApplyProfileOverrides"/>).</summary>
+    /// <summary>Queues a world restart with the panel's maximum distance and minimum heights (see <see cref="WorldView.ApplyProfileOverrides"/>).</summary>
     public void Apply()
     {
         if (Bridge == null) return;
-        var bands = new Godot.Collections.Dictionary();
-        for (int i = 0; i < 4; i++) bands[EdgeKeys[i]] = _edges[i];
-        var o = new Godot.Collections.Dictionary { ["bands"] = bands };
+        var o = new Godot.Collections.Dictionary();
+        if (HasMaxDistance) o["bands"] = new Godot.Collections.Dictionary { ["max_distance_m"] = _maxDist };
         if (HasMinHeight)
         {
             var b = new Godot.Collections.Dictionary();
@@ -508,7 +541,7 @@ public partial class SettingsMenu : PanelContainer
         else
         {
             // Rejected: the previous world still runs; go back to its values.
-            System.Array.Copy(_appliedEdges, _edges, 4);
+            _maxDist = _appliedMaxDist;
             System.Array.Copy(_appliedMinH, _minH, 3);
             _lightRing = _appliedLightRing;
             _terrainOn = _appliedTerrainOn;
@@ -530,6 +563,11 @@ public partial class SettingsMenu : PanelContainer
 
     public override void _Process(double delta)
     {
+        if (_qualityDirty && Bridge != null)
+        {
+            _qualityTimer -= delta;
+            if (_qualityTimer <= 0) ApplyQualityNow();
+        }
         if (_detailDirty && Bridge != null)
         {
             _detailTimer -= delta;
@@ -560,6 +598,11 @@ public partial class SettingsMenu : PanelContainer
             _syncing = false;
         }
         if (_dirty) RefreshStatus();
+        if (Bridge != null && Bridge.HasLodStats)
+        {
+            var e = Bridge.LodEdgesM;
+            _lodLabel.Text = $"live: tau {Bridge.TauEff:0.##} px, fov {Bridge.LibraryViewFovYDeg:0.#} deg, H {Bridge.LibraryViewHeightPx} px\nrefine distances R0|R1|R2: {e[0]:0}|{e[1]:0}|{e[2]:0} m, max {e[3]:0} m";
+        }
 
         _statsTimer -= delta;
         if (_statsTimer <= 0 && Bridge != null && Bridge.Streamer.DebugStats(_stats))
@@ -669,19 +712,45 @@ public partial class SettingsMenu : PanelContainer
         if (System.Math.Abs(_speedBox.Value - 123) > 0.2 || System.Math.Abs(_speedSlider.Value - System.Math.Log10(123)) > 0.01) fails.Add($"panel did not follow the camera speed (box {_speedBox.Value}, slider {_speedSlider.Value})");
         Visible = wasVisible;
         cam.Speed = 40f;
-        _edgeBox[3].Value = 12000;
+        _maxBox.Value = 12000;
         _minSlider[1].Value = 4;
         await Delay(0.2);
         if (ApplyInFlight || bridge.ReconfigureCount != cw) fails.Add("auto-apply fired before its 0.6 s delay");
         if (!await WaitFor(() => bridge.ReconfigureCount == cw + 1 && !ApplyInFlight, 10)) { fails.Add("auto-apply did not run after the widget changes"); return; }
-        if (System.Math.Abs(_appliedEdges[3] - 12000) > 0.5 || System.Math.Abs(_appliedMinH[1] - 4) > 0.01) fails.Add($"widget apply: effective R3 {_appliedEdges[3]}, R1 min {_appliedMinH[1]}");
+        if (System.Math.Abs(_appliedMaxDist - 12000) > 0.5 || System.Math.Abs(_appliedMinH[1] - 4) > 0.01) fails.Add($"widget apply: effective max distance {_appliedMaxDist}, R1 min {_appliedMinH[1]}");
         GD.Print($"[SelfTest] widgets: speed slider/box/wheel ok, auto-apply ran once; effective {_effective}");
         AutoApply = false;
         await WaitIdle(150);
 
+        // Live quality (set_lod_quality through the slider): changes the refine distances without a reconfigure, and survives one.
+        if (!HasLodQuality) fails.Add("library has no set_lod_quality (api < 1.10)");
+        else
+        {
+            await Delay(0.8);
+            bridge.ReadLod();
+            double[] e0 = (double[])bridge.LodEdgesM.Clone();
+            int rc0 = bridge.ReconfigureCount;
+            _qualitySlider.Value = System.Math.Log10(2.0);
+            await Delay(1.0);
+            bridge.ReadLod();
+            for (int i = 0; i < 3; i++)
+                if (e0[i] <= 0 || System.Math.Abs(bridge.LodEdgesM[i] / e0[i] - 0.5) > 0.01) fails.Add($"quality x2 (slider): R{i} edge {e0[i]:0.#} -> {bridge.LodEdgesM[i]:0.#} m, expected half");
+            if (System.Math.Abs(bridge.LodEdgesM[3] - e0[3]) > 0.5) fails.Add($"quality changed the max distance {e0[3]} -> {bridge.LodEdgesM[3]}");
+            if (System.Math.Abs(bridge.LodQuality - 2.0) > 1e-9 || System.Math.Abs(bridge.TauEff - 8.0) > 0.01) fails.Add($"quality x2: library quality {bridge.LodQuality}, tau_eff {bridge.TauEff} (expected 2 and 8 px)");
+            if (bridge.ReconfigureCount != rc0 || ApplyInFlight) fails.Add("the quality slider caused a reconfigure");
+            GD.Print($"[SelfTest] quality x2 live: edges {e0[0]:0}/{e0[1]:0}/{e0[2]:0}/{e0[3]:0} -> {bridge.LodEdgesM[0]:0}/{bridge.LodEdgesM[1]:0}/{bridge.LodEdgesM[2]:0}/{bridge.LodEdgesM[3]:0} m, tau_eff {bridge.TauEff:0.##} px, no reconfigure");
+            _qualityBox.Value = 1.0;
+            await Delay(1.0);
+            bridge.ReadLod();
+            for (int i = 0; i < 3; i++)
+                if (System.Math.Abs(bridge.LodEdgesM[i] / e0[i] - 1.0) > 0.01) fails.Add($"quality x1 (box): R{i} edge {bridge.LodEdgesM[i]:0.#} m, expected back to {e0[i]:0.#}");
+            await WaitIdle(150);
+        }
+
         // Config A: smaller ranges plus a height filter. Config B: the library defaults.
-        double[] edgesA = { 600, 2500, 3000, 6000 }, minA = { 0, 8, 0 };
-        double[] edgesB = EdgeDefaults, minB = { 0, 0, 0 };
+        double maxA = 6000, qualityA = 2.0, minA8 = 8;
+        double maxB = MaxDistDefaultM, qualityB = 1.0;
+        double[] minA = { 0, minA8, 0 }, minB = { 0, 0, 0 };
         const int ringA = 1, ringB = LightRingDefault;
         int nodesBase = (int)Performance.GetMonitor(Performance.Monitor.ObjectNodeCount);
         long loadedA = -1, loadedB = -1;
@@ -694,7 +763,6 @@ public partial class SettingsMenu : PanelContainer
         for (int k = 0; k < 11; k++)
         {
             bool a = k % 2 == 0;
-            var edges = a ? edgesA : edgesB;
             var minH = a ? minA : minB;
             if (k > 0) cam.GlobalPosition += new Vector3(250f, 0f, -150f); // keep moving between applies
             string before = Snapshot();
@@ -702,7 +770,9 @@ public partial class SettingsMenu : PanelContainer
             float y0 = cam.GlobalPosition.Y;
             int count0 = bridge.ReconfigureCount;
 
-            for (int i = 0; i < 4; i++) SetEdge(i, edges[i]);
+            SetMaxDistance(a ? maxA : maxB);
+            SetQuality(a ? qualityA : qualityB);
+            ApplyQualityNow(); // live, before the restart: the library keeps the scale across configure_world
             for (int i = 0; i < 3; i++) SetMinHeight(i, minH[i]);
             int lightRing = a ? ringA : ringB;
             SetLightMinRing(lightRing);
@@ -720,7 +790,11 @@ public partial class SettingsMenu : PanelContainer
             GD.Print($"[SelfTest] apply {k} ({(a ? "A" : "B")}): origin moved to camera, tiles held at finish {atEventLoaded}\n  before: {before}\n  after:  {after}");
 
             // Applied values: what the library reports must be what was sent.
-            for (int i = 0; i < 4; i++) if (System.Math.Abs(_appliedEdges[i] - edges[i]) > 0.5) fails.Add($"apply {k}: effective edge R{i} {_appliedEdges[i]}, sent {edges[i]}");
+            double wantMax = a ? maxA : maxB, wantQ = a ? qualityA : qualityB;
+            if (System.Math.Abs(_appliedMaxDist - wantMax) > 0.5) fails.Add($"apply {k}: effective max distance {_appliedMaxDist}, sent {wantMax}");
+            bridge.ReadLod();
+            if (System.Math.Abs(bridge.LodQuality - wantQ) > 1e-9) fails.Add($"apply {k}: library LOD quality {bridge.LodQuality} after the restart, expected {wantQ} (kept across configure)");
+            if (System.Math.Abs(bridge.LodEdgesM[3] - wantMax) > 0.5) fails.Add($"apply {k}: lod_edges_m R3 {bridge.LodEdgesM[3]}, expected the max distance {wantMax}");
             if (!HasLightMinRing) fails.Add("profile has no lights.min_ring key");
             else if (_appliedLightRing != lightRing) fails.Add($"apply {k}: effective lights.min_ring {_appliedLightRing}, sent {lightRing}");
             if (!HasMinHeight) fails.Add("profile has no buildings.rN.min_height_m keys");
@@ -747,25 +821,25 @@ public partial class SettingsMenu : PanelContainer
             if (a) loadedA = bridge.Cover.Loaded; else loadedB = bridge.Cover.Loaded;
         }
 
-        // Rejection path: an out-of-range edge sent behind the sliders' back must leave the running world alone and revert the panel.
+        // Rejection path: an out-of-range tau sent behind the sliders' back must leave the running world alone and revert the panel.
         int loadedBefore = bridge.Cover.Loaded, countBefore = bridge.ReconfigureCount, unloadedBefore = bridge.UnloadedTotal;
         bridge.Streamer.DebugStats(_stats);
         double originLat = _stats.OriginLat, originLon = _stats.OriginLon;
         var posBefore = cam.GlobalPosition;
-        bridge.ApplyProfileOverrides(new Godot.Collections.Dictionary { ["bands"] = new Godot.Collections.Dictionary { ["r3_edge_m"] = 5.0e6 } });
+        bridge.ApplyProfileOverrides(new Godot.Collections.Dictionary { ["lod"] = new Godot.Collections.Dictionary { ["tau_px"] = 1000.0 } });
         ApplyInFlight = true;
         if (!await WaitFor(() => !ApplyInFlight, 30)) { fails.Add("rejection test: bridge never answered"); return; }
         await Delay(1.0);
         bridge.Streamer.DebugStats(_stats);
         GD.Print($"[SelfTest] rejection: ok={LastApplyOk}, error text '{LastError}', ReconfigureCount {countBefore} -> {bridge.ReconfigureCount}, "
             + $"tiles held {loadedBefore} -> {bridge.Cover.Loaded} ({bridge.UnloadedTotal - unloadedBefore} unloaded meanwhile by normal streaming), library origin unchanged: {_stats.OriginLat == originLat && _stats.OriginLon == originLon}");
-        if (LastApplyOk || LastError.Length == 0) fails.Add("rejection test: an out-of-range edge was not rejected with an error text");
+        if (LastApplyOk || LastError.Length == 0) fails.Add("rejection test: an out-of-range lod.tau_px was not rejected with an error text");
         if (bridge.ReconfigureCount != countBefore) fails.Add("rejection test: counted as a reconfigure");
         if (bridge.TerrainActive && bridge.TerrainCover.Loaded == 0) fails.Add("rejection test: the terrain layer was dropped");
         if (bridge.UnloadedTotal - unloadedBefore > loadedBefore / 3 || bridge.Cover.Loaded < loadedBefore / 2) fails.Add($"rejection test: the world was dropped ({loadedBefore} -> {bridge.Cover.Loaded} tiles); the previous world must keep running");
         if (_stats.OriginLat != originLat || _stats.OriginLon != originLon) fails.Add("rejection test: library origin changed");
         if (cam.GlobalPosition != posBefore) fails.Add("rejection test: camera moved");
-        for (int i = 0; i < 4; i++) if (System.Math.Abs(_edges[i] - _appliedEdges[i]) > 0.01) fails.Add("rejection test: sliders not reverted");
+        if (System.Math.Abs(_maxDist - _appliedMaxDist) > 0.01 || System.Math.Abs(_maxBox.Value - _appliedMaxDist) > 0.5) fails.Add("rejection test: sliders not reverted");
 
         int roots = bridge.TileRootCount;
         int peak = System.Math.Max(24, bridge.PeakActiveTiles);
@@ -774,7 +848,7 @@ public partial class SettingsMenu : PanelContainer
             + $"{bridge.PoolCreated - bridge.PoolFree} in use; scene nodes {nodesBase} -> {nodesEnd}; last A loaded {loadedA}, last B loaded {loadedB}");
         if (roots > rootsWarm * 1.15 + 8) fails.Add($"tile pool grew from {rootsWarm} (after the first A+B) to {roots} node sets");
         if (roots != peak) fails.Add($"tile pool has {roots} node sets, expected exactly the peak {peak} (leak or double allocation)");
-        if (loadedA >= loadedB) fails.Add($"config A (smaller ranges) loaded {loadedA} tiles, not fewer than config B's {loadedB}: the ranges had no effect");
+        if (loadedA >= loadedB) fails.Add($"config A (max distance 6000, quality x2) loaded {loadedA} tiles, not fewer than config B's {loadedB}: the ranges had no effect");
         if (bridge.ConsistencyErrors > 0) fails.Add($"{bridge.ConsistencyErrors} cover consistency errors");
     }
 }

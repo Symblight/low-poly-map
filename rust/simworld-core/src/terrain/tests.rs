@@ -213,7 +213,7 @@ fn drape_table_is_frozen_at_the_default_rules() {
                 { "edge_m": 25000.0, "max_error_m": 12.0, "max_edge_m": 0.0, "max_triangles": 4096 },
                 { "edge_m": 60000.0, "max_error_m": 30.0, "max_edge_m": 0.0, "max_triangles": 4096 },
                 { "edge_m": 130000.0, "max_error_m": 60.0, "max_edge_m": 0.0, "max_triangles": 4096 } ] },
-            "bands": { "r1_edge_m": 2000.0, "r3_edge_m": 40000.0, "hysteresis": 1.3 } })),
+            "bands": { "max_distance_m": 40000.0, "hysteresis": 1.3 }, "lod": { "error_m": { "r2": 8.55 } } })),
         &crate::NullLog,
     )
     .unwrap();

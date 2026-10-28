@@ -8,13 +8,17 @@
 //! latitude (one `cos(lat)` per frame, no trig per tile). The scale error grows with the
 //! north-south offset: ~0.6 % at 25 km at Vilnius latitude, irrelevant for band selection.
 //!
-//! Bands (ring = 16 - zoom; default edges from the world profile): R0 z16 < 600 m, R1 z15 <
-//! 2.5 km, R2 z14 < 7 km, R3 z13 < 25 km. A tile of ring r > 0 is split into its 4 children
-//! (ring r - 1) when its box is closer than the finer band's outer edge, measured from that
+//! Bands (ring = 16 - zoom). Since api 1.10 (Tiles and LOD v2 step T3a) the edges of R0..R2
+//! come from the screen-space error: a tile of ring r > 0 refines into its 4 children when
+//! `SSE = e_r * H / (2 d tan(fov_y / 2)) > tau`, i.e. when its slant distance is below the
+//! refine distance [`sse_refine_distance`]`(e_r, view, tau)` (`e_r` = profile `lod.error_m.r{r}`,
+//! `H` / `fov_y` from the host's `set_view`, `tau` = `lod.tau_px` x the quality scale). At the
+//! default view (1080 px, 60 deg, tau 4) the defaults give the old 0.6 / 2.5 / 7 km edges. R3's
+//! edge is the outer limit `bands.max_distance_m` (25 km). Distances are measured from the
 //! finer band's look-ahead point. Hysteresis (default 15 %): a split tile merges again only once
-//! its distance exceeds the edge by that much; a z13 root is added below 25 km and dropped
-//! beyond 28.75 km. The tuning values come in as [`BandParams`] (`profile::Profile::bands`);
-//! only the structural constants (ring count, zooms) live here.
+//! its distance exceeds the edge by that much (SSE < tau / 1.15); a z13 root is added below
+//! 25 km and dropped beyond 28.75 km. The tuning values come in as [`BandParams`]
+//! (`profile::Profile::bands`); only the structural constants (ring count, zooms) live here.
 
 use crate::geo::{lat_to_tile_y, lon_to_tile_x, TileKey, MERCATOR_CIRCUMFERENCE};
 
@@ -116,10 +120,17 @@ pub struct Layer {
 }
 
 impl Layer {
-    /// The vector layer: zooms 13..16, the profile's `bands.*` and `streaming.*` limits.
+    /// The vector layer at the default view ([`LodView::default`], quality 1): zooms 13..16,
+    /// the profile's `bands.*` / `lod.*` and `streaming.*` limits.
     pub fn world(b: &BandParams, max_fetch: u32, max_mesh: u32) -> Self {
+        Self::world_view(b, &LodView::default(), 1.0, max_fetch, max_mesh)
+    }
+
+    /// The vector layer for a view and quality scale: the edges of R0..R2 are the SSE refine
+    /// distances ([`BandParams::edges_for`]), R3's is `bands.max_distance_m`.
+    pub fn world_view(b: &BandParams, view: &LodView, quality: f64, max_fetch: u32, max_mesh: u32) -> Self {
         let mut edge_m = [0.0; MAX_RINGS];
-        edge_m[..RING_COUNT].copy_from_slice(&b.edge_m);
+        edge_m[..RING_COUNT].copy_from_slice(&b.edges_for(view, quality));
         Self {
             kind: LayerKind::World,
             root_zoom: ROOT_ZOOM,
@@ -223,11 +234,75 @@ pub fn above_horizon(horizontal_m: f64, line_m: f64, hysteresis: f64, current: b
     }
 }
 
-/// Band tuning from the world profile (`bands.*`).
+/// The host's view for the screen-space error (contract `set_view`, api 1.10): vertical field of
+/// view, viewport height in physical pixels and the camera's forward direction (local axes,
+/// unit length; stored for the rear-hemisphere relaxation of step T4, unused by the cover yet).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LodView {
+    pub fov_y_deg: f64,
+    pub viewport_h_px: f64,
+    pub forward: [f64; 3],
+}
+
+impl Default for LodView {
+    /// 60 deg, 1080 px, looking north (`-Z`): the view the default `lod.error_m` were sized for.
+    fn default() -> Self {
+        Self { fov_y_deg: 60.0, viewport_h_px: 1080.0, forward: [0.0, 0.0, -1.0] }
+    }
+}
+
+impl LodView {
+    /// Smallest / largest accepted vertical field of view (deg).
+    pub const FOV_MIN_DEG: f64 = 1.0;
+    pub const FOV_MAX_DEG: f64 = 179.0;
+    /// Largest accepted viewport height (px).
+    pub const MAX_VIEWPORT_PX: f64 = 65_536.0;
+
+    /// A validated view: `fov_y_deg` in [1, 179], `viewport_h_px` in [1, 65536], `forward`
+    /// finite and not zero (normalized here). `None` for anything else.
+    pub fn new(fov_y_deg: f64, viewport_h_px: f64, forward: [f64; 3]) -> Option<Self> {
+        let fov_ok = fov_y_deg.is_finite() && (Self::FOV_MIN_DEG..=Self::FOV_MAX_DEG).contains(&fov_y_deg);
+        let h_ok = viewport_h_px.is_finite() && (1.0..=Self::MAX_VIEWPORT_PX).contains(&viewport_h_px);
+        let len = (forward[0] * forward[0] + forward[1] * forward[1] + forward[2] * forward[2]).sqrt();
+        let f_ok = forward.iter().all(|v| v.is_finite()) && len.is_finite() && len > 1e-9;
+        (fov_ok && h_ok && f_ok).then(|| Self { fov_y_deg, viewport_h_px, forward: forward.map(|v| v / len) })
+    }
+
+    /// `2 tan(fov_y / 2)`: the view's height at 1 m distance (m).
+    pub fn view_height_at_1m(&self) -> f64 {
+        2.0 * crate::math::tan(self.fov_y_deg.to_radians() * 0.5)
+    }
+}
+
+/// Slant distance (m) below which a tile with geometric error `error_m` (m lost when it is not
+/// refined) shows more than `tau` pixels of error in `view`: the solution of
+/// `SSE = error_m * H / (2 d tan(fov_y / 2)) = tau` for `d`. Shared by every layer that refines
+/// by screen-space error (the vector layer since api 1.10; the terrain layer later, step G2).
+///
+/// Evaluated as `error_m * (H / (2 tan(fov_y / 2) * tau))`: with this order the default
+/// `lod.error_m` give exactly 600.0 / 2500.0 / 7000.0 m at the default view (the old edges, bit
+/// for bit), so the default cover is the 1.7 cover even for boxes at an exact edge distance.
+pub fn sse_refine_distance(error_m: f64, view: &LodView, tau: f64) -> f64 {
+    error_m * (view.viewport_h_px / (view.view_height_at_1m() * tau))
+}
+
+/// Smallest refine distance the SSE edges are clamped to (m).
+pub const MIN_REFINE_DISTANCE_M: f64 = 1.0;
+
+/// Band tuning from the world profile (`bands.*`, `lod.*`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BandParams {
-    /// Outer slant-distance edge of each band (m), indexed by ring.
+    /// Outer slant-distance edge of each band (m), indexed by ring, at the default view
+    /// ([`LodView::default`], quality 1): R0..R2 from `lod.error_m`, R3 = `max_distance_m`. The
+    /// live cover uses [`BandParams::edges_for`] with the host's view instead.
     pub edge_m: [f64; RING_COUNT],
+    /// Geometric error (m) of the R1, R2, R3 chunks against the next finer level
+    /// (`lod.error_m.r1..r3`): index i = the error behind edge i.
+    pub error_m: [f64; RING_COUNT - 1],
+    /// SSE threshold (px) at quality 1 (`lod.tau_px`).
+    pub tau_px: f64,
+    /// Outer limit of the whole cover (m, `bands.max_distance_m`): R3's edge.
+    pub max_distance_m: f64,
     /// A tile changes band only once its slant distance is this factor past the band edge.
     pub hysteresis: f64,
     /// Look-ahead horizon (s): center = camera + velocity * this (3D), clamped.
@@ -239,6 +314,18 @@ pub struct BandParams {
 }
 
 impl BandParams {
+    /// The band edges (m) for `view` and the quality scale `quality` (tau_eff = `tau_px` x
+    /// `quality`): R0..R2 = [`sse_refine_distance`] of `error_m`, clamped to
+    /// [[`MIN_REFINE_DISTANCE_M`], `max_distance_m`]; R3 = `max_distance_m`.
+    pub fn edges_for(&self, view: &LodView, quality: f64) -> [f64; RING_COUNT] {
+        let tau = self.tau_px * quality;
+        let mut e = [self.max_distance_m; RING_COUNT];
+        for (i, err) in self.error_m.iter().enumerate() {
+            e[i] = sse_refine_distance(*err, view, tau).clamp(MIN_REFINE_DISTANCE_M, self.max_distance_m);
+        }
+        e
+    }
+
     /// The look-ahead clamp of a band (default: half the band's radius).
     pub fn look_ahead_clamp_m(&self, ring: usize) -> f64 {
         self.edge_m[ring] * self.look_ahead_clamp
@@ -517,6 +604,47 @@ mod tests {
         let mut c = Vec::new();
         ViewPoint::new(VILNIUS.0, VILNIUS.1, 30_000.0).root_candidates(&bands(), &mut c);
         assert!(c.is_empty());
+    }
+
+    /// api 1.10: the SSE refine distances. The default view and profile give the old fixed
+    /// edges; fov 30 deg pushes them out by tan 30 / tan 15, H 540 and quality 2 halve them; the
+    /// outer limit stays and clamps.
+    #[test]
+    fn sse_refine_distances_follow_view_and_tau() {
+        let b = bands();
+        let def = LodView::default();
+        let e = b.edges_for(&def, 1.0);
+        assert_eq!(e, [600.0, 2500.0, 7000.0, 25_000.0], "bit for bit the old edges");
+        assert_eq!(e, b.edge_m, "BandParams::edge_m = the default view");
+        // The formula itself: SSE at the refine distance is exactly tau.
+        let d = sse_refine_distance(10.0, &def, 4.0);
+        let sse = 10.0 * 1080.0 / (2.0 * d * (30f64).to_radians().tan());
+        assert!((sse - 4.0).abs() < 1e-9);
+        let narrow = LodView::new(30.0, 1080.0, [0.0, 0.0, -1.0]).unwrap();
+        let k = (30f64).to_radians().tan() / (15f64).to_radians().tan();
+        let en = b.edges_for(&narrow, 1.0);
+        for r in 0..3 {
+            let ratio = en[r] / e[r];
+            assert!((ratio - k).abs() / k < 0.01, "ring {r}: {ratio} vs {k}");
+        }
+        assert_eq!(en[3], 25_000.0, "outer limit unchanged");
+        let small = LodView::new(60.0, 540.0, [0.0, 0.0, -1.0]).unwrap();
+        let q2 = b.edges_for(&def, 2.0);
+        for (r, eh) in b.edges_for(&small, 1.0).iter().enumerate().take(3) {
+            assert!((eh / e[r] - 0.5).abs() < 1e-12, "H 540 halves ring {r}");
+            assert!((q2[r] / e[r] - 0.5).abs() < 1e-12, "quality 2 halves ring {r}");
+        }
+        // Clamped to the outer limit (a 5 deg zoom would put R2's edge at ~85 km).
+        let zoom = LodView::new(5.0, 1080.0, [1.0, 0.0, 0.0]).unwrap();
+        assert_eq!(b.edges_for(&zoom, 1.0)[2], 25_000.0);
+        // Validation and normalization.
+        assert!(LodView::new(0.5, 1080.0, [0.0, 0.0, -1.0]).is_none());
+        assert!(LodView::new(180.0, 1080.0, [0.0, 0.0, -1.0]).is_none());
+        assert!(LodView::new(f64::NAN, 1080.0, [0.0, 0.0, -1.0]).is_none());
+        assert!(LodView::new(60.0, 0.0, [0.0, 0.0, -1.0]).is_none());
+        assert!(LodView::new(60.0, 1080.0, [0.0, 0.0, 0.0]).is_none());
+        assert!(LodView::new(60.0, 1080.0, [f64::INFINITY, 0.0, 0.0]).is_none());
+        assert_eq!(LodView::new(60.0, 1080.0, [0.0, 3.0, 4.0]).unwrap().forward, [0.0, 0.6, 0.8]);
     }
 
     #[test]

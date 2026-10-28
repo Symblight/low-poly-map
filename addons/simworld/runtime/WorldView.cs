@@ -170,8 +170,9 @@ public partial class WorldView : Node3D
     public bool WorldRunning { get; private set; }
     /// <summary>Attribution strings to show while map data is visible (empty for the synthetic city).</summary>
     public string[] Attributions { get; private set; } = System.Array.Empty<string>();
-    /// <summary>Effective band edges for the overlay, e.g. "bands 0.6/2.5/7/25 km" (empty until the profile is readable, api 0.6+).</summary>
-    public string BandsText { get; private set; } = "";
+    /// <summary>Effective band edges for the overlay, e.g. "edges 0.6/2.5/7/25 km": the live screen-space refine distances (api 1.10), or on an older library the profile's fixed edges (empty until readable).</summary>
+    public string BandsText => EdgesText();
+    private string _legacyBandsText = "";
     /// <summary>The effective profile overrides passed to configure_world (base + panel; empty = none), for logs and tests.</summary>
     public Godot.Collections.Dictionary ProfileOverrides { get; private set; } = new();
 
@@ -383,6 +384,20 @@ public partial class WorldView : Node3D
     /// <summary>Lit-window share per light profile id last written to the building materials (8 entries, ids 3 5 6 7 are 0).</summary>
     public System.ReadOnlySpan<float> WindowShares => _shares;
     /// <summary>The <c>window_share</c> array as read back from the plain / dithering building material (tests).</summary>
+    /// <summary>The cross-fade ranges now on the materials (tests): window average fade start / end (building material), light sprite blend start / end, street pool fade start / end, sprite far fade start / end.</summary>
+    public float[] ReadMaterialBlendRanges()
+    {
+        if (_pool == null) return System.Array.Empty<float>();
+        float F(ShaderMaterial m, string p) => m.GetShaderParameter(p).AsSingle();
+        return new[]
+        {
+            F(_pool.BuildingMaterial, "avg_fade_start_m"), F(_pool.BuildingMaterial, "avg_fade_end_m"),
+            F(_pool.LightMaterial, "blend_start_m"), F(_pool.LightMaterial, "blend_end_m"),
+            F(_pool.StreetPoolMaterial, "fade_start_m"), F(_pool.StreetPoolMaterial, "fade_end_m"),
+            F(_pool.LightMaterial, "fade_start_m"), F(_pool.LightMaterial, "far_end_m"),
+        };
+    }
+
     public float[] ReadMaterialWindowShares(bool fadeMaterial) => _pool?.ReadWindowShares(fadeMaterial) ?? System.Array.Empty<float>();
     /// <summary>True when the shares come from the world profile's lit_share tables (false = the TilePool fallback values).</summary>
     public bool WindowSharesFromProfile => _windowProfile != null;
@@ -484,7 +499,9 @@ public partial class WorldView : Node3D
 
     // ---- configuration ---------------------------------------------------
 
+    /// <summary>The band edge keys of a library before api 1.10 (gone since: <c>bands.r3_edge_m</c> is now <c>bands.max_distance_m</c>); read only to describe an older library.</summary>
     private static readonly string[] BandEdgeKeys = { "r0_edge_m", "r1_edge_m", "r2_edge_m", "r3_edge_m" };
+    private static readonly double[] LegacyEdgesM = { 600.0, 2500.0, 7000.0, 25000.0 };
 
     /// <summary>
     /// configure_world (api 0.6+, with the profile) or the legacy configure. On a profile error the world is retried with the
@@ -651,9 +668,11 @@ public partial class WorldView : Node3D
         var profile = Streamer.WorldProfile();
         ApplyWindowProfile(profile);
         ConfigureTerrainLayer(profile);
+        _legacyBandsText = "";
         if (profile.TryGetValue("bands", out var bv) && bv.VariantType == Variant.Type.Dictionary)
         {
             var b = bv.AsGodotDictionary();
+            if (b.TryGetValue("hysteresis", out var hv)) _hysteresis = (float)hv.AsDouble();
             var sb = new StringBuilder("bands ");
             for (int i = 0; i < BandEdgeKeys.Length; i++)
             {
@@ -661,10 +680,102 @@ public partial class WorldView : Node3D
                 if (i > 0) sb.Append('/');
                 sb.Append((e.AsDouble() / 1000.0).ToString("0.##", System.Globalization.CultureInfo.InvariantCulture));
             }
-            if (sb.Length > 0) BandsText = sb.Append(" km").ToString();
+            if (sb.Length > 0) _legacyBandsText = sb.Append(" km").ToString();
         }
-        if (BandsText.Length > 0) GD.Print($"[WorldView] effective {BandsText}");
+        _lodBlendD = 0; _lodMaxDist = 0; _lodRingEdge0 = 0; // a new world: write the cross-fade ranges again
+        ReadLod();
+        if (BandsText.Length > 0) GD.Print($"[WorldView] effective {BandsText}{(HasLodStats ? $", tau_eff {TauEff:0.##} px (quality x{LodQuality:0.##}), library view {LibraryViewFovYDeg:0.#} deg / {LibraryViewHeightPx} px" : "")}");
         RefreshSeed(true);
+    }
+
+    // ---- screen-space LOD (api 1.10) ----------------------------------------------------------
+
+    /// <summary>The band edges the cover uses now in metres, R0..R3 (library <c>lod_edges_m</c>; R0..R2 are the refine distances of the screen-space error, R3 is <c>bands.max_distance_m</c>). All 0 until read or on a library before api 1.10. Refreshed 4 times a second and by <see cref="ReadLod"/>.</summary>
+    public readonly double[] LodEdgesM = new double[4];
+    /// <summary>True once the library has reported the screen-space LOD fields (<c>lod_edges_m</c>, <c>tau_eff</c>).</summary>
+    public bool HasLodStats { get; private set; }
+    /// <summary>tau_eff in pixels (profile <c>lod.tau_px</c> x <see cref="LodQuality"/>), the set_lod_quality scale in effect, and the view the library works with (echo of set_view).</summary>
+    public double TauEff { get; private set; }
+    public double LodQuality { get; private set; } = 1.0;
+    public double LibraryViewFovYDeg { get; private set; }
+    public int LibraryViewHeightPx { get; private set; }
+    /// <summary>The R2 to R1 edge D the cross-fade ranges were last computed from (0 = not written yet), and how often they were written.</summary>
+    public double BlendEdgeM => _lodBlendD;
+    public int BlendUpdates { get; private set; }
+
+    private readonly StreamerStats _lodStats = new();
+    private double _lodBlendD, _lodMaxDist, _lodRingEdge0, _lodReadT;
+    private readonly double[] _lodMarkEdges = new double[3];
+    private float _hysteresis = 1.15f;
+    private const double LodReadIntervalS = 0.25, LodBlendRelChange = 0.05;
+
+    /// <summary>
+    /// set_lod_quality (api 1.10): live multiplier of the pixel error threshold, clamped by the library to [0.25, 4]; 2 halves every refine distance, 0.5
+    /// doubles them. No reconfigure; the library keeps it across <see cref="ApplyProfileOverrides"/>. Returns the scale in effect (NaN on an older library).
+    /// The edges change with the next camera update; <see cref="ReadLod"/> then shows them.
+    /// </summary>
+    public double SetLodQuality(double scale)
+    {
+        double r = Streamer.SetLodQuality(scale);
+        if (!double.IsNaN(r)) LodQuality = r;
+        return r;
+    }
+
+    /// <summary>Reads <c>lod_edges_m</c>, <c>tau_eff</c>, <c>lod_quality</c> and the view from debug_stats() into the properties above and, when the live R2 to R1 edge moved by more than 5 %, rewrites the cross-fade ranges.</summary>
+    public void ReadLod()
+    {
+        if (!Streamer.IsAvailable || !Streamer.HasSetView || !Streamer.DebugStats(_lodStats) || !_lodStats.HasLodStats) return;
+        HasLodStats = true;
+        TauEff = _lodStats.TauEff;
+        LodQuality = _lodStats.LodQuality;
+        LibraryViewFovYDeg = _lodStats.ViewFovYDeg;
+        LibraryViewHeightPx = _lodStats.ViewHeightPx;
+        System.Array.Copy(_lodStats.LodEdgesM, LodEdgesM, 4);
+        if (_settings.BlendFollowsLod && _pool != null) FollowLodEdges();
+        FollowMarkingEdges();
+    }
+
+    /// <summary>Contract-time part of S3: the window / sprite blend and the street pool fade follow D = the R2 to R1 edge, the sprites' far fade follows the maximum distance.</summary>
+    private void FollowLodEdges()
+    {
+        double d = LodEdgesM[1];
+        if (d > 1 && (_lodBlendD <= 0 || System.Math.Abs(d - _lodBlendD) > _lodBlendD * LodBlendRelChange))
+        {
+            _lodBlendD = d;
+            BlendUpdates++;
+            _pool!.SetLodRanges((float)(d * WorldRenderSettings.BlendStartShare), (float)(d * WorldRenderSettings.BlendEndShare),
+                (float)(d * WorldRenderSettings.PoolStartShare), (float)(d * WorldRenderSettings.PoolEndShare));
+        }
+        double far = LodEdgesM[3];
+        if (far > 1 && far != _lodMaxDist)
+        {
+            _lodMaxDist = far;
+            _pool!.SetLightFar((float)(far * WorldRenderSettings.LightFadeShare), (float)far);
+        }
+    }
+
+    /// <summary>The runway markings choose the lift of the ground ring by view distance: their ring edges follow the live edges x (2 - hysteresis).</summary>
+    private void FollowMarkingEdges()
+    {
+        if (_markings == null || LodEdgesM[2] <= 1) return;
+        bool moved = _lodRingEdge0 <= 0;
+        for (int i = 0; i < 3 && !moved; i++) moved = System.Math.Abs(LodEdgesM[i] - _lodMarkEdges[i]) > _lodMarkEdges[i] * 0.01;
+        if (!moved) return;
+        for (int i = 0; i < 3; i++) _lodMarkEdges[i] = LodEdgesM[i];
+        _lodRingEdge0 = LodEdgesM[0];
+        float k = 2f - _hysteresis;
+        _markings.SetRingLifts(RunwayLift, new Vector3((float)LodEdgesM[0] * k, (float)LodEdgesM[1] * k, (float)LodEdgesM[2] * k));
+    }
+
+    private string EdgesText()
+    {
+        if (HasLodStats && LodEdgesM[3] > 0)
+        {
+            var sb = new StringBuilder("edges ");
+            for (int i = 0; i < 4; i++) sb.Append(i > 0 ? "/" : "").Append((LodEdgesM[i] / 1000.0).ToString("0.##", System.Globalization.CultureInfo.InvariantCulture));
+            return sb.Append(" km").ToString();
+        }
+        return _legacyBandsText;
     }
 
     /// <summary>The drawn runway height above ground_height_at per ring R0..R3 as the host computes it (set by <see cref="ComputeRunwayLifts"/>; tests, overlay).</summary>
@@ -677,7 +788,7 @@ public partial class WorldView : Node3D
     /// contract section 9 "Airports"): inside an airport fence the ground has no drape lift, the runway is at stacking level
     /// <see cref="WorldRenderSettings.MarkingRunwayLevel"/> (3) x <c>ground.rN.lift_step_m</c> and nothing else (0.06 / 0.18 / 0.45 / 1.5 m by default). It
     /// does NOT depend on the general drape lift. Generator 1 or a library without the key (older libraries): replays the old rule, lift(band N) = the largest
-    /// <c>max_error_m</c> of the terrain bands whose range starts below <c>rN_edge_m x hysteresis</c>, times <c>terrain.detail_scale_max</c>, plus
+    /// <c>max_error_m</c> of the terrain bands whose range starts below <c>rN_edge_m x hysteresis</c> (a generator-1 library has the old fixed edges), times <c>terrain.detail_scale_max</c>, plus
     /// <c>MarkingRunwayLevel</c> x step; there the level must be set back to 10 (the old runway level), which this method does by itself.
     /// </summary>
     private void ComputeRunwayLifts(Godot.Collections.Dictionary profile)
@@ -688,7 +799,6 @@ public partial class WorldView : Node3D
         // The old library drew the runway at level 10; the setting is the generator-2 level (3) and must not be applied to it.
         int level = levelRule ? _settings.MarkingRunwayLevel : LegacyRunwayLevel;
         var lift = new float[4] { 1.2f, 3.6f, 9.5f, 25f };
-        var edge = new float[3] { 510f, 2125f, 5950f };
         if (levelRule) lift = new float[4] { 0.06f, 0.18f, 0.45f, 1.5f };
         try
         {
@@ -705,7 +815,8 @@ public partial class WorldView : Node3D
             }
             for (int n = 0; n < 4; n++)
             {
-                double rEdge = bands[BandEdgeKeys[n]].AsDouble();
+                // Generator 1 only: the band reach of the old drape replay. The edges are the old fixed ones (a generator-1 library has no screen-space LOD).
+                double rEdge = !levelRule && bands.TryGetValue(BandEdgeKeys[n], out var rev) ? rev.AsDouble() : LegacyEdgesM[n];
                 double step = ground["r" + n].AsGodotDictionary()["lift_step_m"].AsDouble();
                 double worst = 0;
                 if (tb != null)
@@ -719,7 +830,6 @@ public partial class WorldView : Node3D
                     }
                 }
                 lift[n] = (float)(worst * detail + level * step);
-                if (n < 3) edge[n] = (float)(rEdge * (2.0 - hyst));
             }
         }
         catch (System.Exception e)
@@ -728,7 +838,11 @@ public partial class WorldView : Node3D
         }
         RunwayLift = new Vector4(lift[0], lift[1], lift[2], lift[3]);
         RunwayLiftRule = levelRule ? "level" : "drape replay";
-        _markings.SetRingLifts(RunwayLift, new Vector3(edge[0], edge[1], edge[2]));
+        // Ring edges (view distance beyond which ring 1, 2, 3 applies): the live edges x (2 - hysteresis); before the first read the old fixed 600 / 2500 / 7000 m.
+        _lodRingEdge0 = 0;
+        float ek = 2f - _hysteresis;
+        _markings.SetRingLifts(RunwayLift, new Vector3((float)LegacyEdgesM[0] * ek, (float)LegacyEdgesM[1] * ek, (float)LegacyEdgesM[2] * ek));
+        FollowMarkingEdges();
         GD.Print($"[WorldView] runway lift per ring (generator {generator}, {(levelRule ? $"level {level} x lift_step_m, no drape lift" : "old drape replay")}): "
             + $"{lift[0]:0.###} / {lift[1]:0.###} / {lift[2]:0.###} / {lift[3]:0.###} m above ground_height_at");
     }
@@ -824,6 +938,8 @@ public partial class WorldView : Node3D
             if (UploadUsLastFrame > _secUploadMax) _secUploadMax = UploadUsLastFrame;
             UpdateCollision();
             _markings?.Update(_source.GlobalPosition, delta);
+            _lodReadT += delta;
+            if (_lodReadT >= LodReadIntervalS) { _lodReadT = 0; ReadLod(); }
         }
 
         UpdateSpriteScale();
@@ -1294,7 +1410,7 @@ public partial class WorldView : Node3D
     // ---- reconfigure (settings panel) ---------------------------------------
 
     /// <summary>
-    /// Queues a world reconfigure with <paramref name="panelOverrides"/> (nested like the profile JSON, e.g. bands.r3_edge_m) merged
+    /// Queues a world reconfigure with <paramref name="panelOverrides"/> (nested like the profile JSON, e.g. bands.max_distance_m) merged
     /// over the launch-arg profile (panel wins). It runs at the start of the next <c>_Process</c>, before update_camera, and ends with
     /// <see cref="Reconfigured"/>. A later call before that replaces the queued one. The world restarts at the camera's current
     /// position: that is the new origin, the camera goes back to local x/z = 0 (altitude and orientation kept), and every tile is
@@ -1405,19 +1521,20 @@ public partial class WorldView : Node3D
         }
     }
 
-    /// <summary>The values the library is running with (world_profile), e.g. "bands 0.6/2.5/7/25 km, min building height R0/R1/R2 0/0/0 m".</summary>
+    /// <summary>The values the library is running with (world_profile), e.g. "tau 4 px (quality x1, fov 60 deg, H 1080 px), edges 0.6/2.5/7/25 km, max distance 25 km, min building height R0/R1/R2 0/0/0 m".</summary>
     public string EffectiveProfileText()
     {
         var p = Streamer.WorldProfile();
         var sb = new StringBuilder();
-        if (p.TryGetValue("bands", out var bv) && bv.VariantType == Variant.Type.Dictionary)
+        ReadLod();
+        if (HasLodStats)
         {
-            var b = bv.AsGodotDictionary();
-            sb.Append("bands ");
-            for (int i = 0; i < BandEdgeKeys.Length; i++)
-                sb.Append(i > 0 ? "/" : "").Append(b.TryGetValue(BandEdgeKeys[i], out var e) ? (e.AsDouble() / 1000.0).ToString("0.##", System.Globalization.CultureInfo.InvariantCulture) : "?");
-            sb.Append(" km");
+            sb.Append("tau ").Append(TauEff.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture)).Append(" px (quality x").Append(LodQuality.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture))
+              .Append(", fov ").Append(LibraryViewFovYDeg.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture)).Append(" deg, H ").Append(LibraryViewHeightPx).Append(" px), ").Append(EdgesText());
         }
+        else sb.Append(EdgesText());
+        if (p.TryGetValue("bands", out var bv) && bv.VariantType == Variant.Type.Dictionary && bv.AsGodotDictionary().TryGetValue("max_distance_m", out var mdv))
+            sb.Append(sb.Length > 0 ? ", " : "").Append("max distance ").Append((mdv.AsDouble() / 1000.0).ToString("0.##", System.Globalization.CultureInfo.InvariantCulture)).Append(" km");
         if (p.TryGetValue("buildings", out var bd) && bd.VariantType == Variant.Type.Dictionary)
         {
             var d = bd.AsGodotDictionary();

@@ -50,6 +50,9 @@ pub struct WorldProfile {
     /// [`PROFILE_VERSION`].
     pub profile_version: u32,
     pub bands: Bands,
+    /// Screen-space-error LOD of the vector layer (profile_version 7, api 1.10, Tiles and LOD v2
+    /// step T3a): replaces the fixed band edges `bands.r0..r2_edge_m`.
+    pub lod: Lod,
     pub buildings: Buildings,
     pub ground: Ground,
     pub lights: Lights,
@@ -68,15 +71,14 @@ pub struct WorldProfile {
     pub seed: SeedProfile,
 }
 
-/// LOD bands: slant-distance edges per ring (R0 = z16 .. R3 = z13), hysteresis, look-ahead.
+/// LOD bands: the outer limit of the cover, hysteresis, look-ahead. The edges between the bands
+/// come from the screen-space error (`lod`, profile_version 7); `r0..r2_edge_m` are gone and
+/// `r3_edge_m` is `max_distance_m` (an older file migrates, see [`resolve`]).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Bands {
-    pub r0_edge_m: f64,
-    pub r1_edge_m: f64,
-    pub r2_edge_m: f64,
-    /// Outer edge of the whole cover: nothing is requested beyond it.
-    pub r3_edge_m: f64,
+    /// Outer edge of the whole cover (R3's edge): nothing is requested beyond it.
+    pub max_distance_m: f64,
     /// A tile changes band only once its slant distance is this factor past the edge.
     pub hysteresis: f64,
     /// Look-ahead horizon (s): camera + velocity x this (3D).
@@ -85,6 +87,42 @@ pub struct Bands {
     pub look_ahead_clamp: f64,
     /// Box height (m) of a tile whose own and ancestors' heights are still unknown.
     pub default_tile_height_m: f64,
+}
+
+/// Screen-space-error LOD (profile_version 7). A tile of ring r > 0 refines while
+/// `error_m.r{r} * H / (2 d tan(fov_y / 2)) > tau_eff` (H, fov_y from the host's `set_view`;
+/// tau_eff = `tau_px` x the `set_lod_quality` scale), coarsens at `tau_eff / bands.hysteresis`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Lod {
+    /// SSE threshold (px) at quality 1.
+    pub tau_px: f64,
+    /// Geometric error per coarse level (m): what is lost when that chunk is not refined.
+    pub error_m: LodErrors,
+    /// Rear-hemisphere tau multiplier (stored; used from step T4).
+    pub rear_tau_scale: f64,
+    /// Frame-budget scaling of tau (stored; used from step T5).
+    pub adaptive: LodAdaptive,
+}
+
+/// `lod.error_m`: error of the R1, R2, R3 chunk against the next finer level (strictly increasing).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LodErrors {
+    pub r1: f64,
+    pub r2: f64,
+    pub r3: f64,
+}
+
+/// `lod.adaptive` (stored; the adaptive tau of step T5).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LodAdaptive {
+    pub enabled: bool,
+    pub frame_budget_ms: f64,
+    pub min_scale: f64,
+    pub max_scale: f64,
+    pub smoothing_s: f64,
 }
 
 /// Building meshing per band (R3 has no buildings) and light-profile resolution rules
@@ -779,6 +817,7 @@ impl Default for WorldProfile {
         Self {
             profile_version: PROFILE_VERSION,
             bands: Bands::default(),
+            lod: Lod::default(),
             buildings: Buildings::default(),
             ground: Ground::default(),
             lights: Lights::default(),
@@ -796,15 +835,34 @@ impl Default for WorldProfile {
 impl Default for Bands {
     fn default() -> Self {
         Self {
-            r0_edge_m: 600.0,
-            r1_edge_m: 2500.0,
-            r2_edge_m: 7000.0,
-            r3_edge_m: 25_000.0,
+            max_distance_m: 25_000.0,
             hysteresis: 1.15,
             look_ahead_s: 20.0,
             look_ahead_clamp: 0.5,
             default_tile_height_m: 60.0,
         }
+    }
+}
+
+impl Default for Lod {
+    /// tau 4 px; errors = the old edges 600 / 2500 / 7000 m x `2 tan 30 deg x 4 / 1080` in full
+    /// precision, picked to the ulp so `rings::sse_refine_distance` gives exactly 600.0 / 2500.0 /
+    /// 7000.0 at the default view (1080 px, 60 deg): the default cover is the old one bit for bit
+    /// (2.566 / 10.69 / 29.94 rounded would move the R2 edge by 0.78 m and change the golden cover).
+    fn default() -> Self {
+        Self { tau_px: 4.0, error_m: LodErrors::default(), rear_tau_scale: 2.0, adaptive: LodAdaptive::default() }
+    }
+}
+
+impl Default for LodErrors {
+    fn default() -> Self {
+        Self { r1: 2.5660011963983367, r2: 10.691671651659735, r3: 29.93668062464726 }
+    }
+}
+
+impl Default for LodAdaptive {
+    fn default() -> Self {
+        Self { enabled: true, frame_budget_ms: 33.3, min_scale: 0.5, max_scale: 3.0, smoothing_s: 2.0 }
     }
 }
 
@@ -1224,14 +1282,18 @@ impl Default for TerrainProfile {
 /// objects); `[]` is every element of an array.
 pub const RANGES: &[(&str, f64, f64)] = &[
     ("profile_version", 1.0, 1_000_000.0),
-    ("bands.r0_edge_m", 50.0, 100_000.0),
-    ("bands.r1_edge_m", 50.0, 100_000.0),
-    ("bands.r2_edge_m", 50.0, 100_000.0),
-    ("bands.r3_edge_m", 50.0, 100_000.0),
+    ("bands.max_distance_m", 50.0, 100_000.0),
     ("bands.hysteresis", 1.01, 2.0),
     ("bands.look_ahead_s", 0.0, 120.0),
     ("bands.look_ahead_clamp", 0.0, 1.0),
     ("bands.default_tile_height_m", 0.0, 400.0),
+    ("lod.tau_px", 0.5, 64.0),
+    ("lod.error_m.*", 0.01, 1000.0),
+    ("lod.rear_tau_scale", 1.0, 16.0),
+    ("lod.adaptive.frame_budget_ms", 1.0, 1000.0),
+    ("lod.adaptive.min_scale", 0.05, 1.0),
+    ("lod.adaptive.max_scale", 1.0, 16.0),
+    ("lod.adaptive.smoothing_s", 0.0, 60.0),
     ("buildings.*.dp_m", 0.0, 50.0),
     ("buildings.*.min_area_m2", 0.0, 100_000.0),
     ("buildings.*.min_height_m", 0.0, 500.0),
@@ -1431,7 +1493,7 @@ fn check_ranges(v: &Value, path: &str, errs: &mut Vec<String>) {
 pub struct Profile {
     world: WorldProfile,
     band_params: BandParams,
-    lod: [Option<LodParams>; RING_COUNT],
+    building_lod: [Option<LodParams>; RING_COUNT],
     ground_lod: [Option<GroundParams>; RING_COUNT],
     kind_profile: AHashMap<String, u8>,
     /// Indexed by `landuse_index`.
@@ -1573,16 +1635,26 @@ impl Profile {
         let json = serde_json::to_value(&world).map_err(|e| format!("profile: {e}"))?;
         check_ranges(&json, "", &mut errs);
         let b = &world.bands;
-        let edges = [b.r0_edge_m, b.r1_edge_m, b.r2_edge_m, b.r3_edge_m];
-        for r in 1..RING_COUNT {
-            if edges[r] <= edges[r - 1] {
+        let lod = &world.lod;
+        let errors = [lod.error_m.r1, lod.error_m.r2, lod.error_m.r3];
+        for r in 1..errors.len() {
+            if errors[r] <= errors[r - 1] {
                 errs.push(format!(
-                    "bands.r{r}_edge_m = {} must be greater than bands.r{}_edge_m = {}",
-                    fmt_num(edges[r]),
-                    r - 1,
-                    fmt_num(edges[r - 1])
+                    "lod.error_m.r{} = {} must be greater than lod.error_m.r{} = {}",
+                    r + 1,
+                    fmt_num(errors[r]),
+                    r,
+                    fmt_num(errors[r - 1])
                 ));
             }
+        }
+        let a = &lod.adaptive;
+        if !(a.min_scale <= 1.0 && 1.0 <= a.max_scale) {
+            errs.push(format!(
+                "lod.adaptive.min_scale = {} <= 1 <= lod.adaptive.max_scale = {} does not hold",
+                fmt_num(a.min_scale),
+                fmt_num(a.max_scale)
+            ));
         }
         let l = &world.lights;
         if l.cluster_off_agl_m > l.cluster_on_agl_m {
@@ -1763,14 +1835,21 @@ impl Profile {
             step_m: p.lift_step_m as f32,
         };
         Ok(Self {
-            band_params: BandParams {
-                edge_m: edges,
-                hysteresis: b.hysteresis,
-                look_ahead_s: b.look_ahead_s,
-                look_ahead_clamp: b.look_ahead_clamp,
-                default_tile_height_m: b.default_tile_height_m,
+            band_params: {
+                let mut bp = BandParams {
+                    edge_m: [b.max_distance_m; RING_COUNT],
+                    error_m: errors,
+                    tau_px: lod.tau_px,
+                    max_distance_m: b.max_distance_m,
+                    hysteresis: b.hysteresis,
+                    look_ahead_s: b.look_ahead_s,
+                    look_ahead_clamp: b.look_ahead_clamp,
+                    default_tile_height_m: b.default_tile_height_m,
+                };
+                bp.edge_m = bp.edges_for(&crate::rings::LodView::default(), 1.0);
+                bp
             },
-            lod: [Some(lod_of(&bw.r0, true)), Some(lod_of(&bw.r1, true)), Some(lod_of(&bw.r2, false)), None],
+            building_lod: [Some(lod_of(&bw.r0, true)), Some(lod_of(&bw.r1, true)), Some(lod_of(&bw.r2, false)), None],
             ground_lod: [Some(ground_of(&g.r0)), Some(ground_of(&g.r1)), Some(ground_of(&g.r2)), Some(ground_of(&g.r3))],
             kind_profile,
             landuse_profile,
@@ -1810,7 +1889,7 @@ impl Profile {
 
     /// Building meshing parameters of a ring; `None` for R3 (light points only).
     pub fn lod(&self, ring: usize) -> Option<LodParams> {
-        self.lod.get(ring).copied().flatten()
+        self.building_lod.get(ring).copied().flatten()
     }
 
     /// Ground meshing parameters of a ring (every band since api 1.3; `None` only out of range).
@@ -2028,6 +2107,47 @@ fn merge(base: &mut Value, over: Value) {
     }
 }
 
+/// The fixed band edges removed in profile_version 7 (api 1.10, screen-space-error LOD).
+const REMOVED_BAND_EDGES: [&str; 3] = ["r0_edge_m", "r1_edge_m", "r2_edge_m"];
+
+/// profile_version 7 replaced `bands.r0..r2_edge_m` by the screen-space error (`lod`) and renamed
+/// `bands.r3_edge_m` to `bands.max_distance_m`. A source declaring an older version migrates
+/// (`r3_edge_m` -> `max_distance_m`, the other edges dropped with a warning); a current one (or
+/// one without `profile_version`, e.g. overrides) that still names them is refused. A newer one
+/// is left to the lenient shape check (unknown keys ignored with a warning).
+fn migrate_band_edges(src: &mut Value, version: u64, errs: &mut Vec<String>, warns: &mut Vec<String>) {
+    let Some(Value::Object(b)) = src.get_mut("bands") else { return };
+    let old: Vec<String> =
+        b.keys().filter(|k| REMOVED_BAND_EDGES.contains(&k.as_str()) || k.as_str() == "r3_edge_m").cloned().collect();
+    if old.is_empty() || version > PROFILE_VERSION as u64 {
+        return;
+    }
+    if version == PROFILE_VERSION as u64 {
+        for k in old {
+            let hint = if k == "r3_edge_m" {
+                "renamed to `bands.max_distance_m`".to_string()
+            } else {
+                format!(
+                    "removed in profile_version {PROFILE_VERSION}: the band edges come from the screen-space error, tune `lod.tau_px` / `lod.error_m` instead"
+                )
+            };
+            errs.push(format!("`bands.{k}` is {hint}"));
+        }
+        return;
+    }
+    if let Some(v) = b.remove("r3_edge_m") {
+        b.insert("max_distance_m".into(), v);
+        warns.push(format!("`bands.r3_edge_m` migrated to `bands.max_distance_m` (profile_version {PROFILE_VERSION})"));
+    }
+    for k in REMOVED_BAND_EDGES {
+        if b.remove(k).is_some() {
+            warns.push(format!(
+                "`bands.{k}` dropped: since profile_version {PROFILE_VERSION} the band edges come from the screen-space error (`lod.tau_px`, `lod.error_m`)"
+            ));
+        }
+    }
+}
+
 /// Version policy + shape check of one source (file or overrides), merged onto `acc`.
 fn apply_source(acc: &mut Value, defaults: &Value, mut src: Value, label: &str, log: &dyn Log) -> Result<(), String> {
     let Value::Object(m) = &src else {
@@ -2043,6 +2163,7 @@ fn apply_source(acc: &mut Value, defaults: &Value, mut src: Value, label: &str, 
     let lenient = version > PROFILE_VERSION as u64;
     let mut errs = Vec::new();
     let mut warns = Vec::new();
+    migrate_band_edges(&mut src, version, &mut errs, &mut warns);
     check_shape(&mut src, defaults, "", lenient, &mut errs, &mut warns);
     for w in warns {
         log.warn(&format!("WorldStreamer: {label} (profile_version {version}, library reads {PROFILE_VERSION}): {w}"));
@@ -2146,7 +2267,10 @@ mod tests {
     fn defaults_equal_the_spike_constants() {
         let p = Profile::default();
         let b = p.bands();
+        // api 1.10: the SSE edges at the default view (1080 px, 60 deg, tau 4) are the spike's
+        // fixed edges, bit for bit.
         assert_eq!(b.edge_m, [600.0, 2500.0, 7000.0, 25_000.0]);
+        assert_eq!(b.edge_m[3], 25_000.0);
         assert_eq!((b.hysteresis, b.look_ahead_s, b.look_ahead_clamp, b.default_tile_height_m), (1.15, 20.0, 0.5, 60.0));
         assert_eq!(p.lod(0), Some(LodParams { dp_m: 0.5, min_area_m2: 0.0, min_height_m: 0.0, windows: true }));
         assert_eq!(p.lod(1), Some(LodParams { dp_m: 2.0, min_area_m2: 20.0, min_height_m: 0.0, windows: true }));
@@ -2447,13 +2571,13 @@ mod tests {
 
     #[test]
     fn partial_profiles_and_overrides_merge_deeply() {
-        let file = r#"{ "profile_version": 1, "bands": { "r0_edge_m": 450 }, "lights": { "profiles": { "office": { "color": [0.5, 0.6, 0.7] } } } }"#;
+        let file = r#"{ "profile_version": 7, "lod": { "error_m": { "r1": 2.0 } }, "lights": { "profiles": { "office": { "color": [0.5, 0.6, 0.7] } } } }"#;
         let ov = serde_json::json!({ "bands": { "hysteresis": 1.2 }, "streaming": { "max_fetch_per_band": 6.0 },
             "ground": { "areas": { "beach": { "class": "other", "level": 1, "kinds": ["beach"] } } } });
         let p = resolve(Some(("f.json", file)), Some(&ov), &NullLog).unwrap();
         let d = WorldProfile::default();
-        assert_eq!(p.bands.r0_edge_m, 450.0);
-        assert_eq!(p.bands.r1_edge_m, d.bands.r1_edge_m);
+        assert_eq!(p.lod.error_m.r1, 2.0);
+        assert_eq!(p.lod.error_m.r2, d.lod.error_m.r2);
         assert_eq!(p.bands.hysteresis, 1.2);
         assert_eq!(p.streaming.max_fetch_per_band, 6, "integral floats (Godot) are accepted as integers");
         assert_eq!(p.lights.profiles.office.color, [0.5, 0.6, 0.7]);
@@ -2461,8 +2585,8 @@ mod tests {
         assert_eq!(p.ground_area_class("beach"), (GROUND_OTHER, 1));
         assert_eq!(p.ground.areas.len(), d.ground.areas.len() + 1);
         // Overrides win over the file.
-        let p = resolve(Some(("f.json", file)), Some(&serde_json::json!({"bands": {"r0_edge_m": 500}})), &NullLog).unwrap();
-        assert_eq!(p.bands.r0_edge_m, 500.0);
+        let p = resolve(Some(("f.json", file)), Some(&serde_json::json!({"lod": {"error_m": {"r1": 1.5}}})), &NullLog).unwrap();
+        assert_eq!(p.lod.error_m.r1, 1.5);
         // Empty sources = defaults.
         assert_eq!(resolve(Some(("e", "{}")), Some(&empty_object()), &NullLog).unwrap(), Profile::default());
     }
@@ -2496,6 +2620,60 @@ mod tests {
 
     /// profile_version 7 adds `memory.budget_mb` (default 512 MiB, one number for every
     /// platform); a version 6 file still loads strictly with the default.
+    /// profile_version 7 (api 1.10, Tiles and LOD v2 T3a): `lod.*` loads, the default view
+    /// reproduces the old edges, ranges and cross-key rules hold.
+    #[test]
+    fn version_7_lod_keys_load_and_validate() {
+        let p = Profile::default();
+        assert_eq!(p.lod.tau_px, 4.0);
+        assert_eq!((p.lod.error_m.r1, p.lod.error_m.r2, p.lod.error_m.r3), (2.5660011963983367, 10.691671651659735, 29.93668062464726));
+        assert_eq!(p.lod.rear_tau_scale, 2.0);
+        assert_eq!(p.lod.adaptive, LodAdaptive { enabled: true, frame_budget_ms: 33.3, min_scale: 0.5, max_scale: 3.0, smoothing_s: 2.0 });
+        assert_eq!(p.bands.max_distance_m, 25_000.0);
+        let ov = serde_json::json!({ "lod": { "tau_px": 8.0, "error_m": { "r1": 3.0, "r2": 12.0, "r3": 40.0 }, "rear_tau_scale": 3.0,
+            "adaptive": { "enabled": false, "frame_budget_ms": 16.7, "min_scale": 0.8, "max_scale": 2.0, "smoothing_s": 1.0 } },
+            "bands": { "max_distance_m": 20000.0 } });
+        let q = resolve(None, Some(&ov), &NullLog).unwrap();
+        assert_eq!(q.lod.tau_px, 8.0);
+        assert!(!q.lod.adaptive.enabled);
+        assert_eq!(q.bands().error_m, [3.0, 12.0, 40.0]);
+        assert_eq!(q.bands().edge_m[3], 20000.0);
+        let bad = |v: serde_json::Value| resolve(None, Some(&v), &NullLog).unwrap_err();
+        assert!(bad(serde_json::json!({"lod": {"tau_px": 0.1}})).contains("lod.tau_px = 0.1 is out of range [0.5, 64]"));
+        assert!(bad(serde_json::json!({"lod": {"error_m": {"r3": 10.0}}})).contains("lod.error_m.r3 = 10 must be greater than lod.error_m.r2"));
+        let e = resolve(None, Some(&serde_json::json!({"lod": {"adaptive": {"max_scale": 1.0}}})), &NullLog);
+        assert!(e.is_ok(), "max_scale 1 is allowed (min <= 1 <= max)");
+        assert!(bad(serde_json::json!({"lod": {"adaptive": {"max_scale": 0.9}}})).contains("lod.adaptive.max_scale"));
+        assert!(bad(serde_json::json!({"lod": {"hysteresis": 0.15}})).contains("unknown key `lod.hysteresis`"));
+    }
+
+    /// The fixed band edges are gone in profile_version 7: a current-version source naming them
+    /// is refused with a message saying what replaced them; an older file migrates
+    /// (`r3_edge_m` -> `max_distance_m`, r0..r2 dropped with a warning through the log).
+    #[test]
+    fn removed_band_edges_refused_in_v7_and_migrated_from_older() {
+        for src in [r#"{ "profile_version": 7, "bands": { "r0_edge_m": 500 } }"#, r#"{ "bands": { "r1_edge_m": 2000 } }"#] {
+            let e = resolve(Some(("p.json", src)), None, &NullLog).unwrap_err();
+            assert!(e.contains("p.json") && e.contains("_edge_m` is removed in profile_version 7") && e.contains("lod.tau_px"), "{e}");
+        }
+        let e = resolve(Some(("p.json", r#"{ "profile_version": 7, "bands": { "r3_edge_m": 20000 } }"#)), None, &NullLog).unwrap_err();
+        assert!(e.contains("`bands.r3_edge_m` is renamed to `bands.max_distance_m`"), "{e}");
+        let e = resolve(None, Some(&serde_json::json!({"bands": {"r2_edge_m": 6000}})), &NullLog).unwrap_err();
+        assert!(e.contains("profile_overrides") && e.contains("bands.r2_edge_m"), "{e}");
+        let v6 = r#"{ "profile_version": 6, "bands": { "r0_edge_m": 450, "r1_edge_m": 2000, "r2_edge_m": 6000, "r3_edge_m": 20000, "hysteresis": 1.2 } }"#;
+        let log = CaptureLog::default();
+        let p = resolve(Some(("v6.json", v6)), None, &log).unwrap();
+        assert_eq!(p.bands.max_distance_m, 20000.0);
+        assert_eq!(p.bands.hysteresis, 1.2);
+        assert_eq!(p.lod, Lod::default(), "the dropped edges do not move the SSE keys");
+        let w = log.0.lock().unwrap();
+        assert_eq!(w.len(), 4, "{w:?}");
+        assert!(w.iter().any(|m| m.contains("bands.r3_edge_m` migrated to `bands.max_distance_m`")), "{w:?}");
+        for k in ["r0_edge_m", "r1_edge_m", "r2_edge_m"] {
+            assert!(w.iter().any(|m| m.contains(&format!("`bands.{k}` dropped")) && m.contains("v6.json")), "{w:?}");
+        }
+    }
+
     #[test]
     fn version_7_adds_the_memory_budget() {
         let v6 = r#"{ "profile_version": 6, "fades": { "max_active": 2 } }"#;
@@ -2519,10 +2697,10 @@ mod tests {
         let e = resolve(None, Some(&serde_json::json!({"cache": {"cap_gb": 1}})), &NullLog).unwrap_err();
         assert!(e.contains("profile_overrides") && e.contains("cache.cap_gb"), "{e}");
         // Newer version: warning, ignored, known keys still apply.
-        let newer = r#"{ "profile_version": 99, "bands": { "r0_edge_m": 450, "r4_edge_m": 90000 }, "weather": {} }"#;
+        let newer = r#"{ "profile_version": 99, "bands": { "max_distance_m": 20000, "r4_edge_m": 90000 }, "weather": {} }"#;
         let log = CaptureLog::default();
         let p = resolve(Some(("new.json", newer)), None, &log).unwrap();
-        assert_eq!(p.bands.r0_edge_m, 450.0);
+        assert_eq!(p.bands.max_distance_m, 20000.0);
         assert_eq!(p.profile_version, PROFILE_VERSION);
         let w = log.0.lock().unwrap();
         assert_eq!(w.len(), 2, "{w:?}");
@@ -2543,10 +2721,10 @@ mod tests {
         assert!(e.contains("streaming.max_mesh_per_band = 0 is out of range [1, 64]"), "{e}");
         let e = resolve(None, Some(&serde_json::json!({"streaming": {"max_mesh_per_band": 2.5}})), &NullLog).unwrap_err();
         assert!(e.contains("streaming.max_mesh_per_band = 2.5 must be an integer"), "{e}");
-        let e = resolve(None, Some(&serde_json::json!({"bands": {"r0_edge_m": "far"}})), &NullLog).unwrap_err();
-        assert!(e.contains("bands.r0_edge_m must be a number, got a string"), "{e}");
-        let e = resolve(None, Some(&serde_json::json!({"bands": {"r1_edge_m": 500}})), &NullLog).unwrap_err();
-        assert!(e.contains("bands.r1_edge_m = 500 must be greater than bands.r0_edge_m = 600"), "{e}");
+        let e = resolve(None, Some(&serde_json::json!({"bands": {"max_distance_m": "far"}})), &NullLog).unwrap_err();
+        assert!(e.contains("bands.max_distance_m must be a number, got a string"), "{e}");
+        let e = resolve(None, Some(&serde_json::json!({"lod": {"error_m": {"r2": 2.0}}})), &NullLog).unwrap_err();
+        assert!(e.contains("lod.error_m.r2 = 2 must be greater than lod.error_m.r1 = 2.566"), "{e}");
         let e = resolve(None, Some(&serde_json::json!({"lights": {"cluster_off_agl_m": 4000}})), &NullLog).unwrap_err();
         assert!(e.contains("cluster_off_agl_m"), "{e}");
         let e = resolve(None, Some(&serde_json::json!({"ground": {"r1": {"max_road_class": "highway"}}})), &NullLog).unwrap_err();

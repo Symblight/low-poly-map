@@ -1,14 +1,17 @@
 {
   "profile_version": 7,
   "bands": {
-    "r0_edge_m": 600.0,
-    "r1_edge_m": 2500.0,
-    "r2_edge_m": 7000.0,
-    "r3_edge_m": 25000.0,
+    "max_distance_m": 25000.0,
     "hysteresis": 1.15,
     "look_ahead_s": 20.0,
     "look_ahead_clamp": 0.5,
     "default_tile_height_m": 60.0
+  },
+  "lod": {
+    "tau_px": 4.0,
+    "error_m": { "r1": 2.5660011963983367, "r2": 10.691671651659735, "r3": 29.93668062464726 },
+    "rear_tau_scale": 2.0,
+    "adaptive": { "enabled": true, "frame_budget_ms": 33.3, "min_scale": 0.5, "max_scale": 3.0, "smoothing_s": 2.0 }
   },
   "buildings": {
     "r0": {

@@ -109,14 +109,14 @@ use crate::geo::{Frame, RectEn, TileKey};
 use crate::latency::{Latency, Stage, TileTimes};
 use crate::mesher::MeshData;
 use crate::profile::Profile;
-use crate::rings::{above_horizon, children, horizon_line_m, look_ahead, Layer, LayerKind, ViewPoint, MAX_BOX_HEIGHT_M, MAX_RINGS};
+use crate::rings::{above_horizon, children, horizon_line_m, look_ahead, Layer, LayerKind, ViewPoint, MAX_BOX_HEIGHT_M, MAX_RINGS, RING_COUNT};
 use crate::terrain::Terrain;
 use crate::jobs::Priority;
 use crate::worker::{DataRef, Job, Payload, WorkerMsg};
 
 // Tuning (world profile): `streaming.max_fetch_per_band` / `max_mesh_per_band` (jobs in flight
 // per band), `lights.cluster_on_agl_m` / `cluster_off_agl_m` (light carpet switch),
-// `fades.cap_s` (fade safety cap), `streaming.retry_*` (backoff), `bands.*` (cover).
+// `fades.cap_s` (fade safety cap), `streaming.retry_*` (backoff), `bands.*` + `lod.*` (cover).
 
 pub struct Scheduler {
     frame: Frame,
@@ -184,6 +184,17 @@ impl Scheduler {
     pub fn new(frame: Frame, synthetic: bool, profile: Arc<Profile>) -> Self {
         let layer = Layer::world(profile.bands(), profile.streaming.max_fetch_per_band, profile.streaming.max_mesh_per_band);
         Self::with_layer(frame, synthetic, profile, layer)
+    }
+
+    /// Vector layer: set the band edges from the host's view and the quality scale (contract
+    /// `set_view` / `set_lod_quality`, api 1.10; [`rings::BandParams::edges_for`]). The next
+    /// `update` uses them; the hysteresis, look-ahead clamp and fade gap follow the new edges.
+    /// No-op on the terrain layer (fixed bands until step G2).
+    pub fn set_lod_view(&mut self, view: &crate::rings::LodView, quality: f64) {
+        if self.layer.kind == LayerKind::World {
+            let e = self.profile.bands().edges_for(view, quality);
+            self.layer.edge_m[..RING_COUNT].copy_from_slice(&e);
+        }
     }
 
     /// The terrain-mesh layer of `profile` on `terrain` (active): no fetch stage, terrain jobs.

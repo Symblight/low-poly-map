@@ -293,13 +293,13 @@ fn profile_override_changes_the_cover() {
     use std::sync::Arc;
     let frame = Frame::new(VILNIUS.0, VILNIUS.1);
     let (cam, vel) = COVER_CAMERAS[0]; // 300 m AGL over the origin, hovering
-    let small_r0 = crate::profile::resolve(None, Some(&serde_json::json!({"bands": {"r0_edge_m": 250.0}})), &crate::NullLog)
+    let small_r0 = crate::profile::resolve(None, Some(&serde_json::json!({"lod": {"error_m": {"r1": 1.07}}})), &crate::NullLog)
         .unwrap();
     let mut s_def = crate::scheduler::Scheduler::new(frame, false, Arc::new(Profile::default()));
     let mut s_ovr = crate::scheduler::Scheduler::new(frame, false, Arc::new(small_r0));
     let def = cover_signature(&mut s_def, cam, vel);
     let ovr = cover_signature(&mut s_ovr, cam, vel);
-    println!("cover at 300 m AGL, tiles per ring R0..R3: default {:?}, r0_edge_m 250 {:?}", def.0, ovr.0);
+    println!("cover at 300 m AGL, tiles per ring R0..R3: default {:?}, lod.error_m.r1 1.07 (R0 edge ~250 m) {:?}", def.0, ovr.0);
     assert_eq!(def, GOLDEN_COVER[0], "default profile = pre-P3 cover");
     assert_ne!(def.1, ovr.1);
     assert!(ovr.0[0] < def.0[0], "smaller R0 radius -> fewer z16 tiles: {:?} vs {:?}", ovr.0, def.0);
@@ -328,7 +328,7 @@ fn profile_override_changes_the_cover() {
         (per_ring, keys)
     };
     let (d_rings, d_keys) = tiles(None);
-    let (o_rings, o_keys) = tiles(Some(serde_json::json!({"bands": {"r0_edge_m": 250}})));
+    let (o_rings, o_keys) = tiles(Some(serde_json::json!({"lod": {"error_m": {"r1": 1.07}}})));
     assert_eq!(d_rings, def.0, "World cover = scheduler cover (default)");
     assert_eq!(o_rings, ovr.0, "World cover = scheduler cover (override)");
     assert_ne!(d_keys, o_keys);

@@ -188,6 +188,33 @@ public sealed class TilePool
         _buildingFadeMaterial.SetShaderParameter("emission_level", level);
     }
 
+    /// <summary>
+    /// Moves the window / sprite cross-fade (building materials: averaged window glow fades out; building light sprites: fade in) and the street
+    /// light pool fade. Called by <see cref="WorldView"/> when the live LOD edge between R2 and R1 changes (<see cref="WorldRenderSettings.BlendFollowsLod"/>).
+    /// </summary>
+    public void SetLodRanges(float blendStartM, float blendEndM, float poolStartM, float poolEndM)
+    {
+        foreach (var m in new[] { _buildingMaterial, _buildingFadeMaterial })
+        {
+            m.SetShaderParameter("avg_fade_start_m", blendStartM);
+            m.SetShaderParameter("avg_fade_end_m", blendEndM);
+        }
+        _lightMaterial.SetShaderParameter("blend_start_m", blendStartM);
+        _lightMaterial.SetShaderParameter("blend_end_m", blendEndM);
+        _streetPoolMaterial.SetShaderParameter("fade_start_m", poolStartM);
+        _streetPoolMaterial.SetShaderParameter("fade_end_m", poolEndM);
+    }
+
+    /// <summary>Moves the far fade of every sprite set (building, street, airport lights and beacons): fully faded at <paramref name="endM"/> (bands.max_distance_m).</summary>
+    public void SetLightFar(float fadeStartM, float endM)
+    {
+        foreach (var m in new[] { _lightMaterial, _streetLightMaterial, _airportLightMaterial, _beaconMaterial })
+        {
+            m.SetShaderParameter("fade_start_m", fadeStartM);
+            m.SetShaderParameter("far_end_m", endM);
+        }
+    }
+
     /// <summary>The environment's depth fog curve on the light sprites, which are additive and fog themselves (fog_disabled).</summary>
     public void SetLightFog(float beginM, float endM, float curve)
     {

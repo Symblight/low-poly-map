@@ -460,6 +460,13 @@ impl WorldStreamer {
         if let Some(l) = self.world.latency() {
             d.set("latency", &latency_dict(l));
         }
+        // api 1.10: screen-space-error LOD (set_view / set_lod_quality).
+        d.set("tau_eff", self.world.tau_eff());
+        d.set("lod_quality", self.world.lod_quality());
+        d.set("lod_edges_m", &PackedFloat64Array::from(&self.world.lod_edges_m()[..]));
+        let v = self.world.lod_view();
+        d.set("view_fov_y_deg", v.fov_y_deg);
+        d.set("view_height_px", v.viewport_h_px as i64);
         // api 1.5: terrain-mesh layer counters, only while the layer runs.
         if self.world.terrain_layer_active() {
             let n = st.terrain_rings;
@@ -496,6 +503,24 @@ impl WorldStreamer {
     #[func]
     fn set_terrain_detail(&mut self, scale: f64) -> f64 {
         self.world.set_terrain_detail(scale)
+    }
+
+    /// The view the screen-space error is measured in (api 1.10): vertical field of view
+    /// (degrees, [1, 179]), viewport height in physical pixels ([1, 65536]) and the camera's
+    /// forward direction (local axes). Invalid input is ignored with a warning. Defaults 60 deg,
+    /// 1080 px, -Z until called; kept across `configure_world`; the cover follows next frame.
+    #[func]
+    fn set_view(&mut self, fov_y_deg: f64, viewport_h_px: i64, forward: Vector3) {
+        let f = [forward.x as f64, forward.y as f64, forward.z as f64];
+        self.world.set_view(fov_y_deg, viewport_h_px as f64, f);
+    }
+
+    /// LOD quality (api 1.10): live multiplier of the profile's `lod.tau_px` (2 = half the
+    /// refine distances), clamped to [0.25, 4], non-finite ignored. Kept across
+    /// `configure_world`; the cover follows next frame. Returns the scale in effect.
+    #[func]
+    fn set_lod_quality(&mut self, scale: f64) -> f64 {
+        self.world.set_lod_quality(scale)
     }
 
     /// Airports of a seed world (api 1.7): ident, name, type, reference point, runways with both

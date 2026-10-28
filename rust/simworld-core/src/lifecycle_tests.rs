@@ -1086,3 +1086,67 @@ fn memory_budget_follows_the_profile_and_evicts_fake_items() {
     let s = w.stats().memory;
     assert_eq!((s.total_bytes, s.pool(Pool::DataTiles).items), (0, 0));
 }
+
+/// api 1.10: `set_view` / `set_lod_quality` work before configure, survive `configure_world`,
+/// ignore invalid input, and move the cover from the next `update_camera` (no reconfigure).
+#[test]
+fn set_view_and_lod_quality_persist_across_configure() {
+    let mut w = world();
+    let default_edges = [600.0, 2500.0, 7000.0, 25_000.0];
+    assert_eq!(w.lod_edges_m(), default_edges);
+    assert_eq!(w.tau_eff(), 4.0);
+    // Before configure.
+    assert!(w.set_view(30.0, 1080.0, [0.0, 0.0, -2.0]));
+    assert_eq!(w.lod_view().forward, [0.0, 0.0, -1.0]);
+    let narrow = w.lod_edges_m();
+    let k = (30f64).to_radians().tan() / (15f64).to_radians().tan();
+    for r in 0..3 {
+        assert!((narrow[r] / default_edges[r] - k).abs() / k < 0.01, "{narrow:?}");
+    }
+    // Invalid input: ignored, no change.
+    for (fov, h, f) in [(0.0, 1080.0, [0.0, 0.0, -1.0]), (60.0, -5.0, [0.0, 0.0, -1.0]), (60.0, 1080.0, [0.0; 3]), (f64::NAN, 1080.0, [0.0, 0.0, -1.0])] {
+        assert!(!w.set_view(fov, h, f));
+    }
+    assert_eq!(w.lod_view().fov_y_deg, 30.0);
+    // Configure: the view is kept and reaches the scheduler.
+    assert!(w.configure_world(synthetic(VILNIUS.0, VILNIUS.1)).ok);
+    assert_eq!(w.lod_view().fov_y_deg, 30.0);
+    assert_eq!(w.scheduler().unwrap().layer().edge_m[..4], narrow);
+    // At 1000 m the narrow view puts R0 tiles in the cover (default: none above 940 m slant).
+    w.update_camera([0.0, 1000.0, 0.0], [0.0; 3], 1000.0);
+    let rings = |w: &World| {
+        let mut per = [0usize; 4];
+        w.debug_tiles(|k: LayerKey, ring, _, _| {
+            if k.layer == crate::rings::LayerKind::World {
+                per[ring] += 1;
+            }
+        });
+        per
+    };
+    assert!(rings(&w)[0] > 0, "fov 30: R0 at 1000 m");
+    // Quality: live tau multiplier, clamped, kept across a reconfigure.
+    assert_eq!(w.set_lod_quality(2.0), 2.0);
+    assert_eq!(w.tau_eff(), 8.0);
+    let q2 = w.lod_edges_m();
+    for r in 0..3 {
+        assert!((q2[r] / narrow[r] - 0.5).abs() < 1e-12);
+    }
+    assert_eq!(q2[3], 25_000.0);
+    assert_eq!(w.set_lod_quality(f64::NAN), 2.0, "non-finite ignored");
+    assert_eq!(w.set_lod_quality(100.0), 4.0);
+    assert_eq!(w.set_lod_quality(0.0), 0.25);
+    assert_eq!(w.set_lod_quality(2.0), 2.0);
+    assert!(w.configure_world(synthetic(54.70, 25.30)).ok);
+    assert_eq!((w.lod_quality(), w.lod_view().fov_y_deg), (2.0, 30.0));
+    assert_eq!(w.scheduler().unwrap().layer().edge_m[..4], q2);
+    // A viewport of half the height halves the edges (quality 1, 60 deg).
+    w.set_lod_quality(1.0);
+    assert!(w.set_view(60.0, 540.0, [1.0, 0.0, 0.0]));
+    let half = w.lod_edges_m();
+    for (got, want) in half.iter().zip([300.0, 1250.0, 3500.0, 25_000.0]) {
+        assert!((got - want).abs() < 1e-9, "{half:?}");
+    }
+    // The default view again: the default cover (GOLDEN_COVER-equivalent edges).
+    assert!(w.set_view(60.0, 1080.0, [0.0, 0.0, -1.0]));
+    assert_eq!(w.scheduler().unwrap().layer().edge_m[..4], default_edges);
+}

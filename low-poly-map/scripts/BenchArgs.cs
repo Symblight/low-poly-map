@@ -7,7 +7,7 @@ namespace LowPolyMap;
 /// <summary>
 /// Test-bench launch arguments for the <see cref="WorldView"/> (host side: the addon itself reads no command line). Applies
 /// <c>--tile-url=</c>, <c>--curvature=</c>, <c>--light-alpha=</c>, <c>--fake-fade=</c>, <c>--profile=</c>, <c>--area=</c>,
-/// <c>--set=</c>, <c>--view=</c> / <c>--cam-fov=</c> (screen-space LOD view), <c>--world=</c> (seed world), <c>--seed-spot=</c>, <c>--seed-selftest</c>, <c>--cover-selftest</c>, <c>--latency-log=</c> and the terrain arguments (<c>--terrain</c>, <c>--terrain-detail=</c>,
+/// <c>--set=</c>, <c>--lod-selftest</c>, <c>--view=</c> / <c>--cam-fov=</c> (screen-space LOD view), <c>--world=</c> (seed world), <c>--seed-spot=</c>, <c>--seed-selftest</c>, <c>--cover-selftest</c>, <c>--latency-log=</c> and the terrain arguments (<c>--terrain</c>, <c>--terrain-detail=</c>,
 /// <c>--terrain-reach-km=</c>, <c>--terrain-amplitude=</c>, <c>--far=</c>, <c>--terrain-selftest</c>, <c>--terrain-collision</c>,
 /// <c>--terrain-collision-selftest</c>), then starts the view (the scene turns
 /// <c>AutoStart</c> off). See low-poly-map/CLAUDE.md.
@@ -18,8 +18,9 @@ public partial class BenchArgs : Node
     private const string ProfileArg = "--profile=";
     private const string SetArg = "--set=";
     private const string AreaArg = "--area=";
-    private static readonly string[] BandEdgeKeys = { "r0_edge_m", "r1_edge_m", "r2_edge_m", "r3_edge_m" };
-    private static readonly double[] BandEdgeDefaults = { 600.0, 2500.0, 7000.0, 25000.0 };
+    private const double DefaultMaxDistanceM = 25000.0;
+    /// <summary>--area=&lt;a&gt;: the LOD quality set after start (1 / a); 0 = not given.</summary>
+    private double _areaQuality;
 
     [Export] public WorldView? View { get; set; }
 
@@ -67,12 +68,14 @@ public partial class BenchArgs : Node
         if (view.Camera != null && (TerrainDefaultOn() || view.SeedWorld.Length > 0 || System.Linq.Enumerable.Any(OS.GetCmdlineUserArgs(), a => a == "--terrain" || a == "--terrain-selftest" || a == "--terrain-collision" || a == "--terrain-collision-selftest" || a.StartsWith("--terrain-detail=", System.StringComparison.Ordinal))))
             view.Camera.Far = 160000f;
         view.BaseProfileOverrides = ParseOverrides(view);
+        PinViewForTests(view);
         ApplyTerrainArgs(view);
         // Terrain collision (addon helper, default off): --terrain-collision turns it on (implies --terrain).
         view.TerrainCollisionEnabled = System.Linq.Enumerable.Contains(OS.GetCmdlineUserArgs(), "--terrain-collision") || TerrainCollisionSelfTest.Requested();
 
         if (CoverSelfTest.Requested()) CoverSelfTest.Run(view);
         view.Start();
+        if (_areaQuality > 0) GD.Print($"[BenchArgs] --area: set_lod_quality({_areaQuality:0.###}) -> in effect {view.SetLodQuality(_areaQuality):0.###} (band edges are screen-space since api 1.10; bands.max_distance_m scaled by the area)");
         double latencyEvery = LatencyLog.Requested();
         if (latencyEvery > 0) LatencyLog.Attach(view, latencyEvery);
         if (WindowSelfTest.Requested()) GetTree().Quit(WindowSelfTest.Run(view) ? 0 : 1);
@@ -81,12 +84,32 @@ public partial class BenchArgs : Node
         if (System.Linq.Enumerable.Contains(OS.GetCmdlineUserArgs(), "--hide-vector")) view.VectorVisible = false;
         if (System.Linq.Enumerable.Contains(OS.GetCmdlineUserArgs(), "--terrain-log")) view.TerrainDebugLog = true;
         if (System.Linq.Enumerable.Contains(OS.GetCmdlineUserArgs(), "--churn-log")) { view.ChurnLog = true; view.OriginShifted += sh => GD.Print($"[Churn] t={Time.GetTicksMsec() / 1000.0:0.00} origin shift {sh}"); view.Reconfigured += (ok, e) => GD.Print($"[Churn] t={Time.GetTicksMsec() / 1000.0:0.00} RECONFIGURE ok={ok} {e}"); }
+        if (LodSelfTest.Requested()) LodSelfTest.Attach(view, View?.GetParent());
         if (SeedSpots.Requested() is { } spot) SeedSpotDriver.Attach(view, View?.GetParent(), spot);
         if (SeedSelfTest.Requested()) SeedSelfTest.Attach(view, View?.GetParent());
         if (TerrainSelfTest.Requested()) TerrainSelfTest.Attach(view, View?.GetParent());
         if (TerrainCollisionSelfTest.Requested()) TerrainCollisionSelfTest.Attach(view, View?.GetParent());
         _fallback = GetParent()?.GetNodeOrNull<MeshInstance3D>("Ground");
         if (_fallback != null && System.Linq.Enumerable.Contains(OS.GetCmdlineUserArgs(), "--hide-fallback")) { _fallback.Visible = false; _fallback = null; }
+    }
+
+    /// <summary>
+    /// A headless window is about 64 px tall, which would make the screen-space edges tiny, and a self-test must not depend on the window of the machine
+    /// it runs on: headless runs and every <c>*-selftest</c> / <c>--geodetic-test</c> / <c>--shot</c> run pin the view to 60 deg / 1080 px (the
+    /// reference view of the default profile) unless <c>--view=</c> was given. Interactive runs use the real window.
+    /// </summary>
+    private static void PinViewForTests(WorldView view)
+    {
+        var args = OS.GetCmdlineUserArgs();
+        bool test = DisplayServer.GetName() == "headless";
+        foreach (var a in args)
+        {
+            if (a.StartsWith("--view=", System.StringComparison.Ordinal)) return;
+            if (a.EndsWith("-selftest", System.StringComparison.Ordinal) || a.StartsWith("--shot=", System.StringComparison.Ordinal) || a == "--geodetic-test") test = true;
+        }
+        if (!test) return;
+        view.SetViewOverride(60f, 1080);
+        GD.Print("[BenchArgs] test/headless run: view pinned to 60 deg / 1080 px");
     }
 
     /// <summary><c>--view=&lt;fovdeg&gt;,&lt;H&gt;</c>: overrides what the view sends with set_view (api 1.10); either part may be empty (<c>--view=,540</c>, <c>--view=30</c>).</summary>
@@ -231,12 +254,12 @@ public partial class BenchArgs : Node
     }
 
     /// <summary>
-    /// --area=&lt;0.05..1&gt; (scales the four band edges, applied first) and repeated --set=&lt;dotted.key&gt;=&lt;number&gt; (applied last, wins).
+    /// --area=&lt;0.05..1&gt; (scales the loaded area: <c>bands.max_distance_m</c> x area, applied first, and after start <c>set_lod_quality(1 / area)</c>, which scales the refine distances) and repeated --set=&lt;dotted.key&gt;=&lt;number&gt; (applied last, wins).
     /// Returns the nested overrides (may be empty).
     /// </summary>
-    private static Godot.Collections.Dictionary ParseOverrides(WorldView view)
+    private Godot.Collections.Dictionary ParseOverrides(WorldView view)
     {
-        double area = 0;
+        double area = 0, quality = 0;
         var sets = new List<(string Key, Variant Value)>();
         foreach (var arg in OS.GetCmdlineUserArgs())
         {
@@ -263,17 +286,13 @@ public partial class BenchArgs : Node
         var overrides = new Godot.Collections.Dictionary();
         if (area > 0)
         {
-            var bands = new Godot.Collections.Dictionary();
             var profile = view.DefaultProfile();
-            Godot.Collections.Dictionary? pb = profile.TryGetValue("bands", out var bv) && bv.VariantType == Variant.Type.Dictionary ? bv.AsGodotDictionary() : null;
-            for (int i = 0; i < BandEdgeKeys.Length; i++)
-            {
-                double def = pb != null && pb.TryGetValue(BandEdgeKeys[i], out var e) ? e.AsDouble() : BandEdgeDefaults[i];
-                bands[BandEdgeKeys[i]] = def * area;
-            }
-            overrides["bands"] = bands;
+            double maxDist = profile.TryGetValue("bands", out var bv) && bv.VariantType == Variant.Type.Dictionary && bv.AsGodotDictionary().TryGetValue("max_distance_m", out var md) ? md.AsDouble() : DefaultMaxDistanceM;
+            overrides["bands"] = new Godot.Collections.Dictionary { ["max_distance_m"] = System.Math.Max(50.0, maxDist * area) };
+            quality = 1.0 / area;
         }
         foreach (var (key, value) in sets) SetDotted(overrides, key, value);
+        _areaQuality = quality;
         return overrides;
     }
 

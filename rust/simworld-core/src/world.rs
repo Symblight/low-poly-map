@@ -38,7 +38,7 @@ use crate::latency::Latency;
 use crate::lock::{canonical_dir, FolderLock, LockError};
 use crate::mesher::MeshData;
 use crate::profile::Profile;
-use crate::rings::{LayerKey, LayerKind, MAX_RINGS, RING_COUNT};
+use crate::rings::{LayerKey, LayerKind, LodView, MAX_RINGS, RING_COUNT};
 use crate::scheduler::{CpuStats, ReadyTile, Scheduler};
 use crate::terrain::Terrain;
 use crate::status::{Health, Status, StatusState, MSG_NOT_CONFIGURED, MSG_SHUT_DOWN};
@@ -220,6 +220,9 @@ static EMPTY_MESH: MeshData = MeshData { positions: Vec::new(), normals: Vec::ne
 
 /// Lower bound of `set_terrain_detail`.
 pub const TERRAIN_DETAIL_MIN: f64 = 0.25;
+/// Range of `set_lod_quality` (the tau multiplier; api 1.10).
+pub const LOD_QUALITY_MIN: f64 = 0.25;
+pub const LOD_QUALITY_MAX: f64 = 4.0;
 
 /// One finished tile, borrowed for the duration of the `pop_ready` callback.
 pub struct ReadyTileView<'a> {
@@ -333,6 +336,10 @@ pub struct World {
     stale_unloads: Vec<LayerKey>,
     /// `set_terrain_detail` scale (kept across configures, clamped to the profile's range).
     terrain_detail: f64,
+    /// The host's view for the screen-space error (`set_view`, api 1.10; kept across configures).
+    lod_view: LodView,
+    /// `set_lod_quality` scale: tau_eff = `lod.tau_px` x this (kept across configures).
+    lod_quality: f64,
 
     /// Light-mode re-deliveries handed out since the last `update_camera`.
     redelivered_this_frame: usize,
@@ -389,6 +396,8 @@ impl World {
             fade_tmp: Vec::new(),
             stale_unloads: Vec::new(),
             terrain_detail: 1.0,
+            lod_view: LodView::default(),
+            lod_quality: 1.0,
             redelivered_this_frame: 0,
             warn_limiter: WarnLimiter::default(),
             folder_lock: None,
@@ -731,6 +740,7 @@ impl World {
                 w.set_terrain(self.terrain.clone());
                 w.set_seed(self.seed.clone());
                 let mut s = Scheduler::new(frame, w.is_synthetic(), self.profile.clone()).with_terrain(self.terrain.clone());
+                s.set_lod_view(&self.lod_view, self.lod_quality);
                 if !w.is_synthetic() {
                     // Tiles v2 (T2a): R0 / R1 are cut from detail data tiles. An archive without
                     // `simworld_levels` metadata (zooms 13..16) is read with the compatibility
@@ -1192,6 +1202,64 @@ impl World {
             }
         }
         self.terrain_detail
+    }
+
+    /// Contract `set_view(fov_y_deg, viewport_h_px, forward)` (api 1.10): the view the
+    /// screen-space error is measured in. `fov_y_deg` in [1, 179], `viewport_h_px` (physical
+    /// pixels) in [1, 65536], `forward` (local axes) finite and non-zero; anything else is
+    /// ignored with a rate-limited warning and no state change (returns false). Until it is
+    /// called the default view applies (60 deg, 1080 px, -Z). Kept across `configure_world`;
+    /// the cover follows from the next `update_camera`, no reconfigure. `forward` is stored for
+    /// the rear-hemisphere relaxation (step T4) and does not move the cover yet.
+    pub fn set_view(&mut self, fov_y_deg: f64, viewport_h_px: f64, forward: [f64; 3]) -> bool {
+        let Some(v) = LodView::new(fov_y_deg, viewport_h_px, forward) else {
+            self.warn(&format!(
+                "WorldStreamer: set_view({fov_y_deg}, {viewport_h_px}, {forward:?}) ignored: needs fov_y_deg in [1, 179], viewport_h_px in [1, 65536] and a finite non-zero forward"
+            ));
+            return false;
+        };
+        self.lod_view = v;
+        self.apply_lod_view();
+        true
+    }
+
+    /// Contract `set_lod_quality(scale)` (api 1.10): live multiplier of `lod.tau_px` (tau_eff =
+    /// `tau_px` x scale; 2 = half the refine distances, coarser and cheaper), clamped to
+    /// [0.25, 4]. Non-finite input is ignored. Kept across `configure_world`; the cover follows
+    /// from the next `update_camera`. Returns the scale in effect.
+    pub fn set_lod_quality(&mut self, scale: f64) -> f64 {
+        if scale.is_finite() {
+            self.lod_quality = scale.clamp(LOD_QUALITY_MIN, LOD_QUALITY_MAX);
+            self.apply_lod_view();
+        }
+        self.lod_quality
+    }
+
+    fn apply_lod_view(&mut self) {
+        if let Some(s) = &mut self.scheduler {
+            s.set_lod_view(&self.lod_view, self.lod_quality);
+        }
+    }
+
+    /// The view in effect (see [`World::set_view`]).
+    pub fn lod_view(&self) -> LodView {
+        self.lod_view
+    }
+
+    /// The `set_lod_quality` scale in effect.
+    pub fn lod_quality(&self) -> f64 {
+        self.lod_quality
+    }
+
+    /// Effective SSE threshold (px): `lod.tau_px` x the quality scale (adaptive factors: T5).
+    pub fn tau_eff(&self) -> f64 {
+        self.profile.lod.tau_px * self.lod_quality
+    }
+
+    /// The vector layer's band edges in effect (m, R0..R3; R3 = `bands.max_distance_m`): the
+    /// SSE refine distances of the current view and tau_eff.
+    pub fn lod_edges_m(&self) -> [f64; RING_COUNT] {
+        self.profile.bands().edges_for(&self.lod_view, self.lod_quality)
     }
 
     /// The terrain detail scale in effect (see [`World::set_terrain_detail`]).

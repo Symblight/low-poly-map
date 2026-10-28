@@ -330,7 +330,9 @@ public partial class DebugOverlay : Control
         if (!streamer.HasSetView) { sb.Append("unavailable (api ").Append(streamer.ApiVersionText).Append("): fixed bands\n"); return; }
         sb.Append(streamer.SetViewCalls).Append(" calls");
         if (!_stats.HasLodStats) { sb.Append("  (no LOD stats in debug_stats)\n"); return; }
-        sb.Append("  tau_eff ").Append(_stats.TauEff.ToString("0.0")).Append(" px  data tiles ").Append(_stats.DataTilesLoaded).Append(" held / ").Append(_stats.DataTilesDecoded)
+        sb.Append("  tau_eff ").Append(_stats.TauEff.ToString("0.0")).Append(" px (quality x").Append(_stats.LodQuality.ToString("0.##")).Append(")  edges ")
+          .Append(_stats.LodEdgesM[0].ToString("0")).Append('/').Append(_stats.LodEdgesM[1].ToString("0")).Append('/').Append(_stats.LodEdgesM[2].ToString("0")).Append('/').Append(_stats.LodEdgesM[3].ToString("0"))
+          .Append(" m  lib view ").Append(_stats.ViewFovYDeg.ToString("0.#")).Append(" deg / ").Append(_stats.ViewHeightPx).Append(" px  blend D ").Append(Bridge.BlendEdgeM.ToString("0")).Append(" m\n  data tiles ").Append(_stats.DataTilesLoaded).Append(" held / ").Append(_stats.DataTilesDecoded)
           .Append(" decoded  requests skipped: empty ").Append(_stats.RequestsSkippedEmpty).Append(", moving ").Append(_stats.RequestsSkippedMoving).Append('\n');
     }
 

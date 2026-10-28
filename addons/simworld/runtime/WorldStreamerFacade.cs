@@ -157,6 +157,13 @@ public sealed class StreamerStats
     public bool HasLodStats;
     /// <summary>The effective screen-space error threshold in pixels (debug_stats "tau_eff", api 1.10).</summary>
     public double TauEff;
+    /// <summary>The set_lod_quality scale in effect (debug_stats "lod_quality", api 1.10; 1 on an older library).</summary>
+    public double LodQuality = 1.0;
+    /// <summary>The band edges the cover uses now in metres, R0..R3 (debug_stats "lod_edges_m", api 1.10): R0..R2 are the screen-space refine distances, R3 = bands.max_distance_m. All 0 without the key.</summary>
+    public readonly double[] LodEdgesM = new double[Rings];
+    /// <summary>The view the library works with (debug_stats "view_fov_y_deg" / "view_height_px", api 1.10; 0 without the keys).</summary>
+    public double ViewFovYDeg;
+    public int ViewHeightPx;
     /// <summary>Data tiles held / decoded so far (detail z14 + overview z11, api 1.10) and requests the scheduler did not send, because the PMTiles directory has no entry / because the camera moves too fast.</summary>
     public long DataTilesLoaded, DataTilesDecoded, RequestsSkippedEmpty, RequestsSkippedMoving;
     public double CacheMb;
@@ -213,7 +220,7 @@ public sealed class WorldStreamerFacade
     /// (poll_fades, ground_height_at, debug_tiles, configure_world / world_profile, the host API), so nothing is probed.</summary>
     public const int MinApiMinor = 0;
     /// <summary>Highest contract minor this facade knows. A library above it gets one info line.</summary>
-    public const int LatestKnownMinor = 7;
+    public const int LatestKnownMinor = 10;
     /// <summary>First contract minor of <see cref="ExpectedApiMajor"/> with the terrain layer (layers option, "t/" keys, set_terrain_detail).</summary>
     public const int TerrainMinApiMinor = 5;
     /// <summary>First contract minor with the <c>terrain_center</c> option and the status key <c>terrain_active</c> (api 1.6).</summary>
@@ -301,6 +308,11 @@ public sealed class WorldStreamerFacade
     private static readonly StringName KVersion = new("version");
     private static readonly StringName KLatency = new("latency");
     private static readonly StringName KTauEff = new("tau_eff");
+    private static readonly StringName KLodQuality = new("lod_quality");
+    private static readonly StringName KLodEdges = new("lod_edges_m");
+    private static readonly StringName KViewFov = new("view_fov_y_deg");
+    private static readonly StringName KViewHeight = new("view_height_px");
+    private static readonly StringName MSetLodQuality = new("set_lod_quality");
     private static readonly StringName KDataTilesLoaded = new("data_tiles_loaded");
     private static readonly StringName KDataTilesDecoded = new("data_tiles_decoded");
     private static readonly StringName KRequestsSkippedEmpty = new("requests_skipped_empty");
@@ -827,6 +839,20 @@ public sealed class WorldStreamerFacade
         return true;
     }
 
+    /// <summary>True when the library has <c>set_lod_quality</c> (api 1.10+).</summary>
+    public bool HasLodQuality => HasSetView;
+
+    /// <summary>
+    /// set_lod_quality(scale) (api 1.10): live multiplier of the screen-space error threshold, clamped by the library to [0.25, 4]; 2 halves every
+    /// refine distance (coarser, fewer tiles), 0.5 doubles them. Kept across configure_world. Returns the scale in effect, NaN without the method.
+    /// </summary>
+    public double SetLodQuality(double scale)
+    {
+        if (!HasLodQuality) return double.NaN;
+        var v = _node!.Call(MSetLodQuality, scale);
+        return v.VariantType == Variant.Type.Float ? v.AsDouble() : double.NaN;
+    }
+
     private bool? _hasPollFades;
 
     /// <summary>True if the loaded Rust build exports poll_fades() (checked once; false = every tile is fade 1, no transitions).</summary>
@@ -887,6 +913,15 @@ public sealed class WorldStreamerFacade
         ReadLatency(d, into.Latency);
         into.HasLodStats = d.ContainsKey(KTauEff);
         into.TauEff = d.TryGetValue(KTauEff, out var tau) ? tau.AsDouble() : 0.0;
+        into.LodQuality = d.TryGetValue(KLodQuality, out var lq) ? lq.AsDouble() : 1.0;
+        System.Array.Clear(into.LodEdgesM);
+        if (d.TryGetValue(KLodEdges, out var le) && le.VariantType == Variant.Type.PackedFloat64Array)
+        {
+            var arr = le.AsFloat64Array();
+            for (int i = 0; i < arr.Length && i < StreamerStats.Rings; i++) into.LodEdgesM[i] = arr[i];
+        }
+        into.ViewFovYDeg = d.TryGetValue(KViewFov, out var vf) ? vf.AsDouble() : 0.0;
+        into.ViewHeightPx = d.TryGetValue(KViewHeight, out var vh) ? (int)vh.AsInt64() : 0;
         into.DataTilesLoaded = d.TryGetValue(KDataTilesLoaded, out var dl) ? dl.AsInt64() : 0;
         into.DataTilesDecoded = d.TryGetValue(KDataTilesDecoded, out var dd) ? dd.AsInt64() : 0;
         into.RequestsSkippedEmpty = d.TryGetValue(KRequestsSkippedEmpty, out var se) ? se.AsInt64() : 0;

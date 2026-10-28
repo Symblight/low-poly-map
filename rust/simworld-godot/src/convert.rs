@@ -8,6 +8,7 @@ use serde_json::{Map, Number, Value};
 
 use std::sync::Arc;
 
+use simworld_core::world::lod::LodState;
 use simworld_core::{Diagnostics, SeedFileReader, WorldOptions};
 
 /// Option keys `configure_world` understands (contract section 3, api 0.6).
@@ -283,4 +284,25 @@ pub fn options_from_dict(d: &VarDictionary, current: &Diagnostics) -> Result<(Wo
         },
         warns,
     ))
+}
+
+/// The vector-layer LOD keys of `debug_stats()` and `lod_state()` (api 1.10 / 1.11).
+pub fn vector_lod_into(d: &mut VarDictionary, s: &LodState) {
+    d.set("tau_eff", s.tau_eff);
+    d.set("lod_quality", s.lod_quality);
+    d.set("lod_edges_m", &PackedFloat64Array::from(&s.lod_edges_m[..]));
+    d.set("lod_tiles_est", &PackedFloat64Array::from(&s.lod_tiles_est[..]));
+    d.set("lod_max_tiles", s.lod_max_tiles as i64);
+    d.set("view_fov_y_deg", s.view_fov_y_deg);
+    d.set("view_height_px", s.view_height_px as i64);
+}
+
+/// `lod_state()` (api 1.11): the vector keys plus the terrain cover's tau and detail.
+pub fn lod_state_dict(s: &LodState) -> VarDictionary {
+    let mut d = VarDictionary::new();
+    vector_lod_into(&mut d, s);
+    d.set("terrain_active", s.terrain_active);
+    d.set("terrain_tau_eff", s.terrain_tau_eff);
+    d.set("terrain_detail", s.terrain_detail);
+    d
 }

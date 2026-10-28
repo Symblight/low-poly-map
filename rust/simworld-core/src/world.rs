@@ -44,7 +44,7 @@ use crate::terrain::Terrain;
 use crate::status::{Health, Status, StatusState, MSG_NOT_CONFIGURED, MSG_SHUT_DOWN};
 use crate::worker::{Job, Worker, WorkerMsg};
 
-mod lod;
+pub mod lod;
 
 /// Bounded wait of `shutdown` and of a re-configure that replaces a worker using a disk cache
 /// (until the old cache thread has flushed and closed its file).

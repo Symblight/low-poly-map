@@ -23,14 +23,14 @@ use crate::world::{World, WorldOptions};
 const VILNIUS: (f64, f64) = (54.6872, 25.2797);
 const FRAME: Duration = Duration::from_micros(16_667);
 
-fn source() -> (String, &'static str) {
+pub(crate) fn source() -> (String, &'static str) {
     match std::env::var("SIMWORLD_V2_ARCHIVE") {
         Ok(p) => (crate::data_world_tests::serve(std::fs::read(p).expect("v2 archive")).0, "v2"),
         Err(_) => (String::new(), "synthetic"),
     }
 }
 
-fn options(url: &str) -> WorldOptions {
+pub(crate) fn options(url: &str) -> WorldOptions {
     let mut ov = serde_json::json!({ "terrain": { "enabled": true } });
     if let Some(extra) = std::env::var("SIMWORLD_PERF_SET").ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()) {
         merge(&mut ov, extra);

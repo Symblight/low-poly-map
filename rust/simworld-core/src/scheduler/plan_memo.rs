@@ -60,6 +60,9 @@ impl Default for ViewSlack {
 pub(super) struct PlanMemo {
     /// Whether the record below belongs to the current plan (`t_split`).
     valid: bool,
+    /// The plan waited on a probe (async boxes): valid only while no probe batch arrived, i.e.
+    /// while the scheduler's probe generation is still this one (perf review 3 item 2).
+    waits_on: Option<u64>,
     inputs: Option<PlanInputs>,
     views: Vec<(ViewPoint, f64)>,
     slack: [ViewSlack; MAX_RINGS],
@@ -98,9 +101,12 @@ impl PlanMemo {
         self.planned += 1;
     }
 
-    /// Finish the record: `reusable` = the budget did not bind (the plan is the unordered set).
-    pub fn finish(&mut self, reusable: bool, counters: (usize, usize)) {
+    /// Finish the record: `reusable` = the budget did not bind (the plan is the unordered set);
+    /// `waits_on` = the probe generation the plan saw when it waited on a probe (`None` = it
+    /// did not).
+    pub fn finish(&mut self, reusable: bool, waits_on: Option<u64>, counters: (usize, usize)) {
         self.valid = reusable;
+        self.waits_on = waits_on;
         self.counters = counters;
     }
 
@@ -144,16 +150,23 @@ impl PlanMemo {
     }
 
     /// Whether the plan of the record is the plan a fresh run would make now. `split(k)` = the
-    /// node's hysteresis state now.
+    /// node's hysteresis state now; `probe_gen` = the scheduler's probe generation now.
+    ///
+    /// A plan that waited on a probe made every other decision with the slack recorded, and
+    /// each wait depends only on which boxes and error proxies are known: until a probe batch
+    /// arrives the waits are the same (a wait is a node that does not split, and the value it
+    /// waits for is still on the way), so the plan is reused like a complete one.
+    #[allow(clippy::too_many_arguments)]
     pub fn still_valid(
         &self,
         inputs: &PlanInputs,
         views: &[ViewPoint; MAX_RINGS],
         grounds: &[f64; MAX_RINGS],
         hyst: f64,
+        probe_gen: u64,
         split: impl Fn(TileKey) -> bool,
     ) -> bool {
-        if !self.valid || self.inputs.as_ref() != Some(inputs) {
+        if !self.valid || self.inputs.as_ref() != Some(inputs) || self.waits_on.is_some_and(|g| g != probe_gen) {
             return false;
         }
         for (r, ((o, og), (n, ng))) in self.views.iter().zip(views.iter().zip(grounds)).enumerate() {

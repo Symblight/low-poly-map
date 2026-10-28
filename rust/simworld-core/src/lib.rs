@@ -62,6 +62,8 @@ mod lifecycle_tests;
 mod perf_tests;
 #[cfg(test)]
 mod perf_stream_tests;
+#[cfg(test)]
+mod perf_flight_tests;
 
 pub use diag::{Diagnostics, Log, NullLog};
 pub use profile::{Profile, WorldProfile, PROFILE_VERSION};

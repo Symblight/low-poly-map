@@ -228,3 +228,32 @@ fn chunk_edge_cases_and_levels() {
     assert_eq!((a.mesh, a.ground, a.lights), (b.mesh, b.ground, b.lights));
 }
 
+
+/// Timing of the synthetic data levels (T2c) and the cost of an overview tile.
+#[test]
+#[ignore]
+fn synthetic_levels_timing() {
+    let p = crate::profile::test_default();
+    let f = frame();
+    for terrain in [false, true] {
+        let t = if terrain {
+            let q = crate::profile::resolve(None, Some(&serde_json::json!({"terrain": {"enabled": true}})), &crate::NullLog).unwrap();
+            Terrain::from_profile(&q, VILNIUS.0, VILNIUS.1)
+        } else {
+            Terrain::flat()
+        };
+        for z in [11u8, 14] {
+            let k = crate::geo::tile_for(VILNIUS.0, VILNIUS.1, z);
+            let t0 = std::time::Instant::now();
+            let d = synthetic_data_tile(k, DataLevels::SYNTHETIC.level_of(k), f, &t, p);
+            println!(
+                "terrain {terrain} z{z}: {:.1} ms, {} buildings/blocks, {} landmarks, {} lights, {:.1} MB",
+                t0.elapsed().as_secs_f64() * 1e3,
+                d.buildings.len(),
+                d.landmarks.len(),
+                d.lights.len(),
+                d.bytes as f64 / 1048576.0
+            );
+        }
+    }
+}

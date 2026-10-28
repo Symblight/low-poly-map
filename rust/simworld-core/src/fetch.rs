@@ -15,9 +15,14 @@
 //!   old tiles. While the archive is unreachable the cache is served as is (offline use) and
 //!   validated as soon as it can be opened.
 //!
-//! * Tileset contract (audit A18): when the archive opens, its header zoom range must cover
-//!   13..16 and its metadata must list the `buildings`, `landuse` and `roads` layers; otherwise
-//!   every fetch fails with that error (reported once through [`Note::Error`]).
+//! * Tileset contract (audit A18, [`check_tileset`]): when the archive opens it must be either a
+//!   two-level archive (metadata `simworld_levels` = `{"detail": 14, "overview": z}`, exactly
+//!   those two zooms, layers `buildings` / `landuse` / `roads` + `blocks` / `lights`, optional
+//!   `landmarks`; Tiles and LOD v2) or a compatibility archive (no `simworld_levels`, zooms
+//!   covering 13..16, layers `buildings`, `landuse`, `roads`); otherwise every fetch fails with
+//!   that error (reported once through [`Note::Error`]). The accepted levels
+//!   ([`crate::data::DataLevels`]) are recorded in the disk cache's `meta` table, so a warm
+//!   cache knows them offline ([`Fetcher::cached_levels`]).
 //!
 //! Everything here runs on tokio threads and the cache thread and never touches Godot.
 
@@ -32,8 +37,9 @@ use std::time::{Duration, Instant, SystemTime};
 use bytes::Bytes;
 use pmtiles::{AsyncPmTilesReader, Compression, HashMapCache, HttpBackend, TileCoord};
 
+use crate::data::DataLevels;
 use crate::geo::TileKey;
-use crate::mvt::{splitmix64, BUILDINGS_LAYER, LANDUSE_LAYER, ROADS_LAYER};
+use crate::mvt::{splitmix64, BLOCKS_LAYER, BUILDINGS_LAYER, LANDMARKS_LAYER, LANDUSE_LAYER, LIGHTS_LAYER, ROADS_LAYER};
 use crate::profile::Profile;
 use crate::rings::{LEAF_ZOOM, ROOT_ZOOM};
 
@@ -127,29 +133,73 @@ impl From<&str> for FetchError {
     }
 }
 
-/// Check an opened archive against the tileset contract: zooms 13..16 and the layers the
-/// decoder needs (`metadata` = the archive's JSON metadata).
-pub fn check_tileset(min_zoom: u8, max_zoom: u8, metadata: &str) -> Result<(), String> {
-    if min_zoom > ROOT_ZOOM || max_zoom < LEAF_ZOOM {
-        return Err(format!(
-            "tileset zoom range z{min_zoom}-{max_zoom} does not cover z{ROOT_ZOOM}-{LEAF_ZOOM} (the library's bands need every zoom from {ROOT_ZOOM} to {LEAF_ZOOM}; rebuild the archive with data/build_tiles.sh)"
-        ));
-    }
+/// The detail zoom a two-level archive must have (R0 z16 / R1 z15 are cut from it, R2 z14 from
+/// the overview level).
+pub const DETAIL_ZOOM: u8 = 14;
+/// Overview zooms a two-level archive may use (R2 z14 / R3 z13 are cut from it).
+pub const OVERVIEW_ZOOMS: std::ops::RangeInclusive<u8> = 8..=13;
+
+/// Check an opened archive against the tileset contract and return its data levels (`metadata`
+/// = the archive's JSON metadata): a two-level archive (`simworld_levels`, exactly its two
+/// zooms, the detail and overview layers; `landmarks` optional) or a compatibility archive
+/// (zooms 13..16, layers `buildings`, `landuse`, `roads`).
+pub fn check_tileset(min_zoom: u8, max_zoom: u8, metadata: &str) -> Result<DataLevels, String> {
     let meta: serde_json::Value = serde_json::from_str(metadata).map_err(|e| format!("tileset metadata is not JSON: {e}"))?;
     let Some(layers) = meta.get("vector_layers").and_then(|v| v.as_array()) else {
         return Err("tileset metadata has no `vector_layers`: cannot verify the required layers (buildings, landuse, roads)".into());
     };
     let ids: Vec<&str> = layers.iter().filter_map(|l| l.get("id").and_then(|i| i.as_str())).collect();
-    let missing: Vec<&str> =
-        [BUILDINGS_LAYER, LANDUSE_LAYER, ROADS_LAYER].into_iter().filter(|l| !ids.contains(l)).collect();
-    if !missing.is_empty() {
-        return Err(format!(
-            "tileset lacks required layer(s) {} (has: {}); build it with the planetiler profile in data/",
+    let need = |want: &[&'static str]| -> Result<(), String> {
+        let missing: Vec<&str> = want.iter().copied().filter(|l| !ids.contains(l)).collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "tileset lacks required layer(s) {} (has: {}); build it with the planetiler profile in data/ or `simworld-cli bake`",
             missing.join(", "),
             ids.join(", ")
+        ))
+    };
+    if let Some(l) = meta.get("simworld_levels") {
+        let zoom = |k: &str| l.get(k).and_then(|v| v.as_u64()).filter(|z| *z <= 30).map(|z| z as u8);
+        let (Some(detail), Some(overview)) = (zoom("detail"), zoom("overview")) else {
+            return Err(format!("tileset metadata simworld_levels must be {{\"detail\": <zoom>, \"overview\": <zoom>}}, got {l}"));
+        };
+        if detail != DETAIL_ZOOM || !OVERVIEW_ZOOMS.contains(&overview) {
+            return Err(format!(
+                "tileset simworld_levels detail z{detail} / overview z{overview} not supported (the library needs detail z{DETAIL_ZOOM} and overview z{}..z{})",
+                OVERVIEW_ZOOMS.start(),
+                OVERVIEW_ZOOMS.end()
+            ));
+        }
+        if (min_zoom, max_zoom) != (overview, detail) {
+            return Err(format!(
+                "tileset zoom range z{min_zoom}-{max_zoom} does not match its simworld_levels (exactly z{overview} and z{detail}); rebuild it with `simworld-cli bake`"
+            ));
+        }
+        need(&[BUILDINGS_LAYER, LANDUSE_LAYER, ROADS_LAYER, BLOCKS_LAYER, LIGHTS_LAYER])?;
+        return Ok(DataLevels::two_level(detail, overview, ids.contains(&LANDMARKS_LAYER)));
+    }
+    if min_zoom > ROOT_ZOOM || max_zoom < LEAF_ZOOM {
+        return Err(format!(
+            "tileset zoom range z{min_zoom}-{max_zoom} does not cover z{ROOT_ZOOM}-{LEAF_ZOOM} (the library's bands need every zoom from {ROOT_ZOOM} to {LEAF_ZOOM}, or a two-level archive with simworld_levels; rebuild the archive with data/build_tiles.sh or `simworld-cli bake`)"
         ));
     }
-    Ok(())
+    need(&[BUILDINGS_LAYER, LANDUSE_LAYER, ROADS_LAYER])?;
+    Ok(DataLevels::COMPAT)
+}
+
+/// `DataLevels` as stored in the disk cache's `meta` table (`levels`).
+fn levels_text(l: DataLevels) -> String {
+    format!("{},{},{},{}", l.detail, l.overview, l.two_level as u8, l.landmarks as u8)
+}
+
+fn parse_levels(s: &str) -> Option<DataLevels> {
+    let v: Vec<u8> = s.split(',').map(|x| x.parse().ok()).collect::<Option<_>>()?;
+    match v[..] {
+        [detail, overview, two, lm] => Some(DataLevels { detail, overview, two_level: two == 1, landmarks: lm == 1 }),
+        _ => None,
+    }
 }
 /// Bump when the tile schema or the decoder's expectations change without a new archive URL.
 /// v2 (M5 Ground): `landuse` gained leisure/natural/riverbank kinds and `roads` is decoded.
@@ -406,6 +456,9 @@ enum Cmd {
     Get(i64, tokio::sync::oneshot::Sender<Option<Vec<u8>>>),
     Put(i64, Bytes),
     Sync(String, tokio::sync::oneshot::Sender<io::Result<bool>>),
+    /// Read / write one `meta` key (the archive's data levels).
+    GetMeta(&'static str, tokio::sync::oneshot::Sender<Option<String>>),
+    SetMeta(&'static str, String),
     Clear,
     Flush(crossbeam_channel::Sender<()>),
     /// Flush, checkpoint, close the file and end the thread; reply when done (if asked).
@@ -507,6 +560,20 @@ impl DiskCache {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.tx.send(Cmd::Sync(fp.to_string(), tx)).map_err(|_| io::Error::other("disk cache closed"))?;
         rx.await.map_err(|_| io::Error::other("disk cache closed"))?
+    }
+
+    /// A value of the `meta` table (`None` when absent or on any error).
+    pub async fn get_meta(&self, k: &'static str) -> Option<String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.tx.send(Cmd::GetMeta(k, tx)).ok()?;
+        rx.await.ok().flatten()
+    }
+
+    /// Set a value of the `meta` table (fire and forget).
+    pub fn set_meta(&self, k: &'static str, v: String) {
+        if !self.is_disabled() {
+            let _ = self.tx.send(Cmd::SetMeta(k, v));
+        }
     }
 
     /// Delete every cached tile (asynchronously).
@@ -680,6 +747,16 @@ impl CacheThread {
             }
             Cmd::Sync(fp, reply) => {
                 let _ = reply.send(self.sync(&fp));
+            }
+            Cmd::GetMeta(k, reply) => {
+                use rusqlite::OptionalExtension;
+                let v = self.conn.as_ref().and_then(|c| c.query_row("SELECT v FROM meta WHERE k = ?1", [k], |r| r.get(0)).optional().ok().flatten());
+                let _ = reply.send(v);
+            }
+            Cmd::SetMeta(k, v) => {
+                if let Some(c) = self.conn.as_ref() {
+                    let _ = c.execute("INSERT OR REPLACE INTO meta (k, v) VALUES (?1, ?2)", [k, v.as_str()]);
+                }
             }
             Cmd::Clear => {
                 let _ = self.clear();
@@ -988,6 +1065,8 @@ pub enum Source {
 
 struct ReaderSlot {
     reader: Option<Arc<Reader>>,
+    /// The data levels the opened archive passed the tileset check with.
+    levels: Option<DataLevels>,
     last_failure: Option<(Instant, String)>,
     /// The archive does not match the tileset contract: permanent for this configuration.
     fatal: Option<String>,
@@ -1045,7 +1124,7 @@ impl Fetcher {
         Ok(Self {
             url: url.to_string(),
             client,
-            reader: tokio::sync::Mutex::new(ReaderSlot { reader: None, last_failure: None, fatal: None }),
+            reader: tokio::sync::Mutex::new(ReaderSlot { reader: None, levels: None, last_failure: None, fatal: None }),
             cache_path,
             disk: tokio::sync::OnceCell::new(),
             opened: Arc::new(Mutex::new(None)),
@@ -1161,14 +1240,26 @@ impl Fetcher {
                         return Err(FetchError::new(Unreachable, msg));
                     }
                 };
-                if let Err(e) = check_tileset(min_zoom, max_zoom, &meta) {
-                    let msg = format!("{}: {e}", self.url);
-                    (self.notify)(Note::Error(msg.clone()));
-                    slot.fatal = Some(msg.clone());
-                    return Err(FetchError::new(Contract, msg));
+                let levels = match check_tileset(min_zoom, max_zoom, &meta) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        let msg = format!("{}: {e}", self.url);
+                        (self.notify)(Note::Error(msg.clone()));
+                        slot.fatal = Some(msg.clone());
+                        return Err(FetchError::new(Contract, msg));
+                    }
+                };
+                if levels.two_level {
+                    self.info(format!(
+                        "two-level archive: detail z{}, overview z{}{}",
+                        levels.detail,
+                        levels.overview,
+                        if levels.landmarks { ", landmarks" } else { "" }
+                    ));
                 }
                 let r = Arc::new(r);
                 slot.reader = Some(r.clone());
+                slot.levels = Some(levels);
                 slot.last_failure = None;
                 Ok(r)
             }
@@ -1199,6 +1290,30 @@ impl Fetcher {
             Err(e) => self.info(format!("disk cache fingerprint: {e}")),
         }
         v.done = true;
+    }
+
+    /// Open the archive (if not yet) and return the data levels it passed the tileset check
+    /// with; recorded in the disk cache for offline starts ([`Fetcher::cached_levels`]).
+    pub async fn open_levels(&self) -> Result<DataLevels, FetchError> {
+        self.reader().await?;
+        let levels = self.reader.lock().await.levels.ok_or_else(|| FetchError::new(FetchErrorKind::Unreachable, "archive not open"))?;
+        if let Some(d) = self.disk().await {
+            if d.get_meta("levels").await.as_deref() != Some(levels_text(levels).as_str()) {
+                d.set_meta("levels", levels_text(levels));
+            }
+        }
+        Ok(levels)
+    }
+
+    /// The data levels recorded by an earlier session in the disk cache (offline start).
+    pub async fn cached_levels(&self) -> Option<DataLevels> {
+        let d = self.disk().await?;
+        parse_levels(&d.get_meta("levels").await?)
+    }
+
+    /// Minimum wait before re-opening an archive that failed to open.
+    pub fn open_retry(&self) -> Duration {
+        self.params.open_retry
     }
 
     /// Raw tile bytes (as archived; empty = no tile in the archive) and where they came from.
@@ -1641,7 +1756,7 @@ mod tests {
     #[test]
     fn tileset_contract_check() {
         let meta = r#"{"vector_layers":[{"id":"buildings"},{"id":"landuse"},{"id":"roads"}],"name":"x"}"#;
-        assert!(check_tileset(13, 16, meta).is_ok());
+        assert_eq!(check_tileset(13, 16, meta), Ok(DataLevels::COMPAT));
         assert!(check_tileset(0, 18, meta).is_ok());
         let e = check_tileset(14, 16, meta).unwrap_err();
         assert!(e.contains("z14-16") && e.contains("z13-16"), "{e}");
@@ -1650,6 +1765,30 @@ mod tests {
         assert!(e.contains("landuse, roads") && e.contains("has: buildings, water"), "{e}");
         assert!(check_tileset(13, 16, "{}").unwrap_err().contains("vector_layers"));
         assert!(check_tileset(13, 16, "not json").is_err());
+        // Two-level archives (Tiles and LOD v2): exactly the two zooms, overview layers.
+        let v2 = |levels: &str, extra: &str| {
+            format!(
+                r#"{{"simworld_levels":{levels},"vector_layers":[{{"id":"buildings"}},{{"id":"landuse"}},{{"id":"roads"}},{{"id":"blocks"}},{{"id":"lights"}}{extra}]}}"#
+            )
+        };
+        let full = v2(r#"{"detail":14,"overview":11}"#, r#",{"id":"landmarks"}"#);
+        assert_eq!(check_tileset(11, 14, &full), Ok(DataLevels::two_level(14, 11, true)));
+        assert_eq!(check_tileset(11, 14, &v2(r#"{"detail":14,"overview":11}"#, "")), Ok(DataLevels::two_level(14, 11, false)));
+        assert_eq!(check_tileset(12, 14, &v2(r#"{"detail":14,"overview":12}"#, "")), Ok(DataLevels::two_level(14, 12, false)));
+        let e = check_tileset(11, 16, &full).unwrap_err();
+        assert!(e.contains("z11-16") && e.contains("exactly z11 and z14"), "{e}");
+        assert!(check_tileset(13, 16, &full).is_err(), "levels win over the compat zooms");
+        let e = check_tileset(11, 15, &v2(r#"{"detail":15,"overview":11}"#, "")).unwrap_err();
+        assert!(e.contains("detail z15"), "{e}");
+        let e = check_tileset(11, 14, &v2(r#"{"detail":"x"}"#, "")).unwrap_err();
+        assert!(e.contains("simworld_levels must be"), "{e}");
+        let e = check_tileset(11, 14, r#"{"simworld_levels":{"detail":14,"overview":11},"vector_layers":[{"id":"buildings"},{"id":"landuse"},{"id":"roads"}]}"#)
+            .unwrap_err();
+        assert!(e.contains("blocks, lights"), "{e}");
+        for l in [DataLevels::COMPAT, DataLevels::two_level(14, 11, true), DataLevels::two_level(14, 12, false)] {
+            assert_eq!(parse_levels(&levels_text(l)), Some(l));
+        }
+        assert_eq!(parse_levels("14,11"), None);
         assert_eq!(FetchParams::default().cache_cap_bytes, 300 * 1024 * 1024);
         assert_eq!(FetchParams::default().open_retry, Duration::from_millis(1500));
     }

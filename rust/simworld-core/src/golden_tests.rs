@@ -1,8 +1,11 @@
 //! Determinism / golden hashes (spec-library-packaging.md section 7, audit A16).
 //!
-//! Pins the output of the real tile build path (`worker::build_tile` on the synthetic city) for
-//! a fixed set of tile keys covering all 4 bands, with ground on the R0-R2 tiles. Any change to
-//! decoding, meshing, ground, lights or their tuning shows up here as a changed hash.
+//! Pins the output of the real tile build path for a fixed set of tile keys covering all 4
+//! bands, with ground on every band. Since Tiles and LOD v2 step T2c that is the data-tile path
+//! on the synthetic city: the generated detail z14 / overview z11 data tiles
+//! (`data::synthetic_data_tile`) cut into chunks by `data::build_chunk_with`, landmarks folded
+//! into the chunks (the default without the landmark layer). Any change to decoding, meshing,
+//! ground, lights or their tuning shows up here as a changed hash.
 //!
 //! Cross-platform rules (f32/f64 results can differ in the last bits between arm64 and x86_64):
 //! positions, UVs and light positions are quantized to 1 mm, colors and normals to 8 bits, and
@@ -24,10 +27,11 @@
 //! (The variable is read only here, in test code; the library itself reads no environment.)
 
 use crate::geo::{tile_for, Frame, TileKey};
-use crate::mesher::{mesh_buildings, ClipRect, MeshData};
+use crate::data::{bbox, build_chunk_with, synthetic_data_tile, DataLevel, DataLevels, DataTile};
+use crate::mesher::{mesh_building_iter, MeshData};
+use crate::mvt::Building;
 use crate::profile::Profile;
 use crate::terrain::Terrain;
-use crate::worker::{build_tile_on, decode_payload_on, Payload};
 
 const VILNIUS: (f64, f64) = (54.6872, 25.2797);
 
@@ -95,11 +99,15 @@ pub(crate) fn tile_hash(key: TileKey, ring: usize, frame: Frame, profile: &Profi
     tile_hash_on(key, ring, frame, &Terrain::flat(), profile)
 }
 
-/// [`tile_hash`] on `terrain` (the worker path `build_tile_on`).
+/// [`tile_hash`] on `terrain` (the streaming path: synthetic data tiles cut into the chunk).
 pub(crate) fn tile_hash_on(key: TileKey, ring: usize, frame: Frame, terrain: &Terrain, profile: &Profile) -> u64 {
-    let payload = Payload::Synthetic;
-    let data = build_tile_on(key, ring, frame, terrain, &payload, profile).expect("build_tile");
-    let dec = decode_payload_on(key, frame, terrain, &payload, false, false, profile).expect("decode");
+    let levels = DataLevels::SYNTHETIC;
+    let dk = levels.data_of(key).expect("a chunk key");
+    let dt = synthetic_data_tile(dk, levels.level_of(dk), frame, terrain, profile);
+    let lk = levels.landmarks_of(key).expect("synthetic landmarks");
+    let lt = (lk != dk).then(|| synthetic_data_tile(lk, DataLevel::Overview, frame, terrain, profile));
+    let lm: &DataTile = lt.as_ref().unwrap_or(&dt);
+    let data = build_chunk_with(&dt, Some(lm), key, ring, profile, &|| false).expect("build_chunk").expect("not stopped");
     let mut h = Fnv::new();
     h.u64(key.z as u64);
     h.u64(key.x as u64);
@@ -108,16 +116,24 @@ pub(crate) fn tile_hash_on(key: TileKey, ring: usize, frame: Frame, terrain: &Te
     h.u64(data.building_count as u64);
     h.mm(data.max_height);
 
-    // Buildings: the merged mesh is `mesh_buildings` over the decoded buildings in order, so
-    // meshing each building alone (same function, same rect, same LOD) yields exactly the
-    // merged buffer's per-building runs. Checked below, then hashed in (id, type) order.
+    // Buildings: the merged mesh is the chunk's buildings (blocks) in order, then its landmarks,
+    // each run meshed by `mesh_building_iter` with the chunk's projector and rectangle, so
+    // meshing each building alone yields exactly the merged buffer's per-building runs. Checked
+    // below, then hashed in (id, type) order.
+    let proj = dt.proj.cut(key).expect("inside");
+    let lproj = lm.proj.cut(key).expect("inside");
+    let meets = |b: &Building, r: crate::mesher::ClipRect| {
+        let bb = bbox(b);
+        !(bb[2] <= r.x0 || bb[0] >= r.x1 || bb[3] <= r.y0 || bb[1] >= r.y1)
+    };
     let mut per_building: Vec<((u64, u64), MeshData)> = Vec::new();
     if let Some(lod) = profile.lod(ring) {
-        let rect = ClipRect::tile(dec.proj.extent());
-        for b in &dec.buildings {
-            let m = mesh_buildings(std::slice::from_ref(b), &dec.proj, rect, lod, profile);
-            if !m.is_empty() {
-                per_building.push(((b.id, b.osm_type.tag()), m));
+        for (list, p) in [(&dt.buildings, &proj), (&lm.landmarks, &lproj)] {
+            for b in list.iter().filter(|b| meets(b, p.rect())) {
+                let m = mesh_building_iter(std::iter::once(b), p, p.rect(), lod, profile);
+                if !m.is_empty() {
+                    per_building.push(((b.id, b.osm_type.tag()), m));
+                }
             }
         }
     }
@@ -148,14 +164,20 @@ pub(crate) fn tile_hash_on(key: TileKey, ring: usize, frame: Frame, terrain: &Te
     // Ground, in output order.
     hash_mesh(&mut h, &data.ground);
 
-    // Lights: one per owned building in decode order, none for `dark` buildings -> pair with
-    // the building, sort by id.
-    let owned: Vec<(u64, u64)> = dec
-        .buildings
-        .iter()
-        .filter(|b| b.owned && crate::mesher::resolve(b, profile).profile != crate::mesher::PROFILE_DARK)
-        .map(|b| (b.id, b.osm_type.tag()))
-        .collect();
+    // Lights: one per building owned by the chunk (detail: footprints then landmarks; overview:
+    // the light points), none for `dark` buildings -> pair with the building, sort by id.
+    let lit = |b: &&Building| crate::mesher::resolve(b, profile).profile != crate::mesher::PROFILE_DARK;
+    let owned: Vec<(u64, u64)> = if dt.level == DataLevel::Overview {
+        dt.lights.iter().filter(|b| proj.place(b).is_some()).filter(lit).map(|b| (b.id, b.osm_type.tag())).collect()
+    } else {
+        dt.buildings
+            .iter()
+            .filter(|b| proj.place(b).is_some())
+            .chain(lm.landmarks.iter().filter(|b| lproj.place(b).is_some()))
+            .filter(lit)
+            .map(|b| (b.id, b.osm_type.tag()))
+            .collect()
+    };
     let l = &data.lights;
     if !l.positions.is_empty() {
         assert_eq!(owned.len(), l.positions.len(), "{key}: one light per owned non-dark building");
@@ -193,6 +215,13 @@ pub(crate) fn golden_keys() -> Vec<(TileKey, usize)> {
 }
 
 /// Golden values for `golden_keys()` with `Profile::default()` (key, ring, hash). Last regenerated
+/// for Tiles and LOD v2 step T2c (every hash changed once, intended): the synthetic city streams
+/// through the data-tile path as a two-level source; R0 / R1 are cut from a generated detail z14
+/// tile (the same lots unthinned, in z14 pixels; buildings with a tagged roof >= 60 m left out),
+/// R2 / R3 from a generated overview z11 tile (street-block blocks with 5 m height steps instead
+/// of merged z14 footprints, one light point per building with rounded roofs instead of the
+/// thinned z13 / z14 buildings, secondary streets only), the >= 60 m landmarks folded into
+/// every chunk from the overview (appended after the chunk's own buildings). Before that
 /// for the R3 ground (api 1.3, `ground.r3`: only the two R3 hashes changed), before that for night-windows W4 (default `lights.min_ring` 2 -> 1: R1 tiles now carry lights, only the R1 hashes
 /// changed), before that for night-windows W3 (api 1.0): wall UVs only (window columns / floors on windowed R0/R1
 /// walls, `u = -1` + meters on windowless and all R2 walls); positions, normals, colors, indices,
@@ -200,14 +229,14 @@ pub(crate) fn golden_keys() -> Vec<(TileKey, usize)> {
 /// churches moved from civic to landmark (COLOR r and light color), and the synthetic castle /
 /// tower / ruin lots in the origin's z16 tile.
 const GOLDEN: &[(&str, usize, u64)] = &[
-    ("16/37370/20827", 0, 0x3b765a5900178657),
-    ("16/37371/20828", 0, 0x467ce64ac1254619),
-    ("15/18685/10413", 1, 0xf9fda743f16d6b50),
-    ("15/18686/10414", 1, 0x3afc10b1968d2be8),
-    ("14/9342/5206", 2, 0x9e78d8f4a8c62bb2),
-    ("14/9343/5207", 2, 0xa549392f72cf056d),
-    ("13/4671/2603", 3, 0x3de346522f977b7c),
-    ("13/4672/2604", 3, 0x9a24caee5797d041),
+    ("16/37370/20827", 0, 0x764e69740c8a69eb),
+    ("16/37371/20828", 0, 0x01c6838b3197bb93),
+    ("15/18685/10413", 1, 0xd90a708cfbcc6d0e),
+    ("15/18686/10414", 1, 0x88bb442529ea9bdb),
+    ("14/9342/5206", 2, 0xd7f24dee1cf3f31b),
+    ("14/9343/5207", 2, 0x8c7f7504ede9e2a7),
+    ("13/4671/2603", 3, 0xf8888332c6901c8e),
+    ("13/4672/2604", 3, 0xed38216f0ccbee16),
 ];
 
 #[test]
@@ -398,19 +427,20 @@ fn golden_terrain() -> (Profile, Terrain) {
 }
 
 /// Golden values for `golden_keys()` on the synthetic relief (terrain phase 1, api 1.4; regenerated
+/// for Tiles and LOD v2 step T2c, the data-tile path as for `GOLDEN`; before that regenerated
 /// 2026-10-28, W0, for the api 1.7 building and drape work of 52105cf that had never been pinned:
 /// bases on the highest ground under the footprint, per-vertex wall bottoms with foundations,
 /// raised parts stacked on the building under them, the band-sized drape tolerance, lights on the
 /// new roofs; the cover table is unchanged): foundations, draped and subdivided ground, lights.
 const GOLDEN_TERRAIN: &[(&str, usize, u64)] = &[
-    ("16/37370/20827", 0, 0x155ac2db53c2d852),
-    ("16/37371/20828", 0, 0x1817e6555a7f7be5),
-    ("15/18685/10413", 1, 0x58c1ba0a83f9984e),
-    ("15/18686/10414", 1, 0xac344ce7b5b058c4),
-    ("14/9342/5206", 2, 0xe150c1114f7c81f7),
-    ("14/9343/5207", 2, 0x96f51734e1402bb1),
-    ("13/4671/2603", 3, 0x60cd6e1fa6ae196c),
-    ("13/4672/2604", 3, 0xe6c37ba8ea77bb5f),
+    ("16/37370/20827", 0, 0xe5c09f268d2bdc70),
+    ("16/37371/20828", 0, 0x47ea0fcd9c76d361),
+    ("15/18685/10413", 1, 0x88342516ffd2c7a6),
+    ("15/18686/10414", 1, 0x532456df36b4eb51),
+    ("14/9342/5206", 2, 0x61903659d117bcb3),
+    ("14/9343/5207", 2, 0xe74fa946c2fddcfc),
+    ("13/4671/2603", 3, 0xcd3ef97883ad4850),
+    ("13/4672/2604", 3, 0x0714e35766092747),
 ];
 
 /// Golden cover on the synthetic relief for `COVER_CAMERAS`.

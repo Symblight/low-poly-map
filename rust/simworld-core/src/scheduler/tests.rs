@@ -86,6 +86,10 @@ struct FakeWorker {
     fetch_zooms: Vec<u8>,
     /// Last building mesh built per chunk cut from a data tile.
     chunk_meshes: std::collections::BTreeMap<TileKey, MeshData>,
+    /// Whether each chunk job folded landmarks in (T2b).
+    chunk_lm: std::collections::BTreeMap<TileKey, bool>,
+    /// Data tiles are generated (the synthetic city, T2c) instead of decoded.
+    synthetic_data: bool,
 }
 
 impl FakeWorker {
@@ -101,6 +105,8 @@ impl FakeWorker {
             data_jobs: (0, 0),
             fetch_zooms: Vec::new(),
             chunk_meshes: Default::default(),
+            chunk_lm: Default::default(),
+            synthetic_data: false,
         }
     }
     fn submit(&mut self, jobs: &mut Vec<Job>) {
@@ -122,17 +128,51 @@ impl FakeWorker {
                     let bytes = self.data_src.get(&key).cloned().unwrap_or_default();
                     (3, WorkerMsg::DataFetched { key, job, result: Ok((bytes, Source::Network)) })
                 }
-                Job::DecodeData { key, job, bytes } => {
+                Job::DecodeData { key, job, bytes, level } => {
                     self.data_jobs.1 += 1;
                     let f = self.real.unwrap_or(Frame::new(VILNIUS.0, VILNIUS.1));
                     let p = self.profile.clone().unwrap_or_else(dp);
-                    let result = crate::data::decode_data_tile(key, f, &Terrain::flat(), &bytes, &p).map(Arc::new);
+                    let result = if self.synthetic_data {
+                        Ok(crate::data::synthetic_data_tile(key, level, f, &Terrain::flat(), &p))
+                    } else {
+                        crate::data::decode_level(key, level, f, &Terrain::flat(), &bytes, &p)
+                    }
+                    .map(Arc::new);
                     if let Ok(d) = &result {
                         self.data_out.insert(job, d.clone());
                     }
                     (2, WorkerMsg::DataDecoded { key, job, result })
                 }
-                Job::MeshChunk { key, ring, job, data } => {
+                Job::MeshChunk { key, ring, job, data, lm } => {
+                    let get = |r: crate::worker::DataRef| match r {
+                        crate::worker::DataRef::Ready(d) => Some(d),
+                        crate::worker::DataRef::After(j) => self.data_out.get(&j).cloned(),
+                    };
+                    let d = get(data);
+                    let (same, other, missing) = match lm {
+                        crate::worker::LmRef::None => (false, None, false),
+                        crate::worker::LmRef::Same => (true, None, false),
+                        crate::worker::LmRef::Other(r) => {
+                            let o = get(r);
+                            let m = o.is_none();
+                            (false, o, m)
+                        }
+                    };
+                    let p = self.profile.clone().unwrap_or_else(dp);
+                    match d.filter(|_| !missing) {
+                        Some(d) => {
+                            self.chunk_lm.insert(key, same || other.is_some());
+                            let lmt: Option<&crate::data::DataTile> = if same { Some(&d) } else { other.as_deref() };
+                            let result = crate::data::build_chunk_with(&d, lmt, key, ring, &p, &|| false).map(|o| o.expect("not stopped"));
+                            if let Ok(t) = &result {
+                                self.chunk_meshes.insert(key, t.mesh.clone());
+                            }
+                            (2, WorkerMsg::Decoded { key, ring, job, result })
+                        }
+                        None => (1, WorkerMsg::Dropped { layer: LayerKind::World, key, ring, job }),
+                    }
+                }
+                Job::MeshLandmarks { key, job, data } => {
                     let d = match data {
                         crate::worker::DataRef::Ready(d) => Some(d),
                         crate::worker::DataRef::After(j) => self.data_out.get(&j).cloned(),
@@ -140,13 +180,10 @@ impl FakeWorker {
                     let p = self.profile.clone().unwrap_or_else(dp);
                     match d {
                         Some(d) => {
-                            let result = crate::data::build_chunk(&d, key, ring, &p, &|| false).map(|o| o.expect("not stopped"));
-                            if let Ok(t) = &result {
-                                self.chunk_meshes.insert(key, t.mesh.clone());
-                            }
-                            (2, WorkerMsg::Decoded { key, ring, job, result })
+                            let result = crate::data::build_landmark_tile(&d, &p, &|| false).map(|o| o.expect("not stopped"));
+                            (2, WorkerMsg::LandmarksBuilt { key, job, result })
                         }
-                        None => (1, WorkerMsg::Dropped { layer: LayerKind::World, key, ring, job }),
+                        None => (1, WorkerMsg::Dropped { layer: LayerKind::Landmarks, key, ring: 0, job }),
                     }
                 }
                 Job::Terrain { key, ring, job, detail } => {
@@ -218,6 +255,10 @@ struct Harness {
     /// Most fades active at once, and swaps completed without a fade (`fades.max_active`).
     max_fades_seen: usize,
     capped_seen: usize,
+    /// Landmark tiles (`l/` keys, api 1.11) the host holds, deliveries and unloads.
+    lm_held: HashSet<TileKey>,
+    lm_delivered: usize,
+    lm_unloaded: usize,
 }
 
 impl Harness {
@@ -250,6 +291,9 @@ impl Harness {
             check_order: true,
             max_fades_seen: 0,
             capped_seen: 0,
+            lm_held: HashSet::new(),
+            lm_delivered: 0,
+            lm_unloaded: 0,
         }
     }
 
@@ -295,6 +339,14 @@ impl Harness {
                     .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
             });
             let Some(t) = self.s.pop_ready(re < 1) else { break };
+            if t.layer == LayerKind::Landmarks {
+                // Additive layer: one fresh delivery per key while held, ring 0, never faded.
+                assert!(!t.redelivery && t.ring == 0, "landmark tile {} re-delivered", t.key);
+                assert!(self.lm_held.insert(t.key), "landmark tile {} delivered twice while held", t.key);
+                assert!(!t.mesh.is_empty() && t.ground.is_empty(), "landmark tile {}: mesh only", t.key);
+                self.lm_delivered += 1;
+                continue;
+            }
             if let Some(Some((d, k))) = nearest {
                 if !t.redelivery {
                     let got = self.s.camera_distance(t.key);
@@ -305,10 +357,10 @@ impl Harness {
                 re += 1;
                 self.redelivered_total += 1;
                 assert!(self.g.uploaded.contains(&t.key), "re-delivery of a tile Godot does not hold");
-                if t.layer == LayerKind::World {
+                if t.layer == LayerKind::World && self.w.real.is_none() {
                     // A re-delivery replaces the whole tile: it must carry the ground again (R3 from the kept mesh).
                     assert_eq!(t.ground.vertex_count(), 3 + t.ring, "re-delivery of {} lost its ground", t.key);
-                } else {
+                } else if t.layer == LayerKind::Terrain {
                     assert!(t.terrain.as_ref().is_some_and(|m| !m.mesh.is_empty()), "terrain re-delivery of {} without a mesh", t.key);
                 }
             } else {
@@ -349,6 +401,15 @@ impl Harness {
         for &k in &un {
             assert!(self.g.uploaded.contains(&k), "unload of a tile Godot does not hold: {k}");
             self.g.unload(k);
+        }
+        let mut lu = Vec::new();
+        self.s.drain_landmark_unload(&mut lu);
+        for k in lu {
+            assert!(self.lm_held.remove(&k), "unload of a landmark tile the host does not hold: {k}");
+            self.lm_unloaded += 1;
+        }
+        for (k, _) in &self.fades {
+            assert!(self.l.ring_for_zoom(k.z).is_some(), "{k}: a landmark key in poll_fades");
         }
         (got, un)
     }
@@ -2417,4 +2478,125 @@ fn terrain_cover_does_not_depend_on_build_history() {
         let settled: std::collections::BTreeSet<TileKey> = h.s.entries().filter(|e| e.split).map(|e| e.key).collect();
         assert_eq!(first, settled, "camera {cam:?}");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tiles v2, step T2b: a two-level source (detail z14 + overview z11) and the landmark layer
+
+/// A harness on the two-level fixture (`data::fixture`): the detail z14 tile under the origin
+/// and its overview z11 tile hold data, every other data tile is empty. `landmarks` = the host
+/// draws the landmark layer.
+fn v2_harness(landmarks: bool) -> Harness {
+    use crate::data::fixture::{detail_v2_bytes, key11, key14, overview_bytes};
+    let mut h = Harness::new();
+    let frame = Frame::new(VILNIUS.0, VILNIUS.1);
+    h.s = Scheduler::new(frame, false, dp()).with_data_levels(crate::data::DataLevels::two_level(14, 11, true)).with_landmark_layer(landmarks);
+    h.w.real = Some(frame);
+    h.w.data_src.insert(key14(), detail_v2_bytes().into());
+    h.w.data_src.insert(key11(), overview_bytes().into());
+    h.mem = Some(crate::budget::MemoryBudget::new(512 << 20));
+    h
+}
+
+/// Every band is cut from the two data levels: no per-tile fetch at all, one fetch and one
+/// decode per data tile (detail for R0 / R1, overview for R2 / R3 and the landmarks), every
+/// requested chunk delivered; R2 / R3 carry the overview's blocks and light points. Landmarks:
+/// with the layer, one `l/` tile (the only overview tile with landmarks), delivered once, and no
+/// chunk folds them in; without it, no `l/` key and every chunk with data folds them in.
+#[test]
+fn two_level_source_cuts_every_band_from_two_data_tile_levels() {
+    use crate::data::fixture::{key11, key14};
+    for landmarks in [true, false] {
+        let mut h = v2_harness(landmarks);
+        let cam = [0.0, 0.0, 300.0];
+        h.settle(cam, 20_000);
+        assert!(h.w.fetch_zooms.is_empty(), "a chunk was fetched on its own: {:?}", h.w.fetch_zooms);
+        assert_eq!(h.ever_requested, h.ever_delivered);
+        let levels = crate::data::DataLevels::two_level(14, 11, true);
+        let mut tiles: HashSet<TileKey> = h.ever_requested.iter().filter_map(|k| levels.data_of(*k)).collect();
+        if !landmarks {
+            tiles.extend(h.ever_requested.iter().filter_map(|k| levels.landmarks_of(*k)));
+        }
+        if landmarks {
+            tiles.extend(h.lm_held.iter().copied());
+        }
+        let n = tiles.len() as u32;
+        assert!(tiles.iter().any(|k| k.z == 11) && tiles.iter().any(|k| k.z == 14), "{tiles:?}");
+        assert_eq!(h.w.data_jobs, (n, n), "one fetch and one decode per data tile ({n})");
+        let r2 = h.w.chunk_meshes.get(&key14()).expect("the R2 chunk over the fixture");
+        assert!(!r2.is_empty(), "R2 from the overview blocks");
+        if landmarks {
+            assert_eq!(h.lm_held, [key11()].into_iter().collect(), "one landmark tile");
+            assert_eq!(h.lm_delivered, 1);
+            assert!(h.w.chunk_lm.values().all(|&f| !f), "the landmark layer draws them");
+            let st = h.s.landmark_stats();
+            assert_eq!((st.loaded, st.pending, st.delivered), (1, 0, 1), "{st:?}");
+            assert!(st.empty > 0, "empty overview tiles are built but not delivered");
+        } else {
+            assert_eq!(h.lm_delivered, 0);
+            assert!(h.w.chunk_lm.values().all(|&f| f), "every chunk folds the landmarks in");
+            assert_eq!(h.s.landmark_stats(), Default::default());
+        }
+        eprintln!("landmark layer {landmarks}: {} chunks from {n} data tiles", h.ever_requested.len());
+    }
+}
+
+/// The landmark tile is held while its box is within `bands.max_distance_m` and unloaded once the
+/// camera is past it (with the hysteresis); flying back delivers it again, once. Never in
+/// `poll_fades` (checked every frame by the harness).
+#[test]
+fn landmark_tile_unloads_beyond_range_and_comes_back_once() {
+    let mut h = v2_harness(true);
+    h.settle([0.0, 0.0, 300.0], 20_000);
+    assert_eq!((h.lm_delivered, h.lm_unloaded, h.lm_held.len()), (1, 0, 1));
+    // 60 km east: the z11 tile (~11 km wide) is beyond 25 km * 1.15.
+    h.settle([60_000.0, 0.0, 300.0], 40_000);
+    assert_eq!((h.lm_delivered, h.lm_unloaded, h.lm_held.len()), (1, 1, 0));
+    assert_eq!(h.s.delivered_landmark_keys(), Vec::<TileKey>::new());
+    h.settle([0.0, 0.0, 300.0], 40_000);
+    assert_eq!((h.lm_delivered, h.lm_unloaded, h.lm_held.len()), (2, 1, 1));
+}
+
+/// Light-mode switch on overview chunks: the held R2 / R3 tiles are re-delivered with the other
+/// light version, R2 re-meshed from the resident overview tile: no data fetch, no decode.
+#[test]
+fn relight_remeshes_from_the_resident_overview_tile_without_fetching() {
+    let mut h = v2_harness(true);
+    h.settle([0.0, 0.0, 2000.0], 20_000);
+    let jobs = h.w.data_jobs;
+    let re = h.redelivered_total;
+    // Above `lights.cluster_on_agl_m` (3300 m): clustered lights.
+    h.settle([0.0, 0.0, 3600.0], 20_000);
+    assert!(h.s.clustered());
+    assert!(h.redelivered_total > re, "lit tiles re-delivered");
+    let held_overview = h.s.delivered_keys().iter().filter(|k| k.z <= 14).count();
+    assert!(held_overview > 0);
+    // New overview / detail tiles may enter the cover at the new height; the re-lit ones were
+    // all resident already.
+    let st = h.s.data_stats();
+    assert_eq!(st.fetched, h.w.data_jobs.0 as u64);
+    assert_eq!(h.w.data_jobs.0 - jobs.0, h.w.data_jobs.1 - jobs.1, "every fetch decoded once");
+    eprintln!("relight: {} re-deliveries, data jobs {:?} -> {:?}", h.redelivered_total - re, jobs, h.w.data_jobs);
+    // Pure re-light at the same height band: go back down (unclustered), nothing new to fetch.
+    let jobs2 = h.w.data_jobs;
+    h.settle([0.0, 0.0, 2000.0], 20_000);
+    assert!(!h.s.clustered());
+    assert_eq!(h.w.data_jobs.0, jobs2.0, "re-light fetched a data tile");
+}
+
+/// Archive source before it opened: nothing is dispatched until the levels are known.
+#[test]
+fn pending_levels_dispatch_nothing_until_the_archive_opened() {
+    let frame = Frame::new(VILNIUS.0, VILNIUS.1);
+    let mut s = Scheduler::new(frame, false, dp()).with_data_pending();
+    let mut jobs = Vec::new();
+    let t0 = Instant::now();
+    for i in 0..5 {
+        s.update([0.0, 0.0, 300.0], [0.0; 3], t0 + Duration::from_millis(i * 30), &mut jobs);
+    }
+    assert!(jobs.is_empty() && s.data_pending() && s.entries().count() > 0);
+    assert!(s.set_data_levels(crate::data::DataLevels::COMPAT));
+    assert!(!s.set_data_levels(crate::data::DataLevels::two_level(14, 11, true)), "set once");
+    s.update([0.0, 0.0, 300.0], [0.0; 3], t0 + Duration::from_millis(200), &mut jobs);
+    assert!(jobs.iter().any(|j| matches!(j, Job::Fetch { .. })) && jobs.iter().any(|j| matches!(j, Job::FetchData { .. })));
 }

@@ -302,14 +302,16 @@ fn status_reports_a_missing_tile_server_as_offline_once() {
         w.update_camera([0.0, 300.0, 0.0], [0.0; 3], 300.0);
         w.pop_ready(8, |_| {});
         changes.extend(w.take_status_change());
-        if w.status().state == StatusState::Offline && w.status().failed_fetches >= 8 {
+        if w.status().state == StatusState::Offline && w.status().failed_fetches >= 2 {
             break;
         }
         std::thread::sleep(Duration::from_millis(5));
     }
     let s = w.status();
     assert_eq!((s.state, s.message.as_str()), (StatusState::Offline, MSG_OFFLINE), "{s:?}");
-    assert!(s.failed_fetches >= 8 && s.last_error.contains("127.0.0.1:9"), "{s:?}");
+    // Tiles v2 (T2b): no chunk is requested before the archive's levels are known, so the
+    // failures are the archive opens (one per `cache.open_retry_s`).
+    assert!(s.failed_fetches >= 2 && s.last_error.contains("127.0.0.1:9"), "{s:?}");
     assert_eq!(changes.iter().map(|c| c.state).collect::<Vec<_>>(), vec![StatusState::Offline]);
     // Shutdown: back to an idle "ok", picked up by the next status check.
     w.shutdown();
@@ -490,6 +492,7 @@ impl Host {
                 crate::rings::LayerKind::World => {
                     assert!(t.terrain.is_empty() && !k.to_string().starts_with("t/"));
                 }
+                crate::rings::LayerKind::Landmarks => panic!("{k}: no landmark layer requested"),
             }
             deliveries.push((k, !held.insert(k)));
         });
@@ -552,7 +555,11 @@ fn terrain_layer_needs_the_opt_in_and_teleport_unloads_both_layers() {
     assert!(w.terrain_layer_active());
     let mut h = Host::default();
     let t0 = Instant::now();
-    while h.held.iter().filter(|k| k.layer == crate::rings::LayerKind::Terrain).count() < 20 && t0.elapsed() < Duration::from_secs(30) {
+    // The vector world's first tiles wait for the generated overview tile (T2c, ~1-2 s in debug).
+    while (h.held.iter().filter(|k| k.layer == crate::rings::LayerKind::Terrain).count() < 20
+        || !h.held.iter().any(|k| k.layer == crate::rings::LayerKind::World))
+        && t0.elapsed() < Duration::from_secs(30)
+    {
         h.frame(&mut w);
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -870,7 +877,6 @@ fn churn_probe_print() {
 /// (no light-mode flip at this height), and its mesh equals a fresh build of that key.
 #[test]
 fn orphaned_mesh_jobs_are_cancelled_and_nothing_stale_is_delivered() {
-    use crate::worker::{build_tile, Payload};
     let mut w = world();
     assert!(w.configure_world(synthetic(VILNIUS.0, VILNIUS.1)).ok);
     let frame = crate::geo::Frame::new(VILNIUS.0, VILNIUS.1);
@@ -897,7 +903,7 @@ fn orphaned_mesh_jobs_are_cancelled_and_nothing_stale_is_delivered() {
         delivered += fresh.len();
         for (k, ring, mesh) in fresh {
             if checked < 40 {
-                let want = build_tile(k, ring, frame, &Payload::Synthetic, &profile).unwrap();
+                let want = crate::data::synthetic_chunk(k, ring, frame, &crate::terrain::Terrain::flat(), &profile, false).unwrap();
                 assert_eq!(mesh, want.mesh, "{k}: delivered mesh differs from a fresh build");
                 checked += 1;
             }

@@ -457,6 +457,20 @@ impl WorldStreamer {
         // Tiles v2 data tiles (step T2a): resident now / decoded since configure.
         d.set("data_tiles_loaded", st.data_tiles_loaded as i64);
         d.set("data_tiles_decoded", st.data_tiles_decoded.min(i64::MAX as u64) as i64);
+        // api 1.11: the source's data levels (once known) and the landmark layer.
+        if let Some(l) = st.data_levels {
+            let mut dl = VarDictionary::new();
+            dl.set("detail", l.detail as i64);
+            dl.set("overview", l.overview as i64);
+            dl.set("two_level", l.two_level);
+            dl.set("landmarks", l.landmarks);
+            d.set("data_levels", &dl);
+        }
+        if self.world.landmark_layer_active() {
+            d.set("landmarks_loaded", st.landmarks.loaded as i64);
+            d.set("landmarks_pending", st.landmarks.pending as i64);
+            d.set("landmarks_empty", st.landmarks.empty as i64);
+        }
         if let Some(l) = self.world.latency() {
             d.set("latency", &latency_dict(l));
         }

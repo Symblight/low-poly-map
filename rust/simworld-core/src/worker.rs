@@ -18,7 +18,7 @@ use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender};
 use tokio::task::AbortHandle;
 
-use crate::data::{build_chunk, decode_data_tile, DataTile};
+use crate::data::{build_chunk_with, build_landmark_tile, decode_level, synthetic_data_tile, DataLevel, DataLevels, DataTile};
 use crate::jobs::{default_threads, JobEnd, JobPool, JobSpec, JobStats, Output, PoolConfig, Priority};
 use crate::rings::LayerKind;
 use crate::fetch::{DiskCache, FetchError, FetchErrorKind, FetchParams, Fetcher, Note, Source};
@@ -226,12 +226,29 @@ pub enum Job {
     Terrain { key: TileKey, ring: usize, job: u64, detail: f64 },
     /// Tiles v2 (T2a): fetch the raw bytes of data tile `key` (I/O runtime, disk cache first).
     FetchData { key: TileKey, job: u64 },
-    /// Tiles v2: decode data tile `key` into an `Arc<DataTile>` (CPU pool); the output goes to
-    /// the dependent [`Job::MeshChunk`]s and back to the main thread ([`WorkerMsg::DataDecoded`]).
-    DecodeData { key: TileKey, job: u64, bytes: Bytes },
-    /// Tiles v2: cut render chunk `key` (band `ring`) from its data tile. Replies like a
-    /// [`Job::Decode`] (`Decoded` or `Dropped`).
-    MeshChunk { key: TileKey, ring: usize, job: u64, data: DataRef },
+    /// Tiles v2: decode data tile `key` of `level` into an `Arc<DataTile>` (CPU pool); the output
+    /// goes to the dependent [`Job::MeshChunk`]s and back to the main thread
+    /// ([`WorkerMsg::DataDecoded`]). The synthetic city (no tile source) generates it instead
+    /// (`bytes` empty, step T2c).
+    DecodeData { key: TileKey, job: u64, bytes: Bytes, level: DataLevel },
+    /// Tiles v2: cut render chunk `key` (band `ring`) from its data tile, with the landmarks of
+    /// `lm` folded in (T2b, no landmark layer). Replies like a [`Job::Decode`] (`Decoded` or
+    /// `Dropped`).
+    MeshChunk { key: TileKey, ring: usize, job: u64, data: DataRef, lm: LmRef },
+    /// Landmark layer (api 1.11): mesh the landmarks of overview data tile `key` (the `l/` key).
+    /// Replies [`WorkerMsg::LandmarksBuilt`] or `Dropped { layer: Landmarks }`.
+    MeshLandmarks { key: TileKey, job: u64, data: DataRef },
+}
+
+/// Which landmarks a [`Job::MeshChunk`] draws.
+#[derive(Debug, Clone)]
+pub enum LmRef {
+    /// None (the landmark layer draws them, or the source has none).
+    None,
+    /// Those of the chunk's own data tile (an overview chunk).
+    Same,
+    /// Those of another data tile (the overview tile of a detail chunk).
+    Other(DataRef),
 }
 
 /// The data tile a [`Job::MeshChunk`] is cut from.
@@ -253,7 +270,8 @@ impl Job {
             | Job::Terrain { key, .. }
             | Job::FetchData { key, .. }
             | Job::DecodeData { key, .. }
-            | Job::MeshChunk { key, .. } => key,
+            | Job::MeshChunk { key, .. }
+            | Job::MeshLandmarks { key, .. } => key,
         }
     }
     /// A data-tile job (`FetchData` / `DecodeData`) rather than a job of a tracked tile.
@@ -278,6 +296,13 @@ pub enum WorkerMsg {
     DataDecoded { key: TileKey, job: u64, result: Result<Arc<DataTile>, String> },
     /// A [`Job::DecodeData`] that was cancelled before or while it ran.
     DataDropped { key: TileKey, job: u64 },
+    /// Result of a [`Job::MeshLandmarks`] (an empty `TileData` = the tile has no landmarks).
+    LandmarksBuilt { key: TileKey, job: u64, result: Result<TileData, String> },
+    /// The archive opened and passed the tileset check with these data levels (or, offline,
+    /// the levels a warm disk cache recorded). Sent once per worker.
+    Levels(DataLevels),
+    /// Opening the archive failed while its levels are still unknown (status).
+    OpenFailed(FetchError),
     Info(String),
     /// Logged as a (rate-limited) warning on the main thread.
     Warn(String),
@@ -524,7 +549,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Pool job id of a layer's job (the two schedulers number their jobs independently).
 fn pool_id(layer: LayerKind, job: u64) -> u64 {
     match layer {
-        LayerKind::World => job & !TERRAIN_TAG,
+        LayerKind::World | LayerKind::Landmarks => job & !TERRAIN_TAG,
         LayerKind::Terrain => job | TERRAIN_TAG,
     }
 }
@@ -618,7 +643,9 @@ impl Worker {
                 Some(c) if !cache_dir.is_empty() => f.with_disk_cache(c),
                 _ => f,
             };
-            (Some(rt), Some(Arc::new(f)))
+            let f = Arc::new(f);
+            Self::spawn_levels_probe(&rt, f.clone(), tx.clone());
+            (Some(rt), Some(f))
         };
         let disk_cache = fetcher.is_some() && !cache_dir.is_empty();
         Ok(Self {
@@ -759,11 +786,12 @@ impl Worker {
             Job::FetchData { key, job } => {
                 self.spawn_fetch(key, job, move |result| WorkerMsg::DataFetched { key, job, result });
             }
-            Job::DecodeData { key, job, bytes } => {
+            Job::DecodeData { key, job, bytes, level } => {
                 let tx = self.tx.clone();
                 let frame = self.frame;
                 let terrain = self.terrain.clone();
                 let profile = self.profile.clone();
+                let synthetic = self.fetcher.is_none();
                 let tx_cancel = self.tx.clone();
                 let spec = JobSpec::new(pool_id(LayerKind::World, job), prio);
                 self.pool.submit(
@@ -772,7 +800,13 @@ impl Worker {
                         if ctx.is_cancelled() {
                             return JobEnd::Cancelled;
                         }
-                        let result = catch_unwind(AssertUnwindSafe(|| decode_data_tile(key, frame, &terrain, &bytes, &profile)))
+                        let result = catch_unwind(AssertUnwindSafe(|| {
+                            if synthetic {
+                                Ok(synthetic_data_tile(key, level, frame, &terrain, &profile))
+                            } else {
+                                decode_level(key, level, frame, &terrain, &bytes, &profile)
+                            }
+                        }))
                             .unwrap_or_else(|p| Err(format!("data decode panic: {}", panic_text(p))));
                         if result.is_ok() && ctx.is_cancelled() {
                             return JobEnd::Cancelled;
@@ -795,15 +829,74 @@ impl Worker {
                     },
                 );
             }
-            Job::MeshChunk { key, ring, job, data } => {
+            Job::MeshChunk { key, ring, job, data, lm } => {
                 let tx = self.tx.clone();
                 let profile = self.profile.clone();
                 let on_cancel = self.dropped_reply(LayerKind::World, key, ring, job);
+                // Ready tiles go in the closure; pending ones become dependencies (in order).
+                let mut deps = Vec::new();
+                let mut dep = |r: DataRef| match r {
+                    DataRef::Ready(d) => Some(d),
+                    DataRef::After(j) => {
+                        deps.push(pool_id(LayerKind::World, j));
+                        None
+                    }
+                };
+                let ready = dep(data);
+                let (same, lm_ready, lm_wait) = match lm {
+                    LmRef::None => (false, None, false),
+                    LmRef::Same => (true, None, false),
+                    LmRef::Other(r) => {
+                        let d = dep(r);
+                        let wait = d.is_none();
+                        (false, d, wait)
+                    }
+                };
+                let spec = JobSpec::new(pool_id(LayerKind::World, job), prio).with_deps(deps);
+                self.pool.submit(
+                    spec,
+                    move |ctx| {
+                        let mut outs = ctx.deps().iter().cloned();
+                        let mut next = || outs.next().and_then(|o| o.downcast::<DataTile>().ok());
+                        let Some(data) = ready.or_else(&mut next) else { return JobEnd::Cancelled };
+                        let other = if lm_wait {
+                            match next() {
+                                Some(d) => Some(d),
+                                None => return JobEnd::Cancelled,
+                            }
+                        } else {
+                            lm_ready
+                        };
+                        let lm: Option<&DataTile> = if same { Some(&data) } else { other.as_deref() };
+                        let stop = || ctx.is_cancelled();
+                        let result = catch_unwind(AssertUnwindSafe(|| build_chunk_with(&data, lm, key, ring, &profile, &stop)))
+                            .unwrap_or_else(|p| Err(format!("chunk panic: {}", panic_text(p))));
+                        let result = match result {
+                            Ok(None) => return JobEnd::Cancelled,
+                            Ok(Some(_)) if ctx.is_cancelled() => return JobEnd::Cancelled,
+                            Ok(Some(d)) => Ok(d),
+                            Err(e) => Err(e),
+                        };
+                        let failed = result.is_err();
+                        let _ = tx.send(WorkerMsg::Decoded { key, ring, job, result });
+                        if failed {
+                            JobEnd::Failed
+                        } else {
+                            JobEnd::Done(None)
+                        }
+                    },
+                    on_cancel,
+                );
+            }
+            Job::MeshLandmarks { key, job, data } => {
+                let tx = self.tx.clone();
+                let profile = self.profile.clone();
+                let on_cancel = self.dropped_reply(LayerKind::Landmarks, key, 0, job);
                 let (ready, deps) = match data {
                     DataRef::Ready(d) => (Some(d), Vec::new()),
                     DataRef::After(j) => (None, vec![pool_id(LayerKind::World, j)]),
                 };
-                let spec = JobSpec::new(pool_id(LayerKind::World, job), prio).with_deps(deps);
+                let spec = JobSpec::new(pool_id(LayerKind::Landmarks, job), prio).with_deps(deps);
                 self.pool.submit(
                     spec,
                     move |ctx| {
@@ -815,8 +908,8 @@ impl Worker {
                             },
                         };
                         let stop = || ctx.is_cancelled();
-                        let result = catch_unwind(AssertUnwindSafe(|| build_chunk(&data, key, ring, &profile, &stop)))
-                            .unwrap_or_else(|p| Err(format!("chunk panic: {}", panic_text(p))));
+                        let result = catch_unwind(AssertUnwindSafe(|| build_landmark_tile(&data, &profile, &stop)))
+                            .unwrap_or_else(|p| Err(format!("landmark panic: {}", panic_text(p))));
                         let result = match result {
                             Ok(None) => return JobEnd::Cancelled,
                             Ok(Some(_)) if ctx.is_cancelled() => return JobEnd::Cancelled,
@@ -824,7 +917,7 @@ impl Worker {
                             Err(e) => Err(e),
                         };
                         let failed = result.is_err();
-                        let _ = tx.send(WorkerMsg::Decoded { key, ring, job, result });
+                        let _ = tx.send(WorkerMsg::LandmarksBuilt { key, job, result });
                         if failed {
                             JobEnd::Failed
                         } else {
@@ -908,6 +1001,40 @@ impl Worker {
 }
 
 impl Worker {
+    /// Open the archive in the background and report its data levels ([`WorkerMsg::Levels`]):
+    /// retried every `cache.open_retry_s` while unreachable (each failure reported as
+    /// [`WorkerMsg::OpenFailed`] for the status); offline, the levels a warm disk cache
+    /// recorded are reported instead (once). A tileset contract violation ends the probe (the
+    /// fetcher reported it as an error).
+    fn spawn_levels_probe(rt: &tokio::runtime::Runtime, f: Arc<Fetcher>, tx: Sender<WorkerMsg>) {
+        rt.spawn(async move {
+            loop {
+                match f.open_levels().await {
+                    Ok(l) => {
+                        let _ = tx.send(WorkerMsg::Levels(l));
+                        return;
+                    }
+                    Err(e) if e.kind == FetchErrorKind::Contract => {
+                        let _ = tx.send(WorkerMsg::OpenFailed(e));
+                        return;
+                    }
+                    Err(e) => {
+                        if let Some(l) = f.cached_levels().await {
+                            let _ = tx.send(WorkerMsg::Info(format!(
+                                "archive unreachable ({}); using the data levels recorded in the disk cache",
+                                e.message
+                            )));
+                            let _ = tx.send(WorkerMsg::Levels(l));
+                            return;
+                        }
+                        let _ = tx.send(WorkerMsg::OpenFailed(e));
+                        tokio::time::sleep(f.open_retry()).await;
+                    }
+                }
+            }
+        });
+    }
+
     /// Fetch `key` on the I/O runtime; `reply` turns the result into the message sent back
     /// (exactly one per job, also on cancel or panic). Registered for [`Worker::cancel`] by `job`.
     fn spawn_fetch(&self, key: TileKey, job: u64, reply: impl FnOnce(Result<(Bytes, Source), FetchError>) -> WorkerMsg + Send + 'static) {

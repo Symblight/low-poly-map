@@ -50,6 +50,23 @@ impl MeshData {
     pub fn bytes(&self) -> usize {
         self.positions.len() * (12 + 12 + 16 + 8) + self.indices.len() * 4
     }
+    /// Append `other` (same origin; indices offset). Both must have UVs or neither (building
+    /// meshes always have them).
+    pub fn append(&mut self, other: MeshData) {
+        if other.positions.is_empty() {
+            return;
+        }
+        if self.positions.is_empty() {
+            *self = other;
+            return;
+        }
+        let base = self.positions.len() as i32;
+        self.positions.extend(other.positions);
+        self.normals.extend(other.normals);
+        self.colors.extend(other.colors);
+        self.uvs.extend(other.uvs);
+        self.indices.extend(other.indices.into_iter().map(|i| i + base));
+    }
     fn shrink(&mut self) {
         self.positions.shrink_to_fit();
         self.normals.shrink_to_fit();

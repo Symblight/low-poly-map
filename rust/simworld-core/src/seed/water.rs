@@ -265,6 +265,44 @@ impl WaterIndex {
         &self.params
     }
 
+    /// Whether the terrain water rule can change a height anywhere in tile `key` (any zoom):
+    /// the tile overlaps an index cell holding water or a blend raster, or reaches outside the
+    /// file's bbox where `outside` is the sea. Conservative (cell resolution, rivers included)
+    /// and hierarchical: a tile touches whenever one of its children does (Terrain v2 G1, the
+    /// terrain error proxy's edit test).
+    pub fn touches_tile(&self, key: crate::geo::TileKey) -> bool {
+        let (n, w) = key.frac_to_lat_lon(0.0, 0.0);
+        let (s, e) = key.frac_to_lat_lon(1.0, 1.0);
+        let b = self.bbox;
+        if self.outside_sea && !(w >= b[0] && e <= b[2] && s >= b[1] && n <= b[3]) {
+            return true;
+        }
+        let z = INDEX_ZOOM;
+        let (cx0, cx1, cy0, cy1) = if key.z >= z {
+            let sh = key.z - z;
+            (key.x >> sh, key.x >> sh, key.y >> sh, key.y >> sh)
+        } else {
+            let sh = z - key.z;
+            let span = (1u32 << sh) - 1;
+            (key.x << sh, (key.x << sh) + span, key.y << sh, (key.y << sh) + span)
+        };
+        let (gx0, gy0) = (cx0.max(self.x0), cy0.max(self.y0));
+        let (gx1, gy1) = (cx1.min(self.x0 + self.nx - 1), cy1.min(self.y0 + self.ny - 1));
+        if gx0 > gx1 || gy0 > gy1 {
+            return false;
+        }
+        for cy in gy0..=gy1 {
+            for cx in gx0..=gx1 {
+                if let Some(g) = self.grid_index(cx, cy) {
+                    if self.grid[g] != 0 || self.raster_of[g] != NONE {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     fn in_bbox(&self, lat: f64, lon: f64) -> bool {
         lon >= self.bbox[0] && lon <= self.bbox[2] && lat >= self.bbox[1] && lat <= self.bbox[3]
     }

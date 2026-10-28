@@ -24,7 +24,7 @@ public partial class WorldView
     /// <summary>Night factor below which the light sprites are hidden, and above which they are shown again (hysteresis, so a clock near dusk does not toggle every tile each frame).</summary>
     public const float SpritesOffBelow = 0.02f, SpritesOnAbove = 0.05f;
 
-    /// <summary>True while the light sprite sets (building lights, street lamps and their pools, beacons, airport lights) are shown. They scale with the night factor, so by day they are hidden: no draw calls, no additive black pixels.</summary>
+    /// <summary>True while the point sprites (building lights, street lamps and their pools, beacons, airport lights) are shown. They scale with the night factor, so by day they are hidden: no draw calls, no additive black pixels.</summary>
     public bool SpritesVisible => _pool?.SpritesOn ?? true;
     /// <summary>Times the sprite switch changed state since start, and tiles touched by the last change (tests, overlay).</summary>
     public int SpriteSwitches { get; private set; }
@@ -55,18 +55,13 @@ public partial class WorldView
     /// <summary>Lit-window share per light profile id last written to the building materials (8 entries, ids 3 5 6 7 are 0).</summary>
     public System.ReadOnlySpan<float> WindowShares => _shares;
     /// <summary>The <c>window_share</c> array as read back from the plain / dithering building material (tests).</summary>
-    /// <summary>The cross-fade ranges now on the materials (tests): window average fade start / end (building material), light sprite blend start / end, street pool fade start / end, sprite far fade start / end.</summary>
+    /// <summary>The cross-fade ranges now on the materials (tests): window average fade start / end (building material), then the sprite materials' (<see cref="SpriteMaterials.ReadRanges"/>): building light blend start / end, street pool fade start / end, sprite far fade start / end.</summary>
     public float[] ReadMaterialBlendRanges()
     {
         if (_pool == null) return System.Array.Empty<float>();
-        float F(ShaderMaterial m, string p) => m.GetShaderParameter(p).AsSingle();
-        return new[]
-        {
-            F(_pool.BuildingMaterial, "avg_fade_start_m"), F(_pool.BuildingMaterial, "avg_fade_end_m"),
-            F(_pool.LightMaterial, "blend_start_m"), F(_pool.LightMaterial, "blend_end_m"),
-            F(_pool.StreetPoolMaterial, "fade_start_m"), F(_pool.StreetPoolMaterial, "fade_end_m"),
-            F(_pool.LightMaterial, "fade_start_m"), F(_pool.LightMaterial, "far_end_m"),
-        };
+        var s = _pool.Sprites.ReadRanges();
+        float F(string p) => _pool.BuildingMaterial.GetShaderParameter(p).AsSingle();
+        return new[] { F("avg_fade_start_m"), F("avg_fade_end_m"), s[0], s[1], s[2], s[3], s[4], s[5] };
     }
 
     public float[] ReadMaterialWindowShares(bool fadeMaterial) => _pool?.ReadWindowShares(fadeMaterial) ?? System.Array.Empty<float>();
@@ -98,11 +93,6 @@ public partial class WorldView
     {
         _windowProfile = WindowProfile.FromWorldProfile(profile);
         if (_pool == null) return;
-        // Street lamp height (api 1.1): the light pools sit this far below each lamp.
-        if (profile.TryGetValue("lights", out var lv) && lv.VariantType == Variant.Type.Dictionary
-            && lv.AsGodotDictionary().TryGetValue("street", out var sv) && sv.VariantType == Variant.Type.Dictionary
-            && sv.AsGodotDictionary().TryGetValue("height_m", out var hv))
-            _pool.SetStreetLampHeight((float)hv.AsDouble());
         if (_windowProfile != null)
         {
             _pool.SetProfileColors(_windowProfile.Colors);

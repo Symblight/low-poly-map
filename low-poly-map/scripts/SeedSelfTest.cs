@@ -444,16 +444,20 @@ public partial class SeedSelfTest : Node
         return h;
     }
 
-    private static ulong HashSprites(ulong h, MultiMesh mm, int count)
+    /// <summary>Hashes the first <paramref name="count"/> lights of a tile's points mesh: position, colour, kind and index within the kind (the padding vertices are left out).</summary>
+    private static ulong HashSprites(ulong h, ArrayMesh mesh, int count)
     {
         h = Mix(h, (ulong)count);
-        if (count == 0) return h;
-        var buf = mm.Buffer;
-        for (int i = 0; i < count; i++)
+        if (count == 0 || mesh.GetSurfaceCount() == 0) return h;
+        var arrays = mesh.SurfaceGetArrays(0);
+        var pos = arrays[(int)Mesh.ArrayType.Vertex].AsVector3Array();
+        var col = arrays[(int)Mesh.ArrayType.Color].AsColorArray();
+        var custom = arrays[(int)Mesh.ArrayType.Custom0].AsByteArray();
+        for (int i = 0; i < count && i < pos.Length; i++)
         {
-            int o = i * 16;
-            h = Mix(h, Q(buf[o + 3])); h = Mix(h, Q(buf[o + 7])); h = Mix(h, Q(buf[o + 11]));
-            h = Mix(h, Q(buf[o + 12])); h = Mix(h, Q(buf[o + 13])); h = Mix(h, Q(buf[o + 14])); h = Mix(h, Q(buf[o + 15]));
+            h = Mix(h, Q(pos[i].X)); h = Mix(h, Q(pos[i].Y)); h = Mix(h, Q(pos[i].Z));
+            h = Mix(h, (ulong)col[i].ToRgba32());
+            for (int k = 0; k < 4; k++) h = Mix(h, custom[i * 4 + k]);
         }
         return h;
     }
@@ -471,10 +475,7 @@ public partial class SeedSelfTest : Node
             h = Mix(h, (ulong)n.Ring);
             h = HashMesh(h, n.Mesh);
             h = HashMesh(h, n.GroundMesh);
-            h = HashSprites(h, n.LightsMm, n.LightCount);
-            h = HashSprites(h, n.StreetLightsMm, n.StreetLightCount);
-            h = HashSprites(h, n.BeaconsMm, n.BeaconCount);
-            h = HashSprites(h, n.AirportLightsMm, n.AirportLightCount);
+            h = HashSprites(h, n.PointsMesh, n.SpriteCount);
         }
         var tlist = new List<TileNodes>(_view.TerrainCover.Loaded);
         foreach (var n in _view.TerrainCover.All) tlist.Add(n);

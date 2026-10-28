@@ -45,6 +45,27 @@ public partial class WorldView
     /// <summary>Same for the vector layer's building meshes (one draw call per tile; ground and sprites not counted).</summary>
     public int CountVectorInFrustum(Camera3D cam, out int visibleByRule, out long triangles) => CountInFrustum(cam, Cover, out visibleByRule, out triangles);
 
+    /// <summary>
+    /// The sprite draws the engine would make for the held vector tiles that are shown by the visibility rule and the day / night switch: the point meshes and the street pools
+    /// whose instance is in the camera's frustum (draw calls, per ring in <paramref name="pointsByRing"/>). Counting aid, not for every frame.
+    /// </summary>
+    public int CountSpriteDrawsInFrustum(Camera3D cam, int[] pointsByRing, out int pools)
+    {
+        _frustumIds.Clear();
+        foreach (var id in RenderingServer.InstancesCullConvex(cam.GetFrustum(), GetWorld3D().Scenario)) _frustumIds.Add((ulong)id);
+        System.Array.Clear(pointsByRing);
+        pools = 0;
+        int points = 0;
+        if (!SpritesVisible) return 0;
+        foreach (var n in Cover.All)
+        {
+            if (n.Vis != TileCover.Vis.Visible) continue;
+            if (n.Points.Visible && _frustumIds.Contains(n.Points.GetInstanceId())) { points++; pointsByRing[System.Math.Clamp(n.Ring, 0, pointsByRing.Length - 1)]++; }
+            if (n.Pools.Visible && _frustumIds.Contains(n.Pools.GetInstanceId())) pools++;
+        }
+        return points;
+    }
+
     private int CountInFrustum(Camera3D cam, TileCover cover, out int visibleByRule, out long triangles)
     {
         visibleByRule = 0;

@@ -32,11 +32,15 @@ public partial class DiagnosticsNode : Node
 
     public SecondSampler Sampler => _sampler;
 
+    /// <summary>The longest frames since the last reset with their GC pause and per-call wall / CPU time (<see cref="StallLog"/>).</summary>
+    public StallLog Stalls { get; } = new();
+
     /// <summary>Forgets the cost figures (the benchmark does it when the warm-up ends).</summary>
     public void ResetCosts()
     {
         FrameCost.Reset();
         SecondCost.Reset();
+        Stalls.Reset();
         FrameAllocatedBytes = 0;
     }
 
@@ -59,6 +63,7 @@ public partial class DiagnosticsNode : Node
 
     public override void _Ready()
     {
+        _view.Timings.MeasureThreadCpu = true;
         PerfMonitor.Attach(GetViewport());
         PerfMarker.RegisterMonitors();
         AddChild(new PerfOverlay(this));
@@ -72,6 +77,7 @@ public partial class DiagnosticsNode : Node
         _view.EndTimingFrame();
         FeedMarkers();
         PerfMonitor.Frame();
+        Stalls.Record(PerfMonitor.Last, _view.Timings, Seconds);
         PerfMonitor.BeginProcess();
         FrameAllocatedBytes += GC.GetAllocatedBytesForCurrentThread() - allocated;
         FrameCost.Add((Stopwatch.GetTimestamp() - start) * MsPerTick);

@@ -20,6 +20,10 @@ public partial class WorldView
         public int OriginShifts;
     }
 
+    /// <summary>Host time to fill the sprites of a vector tile (<see cref="TilePool.SetSprites"/>: pack the points, build the points mesh, fill the pool MultiMesh), per ring R0..R3: tiles, total and worst microseconds.</summary>
+    public readonly int[] SpriteFillCount = new int[4];
+    public readonly long[] SpriteFillUsSum = new long[4], SpriteFillUsMax = new long[4];
+
     /// <summary>Time inside the library calls.</summary>
     public StreamerTimings Timings => Streamer.Timings;
 

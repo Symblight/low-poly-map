@@ -59,6 +59,13 @@ public sealed class TerrainPool
         _fades = new FadeMaterials(fadeMaterial);
     }
 
+    /// <summary>Makes dither clones ahead of need, up to <paramref name="tiles"/> in total, at most <paramref name="perCall"/> per call (see <see cref="TilePool.ReserveFadeClones"/>). True when done.</summary>
+    public bool ReserveFadeClones(int tiles, int perCall)
+    {
+        for (int i = 0; i < perCall && _fades.Clones < tiles; i++) _fades.AddClone();
+        return _fades.Clones >= tiles;
+    }
+
     /// <summary>Flat shading from screen derivatives (profile terrain.shading = "flat", default) or the mesh NORMAL ("smooth").</summary>
     public void SetSmoothShading(bool smooth)
     {

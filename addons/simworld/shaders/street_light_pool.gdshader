@@ -1,7 +1,7 @@
 shader_type spatial;
-// Light pools: a soft disc of lamp light on the ground under each street lamp (api 1.1 street_lights). Drawn from the tile's street
-// lamp MultiMesh itself (a second MultiMeshInstance3D on the same MultiMesh, this material as override), so no extra upload: each
-// instance sits at the lamp, the disc goes lamp_height_m lower (lights.street.height_m, from world_profile()).
+// Light pools: a soft disc of lamp light on the ground under each street lamp (api 1.1 street_lights). One MultiMesh per tile with one instance per
+// street lamp (transform = the lamp, COLOR = its colour), filled only for the tiles that can show a pool (WorldRenderSettings.StreetPoolMaxRing) and
+// drawn only while the tile is within the fade range: the disc goes lamp_height_m lower (lights.street.height_m, from world_profile()).
 // Mobile-renderer compatible. Additive, unshaded, no depth write; depth tested, so buildings hide the pools behind them. A pool lies on
 // the ground surface, so pools seen at grazing angles do not stack the way billboards do (a pixel sees one ground point).
 // Fog by hand (fog_disabled) for the same reason as the sprites: additive blending of a fogged colour would add the fog colour.

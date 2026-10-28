@@ -48,6 +48,9 @@ public partial class BenchArgs : Node
             else if (arg == "--no-landmarks") view.LandmarksEnabled = false; // api 1.11: do not opt in to the landmark layer; the landmarks stay folded into the vector tiles
             else if (arg.StartsWith("--curvature=", System.StringComparison.Ordinal) && TryNumber(arg.Substring(12), out var cv)) view.Curvature = Mathf.Max((float)cv, 0f);
             else if (arg.StartsWith("--light-alpha=", System.StringComparison.Ordinal) && TryNumber(arg.Substring(14), out var la)) settings.DebugLightAlpha = (float)la;
+            else if (arg == "--no-building-lights") settings.BuildingLightSprites = false;
+            else if (arg == "--no-upload-burst") settings.UploadBudgetBurstUs = 0;
+            else if (arg.StartsWith("--pool-max-ring=", System.StringComparison.Ordinal) && TryNumber(arg.Substring(16), out var pmr)) settings.StreetPoolMaxRing = (int)pmr;
             else if (arg.StartsWith("--fake-fade=", System.StringComparison.Ordinal) && TryNumber(arg.Substring(12), out var ff)) settings.DebugFakeFade = (float)ff;
             else if (arg.StartsWith("--cam-fov=", System.StringComparison.Ordinal) && TryNumber(arg.Substring(10), out var cf) && cf > 1 && cf < 170 && view.Camera != null)
             {

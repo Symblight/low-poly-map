@@ -44,6 +44,10 @@ public partial class Benchmark : Node
     public Phase Current => _phase;
     public bool Settled { get; private set; }
     public double SettleSeconds => _settleSeconds;
+    /// <summary>Cold fill: seconds into the settle phase of the last tile upload (all layers) and how many tiles were uploaded by then. The camera holds the start pose, so this is how long the world takes to appear after a start.</summary>
+    public double FillSeconds { get; private set; }
+    public int FillTiles { get; private set; }
+    int _lastUploaded;
     public FlightPose Pose => _pose;
     public int Reconfigures { get; private set; }
     public int ReconfigureFailures { get; private set; }
@@ -166,7 +170,12 @@ public partial class Benchmark : Node
     public override void _Process(double delta)
     {
         if (_phase == Phase.Done) return;
-        if (_phase == Phase.Settle) _settleSeconds += delta;
+        if (_phase == Phase.Settle)
+        {
+            _settleSeconds += delta;
+            int uploaded = _view.ReadyTotal + _view.TerrainReadyTotal + _view.LandmarkReadyTotal;
+            if (uploaded != _lastUploaded) { _lastUploaded = uploaded; FillSeconds = _settleSeconds; FillTiles = uploaded; }
+        }
         else _simSeconds += delta;
         Place(_path.At(_simSeconds), delta);
         switch (_phase)

@@ -27,12 +27,25 @@ public partial class WorldView
         CullMarginWrites++;
     }
 
+    /// <summary>Hides the street pools of a tile whose nearest point is beyond the pool fade end (see <see cref="TilePool.UpdatePoolRange"/>).</summary>
+    private void RefreshPoolRange(TileNodes nodes, Vector3 camera)
+    {
+        var p = nodes.Root.Position;
+        float dx = p.X - camera.X, dz = p.Z - camera.Z, dy = camera.Y - p.Y;
+        float horizontal = Mathf.Max(Mathf.Sqrt(dx * dx + dz * dz) - nodes.HalfSpanM, 0f);
+        _pool!.UpdatePoolRange(nodes, Mathf.Sqrt(horizontal * horizontal + dy * dy));
+    }
+
     /// <summary>Four times a second: keeps every held tile's margin in step with its distance to the camera (the loops are plain dictionary walks; a write is rare).</summary>
     private void RefreshCullMargins()
     {
         var cam = _source!.GlobalPosition;
         float invTwoR = InvTwoR;
-        foreach (var n in Cover.All) RefreshCullMargin(n, cam, invTwoR);
+        foreach (var n in Cover.All)
+        {
+            RefreshCullMargin(n, cam, invTwoR);
+            if (n.PoolsFilled) RefreshPoolRange(n, cam);
+        }
         foreach (var n in LandmarkCover.All) RefreshCullMargin(n, cam, invTwoR);
         foreach (var n in TerrainCover.All) RefreshCullMargin(n, cam, invTwoR);
     }

@@ -77,13 +77,15 @@ public partial class WorldView
             GroundUploadCount++;
         }
         long tm1b = (long)Time.GetTicksUsec();
-        // Building lights exist on the bands lights.min_ring..R3 (R1..R3 by default); street lamps on every band.
-        pool.SetLights(nodes, tile.Lights, tile.LightColors);
-        pool.SetStreetLights(nodes, tile.StreetLights ?? System.Array.Empty<Vector3>(), tile.StreetLightColors ?? System.Array.Empty<Color>());
-        pool.SetBeacons(nodes, tile.BeaconLights ?? System.Array.Empty<Vector3>(), tile.BeaconLightColors ?? System.Array.Empty<Color>());
-        pool.SetAirportLights(nodes, tile.AirportLights ?? System.Array.Empty<Vector3>(), tile.AirportLightColors ?? System.Array.Empty<Color>());
+        // Building lights exist on the bands lights.min_ring..R3 (R1..R3 by default); street lamps on every band. All four kinds go into one MultiMesh.
+        pool.SetSprites(nodes, in tile);
 
         long tm2 = (long)Time.GetTicksUsec();
+        int fr = System.Math.Clamp(tile.Ring, 0, 3);
+        long fillUs = tm2 - tm1b;
+        SpriteFillCount[fr]++;
+        SpriteFillUsSum[fr] += fillUs;
+        if (fillUs > SpriteFillUsMax[fr]) SpriteFillUsMax[fr] = fillUs;
         InitCullMargin(nodes);
         if (replace)
         {
@@ -203,9 +205,8 @@ public partial class WorldView
         nodes.Root.Position = tile.Origin;
         if (!pool.SetMesh(nodes, tile.Mesh)) ReportRejectedMesh(in tile, "landmark", tile.Mesh);
         // Lights like R1 (the shared sprite material cross-fades them with the building windows) and the beacons; a landmark tile has no ground
-        // and no street or airport lights (empty in the entry), so those sets of the pooled node stay cleared.
-        pool.SetLights(nodes, tile.Lights, tile.LightColors);
-        pool.SetBeacons(nodes, tile.BeaconLights ?? System.Array.Empty<Vector3>(), tile.BeaconLightColors ?? System.Array.Empty<Color>());
+        // and no street or airport lights (empty in the entry), so its sprite MultiMesh holds lights and beacons only.
+        pool.SetSprites(nodes, in tile);
         InitCullMargin(nodes);
         if (replace)
         {

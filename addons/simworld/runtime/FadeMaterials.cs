@@ -35,10 +35,18 @@ public sealed class FadeMaterials
     public ShaderMaterial Rent()
     {
         if (_free.TryPop(out var m)) return m;
-        m = (ShaderMaterial)_template.Duplicate();
+        return Make();
+    }
+
+    private ShaderMaterial Make()
+    {
+        var m = (ShaderMaterial)_template.Duplicate();
         _all.Add(m);
         return m;
     }
+
+    /// <summary>Makes one clone ahead of need (it goes to the free list), so a burst of fades finds it ready.</summary>
+    public void AddClone() => _free.Push(Make());
 
     public void Return(ShaderMaterial m) => _free.Push(m);
 

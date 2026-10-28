@@ -18,23 +18,17 @@ public sealed partial class TilePool
     private readonly RetireQueue<TileNodes> _retiring = new();
     private readonly PoolTrimmer _trimmer;
     private readonly System.Action<TileNodes> _destroy, _finishRetired;
-    private readonly Mesh _lightMesh;
-    private readonly ShaderMaterial _lightMaterial;
-    private readonly Mesh _streetLightMesh;
-    private readonly ShaderMaterial _streetLightMaterial;
-    private readonly ShaderMaterial _streetPoolMaterial;
-    private readonly Mesh _airportLightMesh;
-    private readonly ShaderMaterial _airportLightMaterial;
-    private readonly float _airportReferenceWeight;
-    private readonly Mesh _beaconMesh;
-    private readonly ShaderMaterial _beaconMaterial;
+    private readonly SpriteMaterials _sprites;
+    private readonly PointPacker _packer;
+    private readonly PoolWriter _poolWriter = new();
+    private readonly int _maxRetainedSprites, _streetPoolMaxRing;
+    private readonly bool _buildingLights;
+    private float _poolFadeEndM;
     private readonly ShaderMaterial _buildingMaterial;
     private readonly ShaderMaterial _groundMaterial;
     // Dithering variants of the two opaque materials: the same shader source compiled with LOD_DITHER, so the discard
     // (and its loss of early depth rejection) exists only while a tile is in a fade. Per-tile values are instance uniforms.
     private readonly FadeMaterials _buildingFades, _groundFades;
-    // The same for the five sprite sets (shader compiled with LOD_DITHER: plain uniform fade_mul instead of the constant 1).
-    private readonly FadeMaterials _lightFades, _streetFades, _poolFades, _beaconFades, _airportFades;
 
     /// <summary>Debug (user arg --light-alpha=&lt;v&gt;): force every light's weight, ignoring Rust's alpha. Negative = off.</summary>
     public static float DebugLightAlpha { get; set; } = -1f;
@@ -54,11 +48,8 @@ public sealed partial class TilePool
     public ShaderMaterial BuildingFadeMaterial => _buildingFades.Template;
     public ShaderMaterial GroundFadeMaterial => _groundFades.Template;
     public FadeMaterials BuildingFades => _buildingFades;
-    public ShaderMaterial LightMaterial => _lightMaterial;
-    public ShaderMaterial StreetLightMaterial => _streetLightMaterial;
-    public ShaderMaterial StreetPoolMaterial => _streetPoolMaterial;
-    public ShaderMaterial BeaconMaterial => _beaconMaterial;
-    public ShaderMaterial AirportLightMaterial => _airportLightMaterial;
+    /// <summary>The point sprite and street pool materials with their dither variants.</summary>
+    public SpriteMaterials Sprites => _sprites;
     public ShaderMaterial GroundMaterial => _groundMaterial;
 
     /// <summary>
@@ -89,26 +80,12 @@ public sealed partial class TilePool
         string shaders = (addonRoot ?? AddonPaths.Root) + "/shaders";
         string textures = (addonRoot ?? AddonPaths.Root) + "/textures";
 
-        // Unit quad; the sprite shader sizes it in pixels and billboards it.
-        _lightMaterial = new ShaderMaterial { Shader = GD.Load<Shader>(shaders + "/light_sprite.gdshader") };
-        _lightMaterial.SetShaderParameter("dot_tex", GD.Load<Texture2D>(textures + "/light_dot_32.png"));
-        settings.ApplyToLights(_lightMaterial);
-        _lightMesh = new QuadMesh { Size = Vector2.One, Material = _lightMaterial };
-        _streetLightMaterial = new ShaderMaterial { Shader = _lightMaterial.Shader };
-        _streetLightMaterial.SetShaderParameter("dot_tex", _lightMaterial.GetShaderParameter("dot_tex"));
-        settings.ApplyToStreetLights(_streetLightMaterial);
-        _streetLightMesh = new QuadMesh { Size = Vector2.One, Material = _streetLightMaterial };
-        _airportReferenceWeight = System.Math.Max(settings.AirportLightReferenceWeight, 0.001f);
-        _airportLightMaterial = new ShaderMaterial { Shader = _lightMaterial.Shader };
-        _airportLightMaterial.SetShaderParameter("dot_tex", _lightMaterial.GetShaderParameter("dot_tex"));
-        settings.ApplyToAirportLights(_airportLightMaterial);
-        _airportLightMesh = new QuadMesh { Size = Vector2.One, Material = _airportLightMaterial };
-        _streetPoolMaterial = new ShaderMaterial { Shader = GD.Load<Shader>(shaders + "/street_light_pool.gdshader") };
-        settings.ApplyToStreetPools(_streetPoolMaterial);
-        _beaconMaterial = new ShaderMaterial { Shader = GD.Load<Shader>(shaders + "/beacon_light.gdshader") };
-        _beaconMaterial.SetShaderParameter("dot_tex", _lightMaterial.GetShaderParameter("dot_tex"));
-        settings.ApplyToBeacons(_beaconMaterial);
-        _beaconMesh = new QuadMesh { Size = Vector2.One, Material = _beaconMaterial };
+        _sprites = new SpriteMaterials(settings, shaders, textures);
+        _packer = new PointPacker(settings) { DebugAlpha = DebugLightAlpha };
+        _maxRetainedSprites = settings.SpriteMaxRetainedInstances;
+        _streetPoolMaxRing = settings.StreetPoolMaxRing;
+        _buildingLights = settings.BuildingLightSprites;
+        _poolFadeEndM = settings.StreetPoolFadeEndM;
 
         // One shared material for every building mesh of every tile (opaque, no discard).
         _buildingMaterial = new ShaderMaterial { Shader = GD.Load<Shader>(shaders + "/building_windows.gdshader") };
@@ -125,22 +102,6 @@ public sealed partial class TilePool
         settings.ApplyToGround(_groundMaterial);
         settings.ApplyToGround(groundFade);
         _groundFades = new FadeMaterials(groundFade);
-
-        // Sprite fade variants, configured like their plain materials.
-        var dot = _lightMaterial.GetShaderParameter("dot_tex");
-        var lightVariant = LoadDitherVariant(shaders + "/light_sprite.gdshader");
-        ShaderMaterial Sprite(Shader sh, System.Action<ShaderMaterial> apply, bool withDot = true)
-        {
-            var m = new ShaderMaterial { Shader = sh };
-            if (withDot) m.SetShaderParameter("dot_tex", dot);
-            apply(m);
-            return m;
-        }
-        _lightFades = new FadeMaterials(Sprite(lightVariant, settings.ApplyToLights));
-        _streetFades = new FadeMaterials(Sprite(lightVariant, settings.ApplyToStreetLights));
-        _airportFades = new FadeMaterials(Sprite(lightVariant, settings.ApplyToAirportLights));
-        _poolFades = new FadeMaterials(Sprite(LoadDitherVariant(shaders + "/street_light_pool.gdshader"), settings.ApplyToStreetPools, false));
-        _beaconFades = new FadeMaterials(Sprite(LoadDitherVariant(shaders + "/beacon_light.gdshader"), settings.ApplyToBeacons));
     }
 
     /// <summary>
@@ -161,69 +122,27 @@ public sealed partial class TilePool
     {
         SetBuilding("avg_fade_start_m", blendStartM);
         SetBuilding("avg_fade_end_m", blendEndM);
-        _lightMaterial.SetShaderParameter("blend_start_m", blendStartM);
-        _lightMaterial.SetShaderParameter("blend_end_m", blendEndM);
-        _lightFades.Set("blend_start_m", blendStartM);
-        _lightFades.Set("blend_end_m", blendEndM);
-        _streetPoolMaterial.SetShaderParameter("fade_start_m", poolStartM);
-        _streetPoolMaterial.SetShaderParameter("fade_end_m", poolEndM);
-        _poolFades.Set("fade_start_m", poolStartM);
-        _poolFades.Set("fade_end_m", poolEndM);
+        _poolFadeEndM = poolEndM;
+        _sprites.SetLodRanges(blendStartM, blendEndM, poolStartM, poolEndM);
     }
 
-    /// <summary>Moves the far fade of every sprite set (building, street, airport lights and beacons): fully faded at <paramref name="endM"/> (bands.max_distance_m).</summary>
-    public void SetLightFar(float fadeStartM, float endM)
-    {
-        foreach (var (m, f) in SpriteSets(false))
-        {
-            m.SetShaderParameter("fade_start_m", fadeStartM);
-            m.SetShaderParameter("far_end_m", endM);
-            f.Set("fade_start_m", fadeStartM);
-            f.Set("far_end_m", endM);
-        }
-    }
+    /// <summary>Moves the far fade of every sprite kind: fully faded at <paramref name="endM"/> (bands.max_distance_m).</summary>
+    public void SetLightFar(float fadeStartM, float endM) => _sprites.SetFar(fadeStartM, endM);
 
     /// <summary>The environment's depth fog curve on the light sprites, which are additive and fog themselves (fog_disabled).</summary>
-    public void SetLightFog(float beginM, float endM, float curve)
-    {
-        foreach (var (m, f) in SpriteSets(true))
-        {
-            m.SetShaderParameter("fog_begin_m", beginM);
-            m.SetShaderParameter("fog_end_m", endM);
-            m.SetShaderParameter("fog_curve", curve);
-            f.Set("fog_begin_m", beginM);
-            f.Set("fog_end_m", endM);
-            f.Set("fog_curve", curve);
-        }
-    }
+    public void SetLightFog(float beginM, float endM, float curve) => _sprites.SetFog(beginM, endM, curve);
 
     /// <summary>Street lamp height above the ground (<c>lights.street.height_m</c>): the light pools sit this far below each lamp.</summary>
-    public void SetStreetLampHeight(float heightM)
-    {
-        _streetPoolMaterial.SetShaderParameter("lamp_height_m", heightM);
-        _poolFades.Set("lamp_height_m", heightM);
-    }
+    public void SetStreetLampHeight(float heightM) => _sprites.SetLampHeight(heightM);
 
-    /// <summary>Each sprite material with its dither variants (the street pool disc only when <paramref name="withPool"/>: it has no light_sprite parameters).</summary>
-    private (ShaderMaterial, FadeMaterials)[] SpriteSets(bool withPool) => withPool
-        ? new[] { (_lightMaterial, _lightFades), (_streetLightMaterial, _streetFades), (_streetPoolMaterial, _poolFades), (_beaconMaterial, _beaconFades), (_airportLightMaterial, _airportFades) }
-        : new[] { (_lightMaterial, _lightFades), (_streetLightMaterial, _streetFades), (_airportLightMaterial, _airportFades), (_beaconMaterial, _beaconFades) };
+    /// <summary>Pixel footprint per metre of view depth on the sprite material (see <c>px_per_depth</c> in light_sprite.gdshader).</summary>
+    public void SetSpritePxPerDepth(float k) => _sprites.SetPxPerDepth(k);
 
     /// <summary>A building shader parameter on the plain material and every dither clone.</summary>
     private void SetBuilding(StringName name, Variant value)
     {
         _buildingMaterial.SetShaderParameter(name, value);
         _buildingFades.Set(name, value);
-    }
-
-    /// <summary>Pixel footprint per metre of view depth on both sprite materials (see <c>px_per_depth</c> in light_sprite.gdshader).</summary>
-    public void SetSpritePxPerDepth(float k)
-    {
-        foreach (var (m, f) in SpriteSets(false))
-        {
-            m.SetShaderParameter("px_per_depth", k);
-            f.Set("px_per_depth", k);
-        }
     }
 
     /// <summary>
@@ -353,7 +272,7 @@ public sealed partial class TilePool
     {
         ClearMesh(t);
         ClearGround(t);
-        ClearLights(t);
+        ClearSprites(t);
     }
 
     /// <summary>Writes the earth-curvature cull margin (<see cref="CullMargins"/>) to the set's instances; the sprite sets keep their own padding on top.</summary>
@@ -362,28 +281,15 @@ public sealed partial class TilePool
         t.CullMargin = margin;
         t.MeshInstance.ExtraCullMargin = margin;
         t.GroundInstance.ExtraCullMargin = margin;
-        t.Lights.ExtraCullMargin = margin + SpriteCullPad;
-        t.StreetLights.ExtraCullMargin = margin + SpriteCullPad;
-        t.StreetPools.ExtraCullMargin = margin + PoolCullPad;
-        t.Beacons.ExtraCullMargin = margin + SpriteCullPad;
-        t.AirportLights.ExtraCullMargin = margin + SpriteCullPad;
+        t.Points.ExtraCullMargin = margin + SpriteCullPad;
+        t.Pools.ExtraCullMargin = margin + PoolCullPad;
     }
 
     private TileNodes Create()
     {
-        var (mmi, mm) = CreateSprites("Lights", _lightMesh, _lightMaterial);
-        var (smi, smm) = CreateSprites("StreetLights", _streetLightMesh, _streetLightMaterial);
-        var (bmi, bmm) = CreateSprites("Beacons", _beaconMesh, _beaconMaterial);
-        var (ami, amm) = CreateSprites("AirportLights", _airportLightMesh, _airportLightMaterial);
-        var pools = new MultiMeshInstance3D
-        {
-            Name = "StreetPools",
-            Multimesh = smm,
-            MaterialOverride = _streetPoolMaterial,
-            CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
-            Visible = false,
-            ExtraCullMargin = PoolCullPad, // the disc reaches below and around the lamp's AABB; the curvature margin is added by SetCullMargin
-        };
+        var pointsMesh = new ArrayMesh();
+        var points = CreatePoints(pointsMesh, _sprites.Point);
+        var (pools, poolsMm) = CreatePools(_sprites.PoolQuad, _sprites.Pool);
         var am = new ArrayMesh();
         var mi = new MeshInstance3D
         {
@@ -406,18 +312,13 @@ public sealed partial class TilePool
         var root = new Node3D { Name = "Tile", Visible = false };
         root.AddChild(mi);
         root.AddChild(gi);
-        sprites.AddChild(mmi);
-        sprites.AddChild(smi);
+        sprites.AddChild(points);
         sprites.AddChild(pools);
-        sprites.AddChild(bmi);
-        sprites.AddChild(ami);
         root.AddChild(sprites);
         _container.AddChild(root);
         return new TileNodes
         {
-            Root = root, Sprites = sprites, SpritesShown = _spritesOn, MeshInstance = mi, Mesh = am, GroundInstance = gi, GroundMesh = gm, Lights = mmi, LightsMm = mm,
-            StreetLights = smi, StreetLightsMm = smm, StreetPools = pools, Beacons = bmi, BeaconsMm = bmm,
-            AirportLights = ami, AirportLightsMm = amm,
+            Root = root, Sprites = sprites, SpritesShown = _spritesOn, MeshInstance = mi, Mesh = am, GroundInstance = gi, GroundMesh = gm, Points = points, PointsMesh = pointsMesh, Pools = pools, PoolsMm = poolsMm,
         };
     }
 

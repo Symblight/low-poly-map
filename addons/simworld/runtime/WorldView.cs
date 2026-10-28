@@ -626,7 +626,7 @@ public partial class WorldView : Node3D
         else if (Streamer.HasHostApi) GD.Print("[WorldView] attribution: none required (synthetic city)");
 
         var profile = Streamer.WorldProfile();
-        ApplyWindowProfile(profile);
+        ApplyWindowProfile(profile); ApplySpriteProfile(profile);
         ConfigureTerrainLayer(profile);
         _legacyBandsText = "";
         if (profile.TryGetValue("bands", out var bv) && bv.VariantType == Variant.Type.Dictionary)
@@ -704,7 +704,7 @@ public partial class WorldView : Node3D
             _lodBlendD = d;
             BlendUpdates++;
             _pool!.SetLodRanges((float)(d * WorldRenderSettings.BlendStartShare), (float)(d * WorldRenderSettings.BlendEndShare),
-                (float)(d * WorldRenderSettings.PoolStartShare), (float)(d * WorldRenderSettings.PoolEndShare));
+                (float)(d * WorldRenderSettings.PoolStartShare), PoolFadeEndM(d));
         }
         double far = LodEdgesM[3];
         if (far > 1 && far != _lodMaxDist)

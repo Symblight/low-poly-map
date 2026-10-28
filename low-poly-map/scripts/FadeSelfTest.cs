@@ -63,7 +63,7 @@ public partial class FadeSelfTest : Node
                 tpool.SetFade(tsets[i], 0.5f);
                 active.Add(n);
                 Check(n.MeshInstance.MaterialOverride != pool.BuildingMaterial && n.MeshInstance.MaterialOverride != pool.BuildingFadeMaterial, "building node uses the plain or the template material while fading");
-                Check(n.Lights.MaterialOverride != pool.LightMaterial && n.AirportLights.MaterialOverride != pool.AirportLightMaterial, "sprite node still on the plain material while fading");
+                Check(n.Points.MaterialOverride != pool.Sprites.Point && n.Pools.MaterialOverride != pool.Sprites.Pool, "sprite node still on the plain material while fading");
                 Check((float)((ShaderMaterial)n.MeshInstance.MaterialOverride!).GetShaderParameter("fade") == 0.5f, "fade value not on the node's own clone");
             }
             if (active.Count >= 2) // two tiles fading together must not share a material (each has its own fade)
@@ -73,9 +73,8 @@ public partial class FadeSelfTest : Node
                 pool.EndFade(n);
                 int i = sets.IndexOf(n);
                 tpool.EndFade(tsets[i]);
-                Check(n.MeshInstance.MaterialOverride == pool.BuildingMaterial && n.GroundInstance.MaterialOverride == pool.GroundMaterial && n.Lights.MaterialOverride == pool.LightMaterial
-                      && n.StreetLights.MaterialOverride == pool.StreetLightMaterial && n.StreetPools.MaterialOverride == pool.StreetPoolMaterial
-                      && n.Beacons.MaterialOverride == pool.BeaconMaterial && n.AirportLights.MaterialOverride == pool.AirportLightMaterial, "plain materials not restored after the fade");
+                Check(n.MeshInstance.MaterialOverride == pool.BuildingMaterial && n.GroundInstance.MaterialOverride == pool.GroundMaterial && n.Points.MaterialOverride == pool.Sprites.Point
+                      && n.Pools.MaterialOverride == pool.Sprites.Pool, "plain materials not restored after the fade");
             }
             active.Clear();
         }
@@ -90,7 +89,7 @@ public partial class FadeSelfTest : Node
         foreach (var n in held)
         {
             var bm = (ShaderMaterial)n.MeshInstance.MaterialOverride!;
-            var lm = (ShaderMaterial)n.Lights.MaterialOverride!;
+            var lm = (ShaderMaterial)n.Points.MaterialOverride!;
             Check((float)bm.GetShaderParameter("emission_level") == 3.5f, "emission_level not on a dither clone");
             Check(bm.GetShaderParameter("window_share").AsFloat32Array()[2] == 0.3f, "window_share not on a dither clone");
             Check((float)lm.GetShaderParameter("fog_end_m") == 9000f, "fog_end_m not on a sprite dither clone");

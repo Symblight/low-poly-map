@@ -43,6 +43,7 @@ public static class BenchmarkReport
         WriteChurn(j, b);
         WriteUploads(j, b);
         WriteGc(j, b);
+        b.Diagnostics.Stalls.WriteFields(j);
         WriteOverhead(j, b.Diagnostics);
         j.BeginObject("series");
         b.AllSeries.Write(j);
@@ -90,6 +91,8 @@ public static class BenchmarkReport
         j.Field("warmup_s", Benchmark.WarmupSeconds);
         j.Field("settle_s", Math.Round(b.SettleSeconds, 1));
         j.Field("settled", b.Settled);
+        j.Field("fill_s", Math.Round(b.FillSeconds, 2));
+        j.Field("fill_tiles", b.FillTiles);
         j.Field("measured_s", Math.Round(b.MeasuredSeconds, 2));
         j.Field("tile_source", view.TileSource);
         j.Field("terrain_active", view.TerrainActive);
@@ -171,6 +174,14 @@ public static class BenchmarkReport
         j.Field("frames_with_uploads_pct", Math.Round(d.UploadFrames * 100.0 / Math.Max(s.Frames, 1), 2));
         j.Field("tiles_per_frame_with_uploads", Math.Round((d.UploadedVector + d.UploadedTerrain + d.UploadedLandmarks) / (double)Math.Max(d.UploadFrames, 1), 2));
         j.Field("max_ms_in_a_frame", Math.Round(Math.Max(PerfMarker.MaxMs(PerfCat.UploadVector), Math.Max(PerfMarker.MaxMs(PerfCat.UploadTerrain), PerfMarker.MaxMs(PerfCat.UploadLandmarks))), 3));
+        j.Field("burst_frames", b.View.UploadBurstFrames);
+        for (int r = 0; r < 4; r++)
+        {
+            int n = b.View.SpriteFillCount[r];
+            j.Field($"sprite_fill_r{r}_tiles", n);
+            j.Field($"sprite_fill_r{r}_mean_ms", n == 0 ? 0 : Math.Round(b.View.SpriteFillUsSum[r] / 1000.0 / n, 3));
+            j.Field($"sprite_fill_r{r}_max_ms", Math.Round(b.View.SpriteFillUsMax[r] / 1000.0, 3));
+        }
         j.End();
     }
 

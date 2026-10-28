@@ -107,7 +107,7 @@ public partial class LodSelfTest : Node
         if (System.Math.Abs(cur.Edges[3] - baseline.Edges[3]) > 0.5) _fails.Add($"{tag}: max distance changed {F(baseline.Edges[3])} -> {F(cur.Edges[3])} m");
     }
 
-    /// <summary>The materials hold 0.36 D .. 0.8 D (window / sprite blend), 0.48 D .. D (street pools) and 0.84 M .. M (sprite far fade) within the 5 % the view lets D drift.</summary>
+    /// <summary>The materials hold 0.36 D .. 0.8 D (window / sprite blend), 0.48 D .. min(D, D / hysteresis) (street pools: no pool beyond where R1 ends) and 0.84 M .. M (sprite far fade) within the 5 % the view lets D drift.</summary>
     private void CheckBlendMaterials(string tag, Sample s)
     {
         var r = _view.ReadMaterialBlendRanges();
@@ -117,14 +117,14 @@ public partial class LodSelfTest : Node
         {
             ("window avg start", r[0], d * WorldRenderSettings.BlendStartShare), ("window avg end", r[1], d * WorldRenderSettings.BlendEndShare),
             ("sprite blend start", r[2], d * WorldRenderSettings.BlendStartShare), ("sprite blend end", r[3], d * WorldRenderSettings.BlendEndShare),
-            ("pool start", r[4], d * WorldRenderSettings.PoolStartShare), ("pool end", r[5], d * WorldRenderSettings.PoolEndShare),
+            ("pool start", r[4], d * WorldRenderSettings.PoolStartShare), ("pool end", r[5], System.Math.Min(d * WorldRenderSettings.PoolEndShare, d / _view.Hysteresis)),
             ("sprite fade start", r[6], m * WorldRenderSettings.LightFadeShare), ("sprite far end", r[7], m),
         };
         foreach (var (name, got, exp) in want)
             if (System.Math.Abs(got - exp) > exp * 0.001 + 0.5) _fails.Add($"{tag}: {name} {got:0.#} m, expected {exp:0.#} m");
         if (System.Math.Abs(d - s.Edges[1]) > s.Edges[1] * 0.05) _fails.Add($"{tag}: blend D {d:0} m is more than 5 % off the live R2 to R1 edge {s.Edges[1]:0} m");
-        if (tag == "baseline" && (System.Math.Abs(r[0] - 900) > 0.5 || System.Math.Abs(r[1] - 2000) > 0.5 || System.Math.Abs(r[4] - 1200) > 0.5 || System.Math.Abs(r[5] - 2500) > 0.5 || System.Math.Abs(r[6] - 21000) > 0.5 || System.Math.Abs(r[7] - 25000) > 0.5))
-            _fails.Add($"baseline: the ranges are not today's 900/2000, 1200/2500, 21000/25000: {string.Join("/", r)}");
+        if (tag == "baseline" && (System.Math.Abs(r[0] - 900) > 0.5 || System.Math.Abs(r[1] - 2000) > 0.5 || System.Math.Abs(r[4] - 1200) > 0.5 || System.Math.Abs(r[5] - 2500 / _view.Hysteresis) > 0.5 || System.Math.Abs(r[6] - 21000) > 0.5 || System.Math.Abs(r[7] - 25000) > 0.5))
+            _fails.Add($"baseline: the ranges are not today's 900/2000, 1200/(2500 / hysteresis), 21000/25000: {string.Join("/", r)}");
     }
 
     private async Task Body()

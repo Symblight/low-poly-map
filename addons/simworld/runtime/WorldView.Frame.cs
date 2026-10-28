@@ -48,7 +48,7 @@ public partial class WorldView
             for (int i = 0; i < unload.Length; i++) UnloadTile(unload[i]);
             _unloadApplyUs += (long)Time.GetTicksUsec() - tu;
             UploadUsLastFrame = (long)Time.GetTicksUsec() - t0;
-            if (n0 != ReadyTotal + LandmarkReadyTotal) { UploadFrames++; if (UploadUsLastFrame > _settings.UploadBudgetUs) UploadFramesOverBudget++; }
+            if (n0 != ReadyTotal + LandmarkReadyTotal) { UploadFrames++; if (UploadUsLastFrame > _budget!.BudgetUs) UploadFramesOverBudget++; }
             if (UploadUsLastFrame > _secUploadMax) _secUploadMax = UploadUsLastFrame;
             DrainRetired();
             UpdateCollision();
@@ -83,18 +83,25 @@ public partial class WorldView
     }
 
     private double _tileCostEmaUs = 500;
+    private UploadBudget? _budget;
+
+    /// <summary>Frames that ran with the burst upload budget (a deep backlog and a slow camera, see <see cref="UploadBudget"/>).</summary>
+    public int UploadBurstFrames => _budget?.BurstFrames ?? 0;
 
     /// <summary>
     /// Polls ready tiles one at a time and uploads them until the budget is spent (<see cref="WorldRenderSettings.UploadBudgetUs"/>, at most
-    /// <see cref="WorldRenderSettings.MaxTilesPerFrame"/> tiles). The next tile is not even polled when the typical cost of a tile (a moving average of the
+    /// <see cref="WorldRenderSettings.MaxTilesPerFrame"/> tiles; a deep backlog with a slow camera gets the burst budget, see <see cref="UploadBudget"/>). The next tile is not even polled when the typical cost of a tile (a moving average of the
     /// recent ones) would carry the frame over the budget, so only the first tile of a frame can exceed it; Rust keeps the rest queued.
     /// </summary>
     private void UploadReady(long frameStartUs)
     {
-        for (int n = 0; n < _settings.MaxTilesPerFrame; n++)
+        var budget = _budget ??= new UploadBudget(_settings);
+        budget.BeginFrame(_source!.Velocity.Length());
+        bool limited = true;
+        for (int n = 0; n < budget.MaxTiles; n++)
         {
             var ready = Streamer.PollReady(1);
-            if (ready.Count == 0) break;
+            if (ready.Count == 0) { limited = false; break; }
             long c0 = (long)Time.GetTicksUsec();
             foreach (var d in ready)
             {
@@ -110,8 +117,9 @@ public partial class WorldView
             }
             long now = (long)Time.GetTicksUsec();
             _tileCostEmaUs += ((now - c0) - _tileCostEmaUs) * 0.2;
-            if (now - frameStartUs >= _settings.UploadBudgetUs || now - frameStartUs + _tileCostEmaUs > _settings.UploadBudgetUs) break;
+            if (now - frameStartUs >= budget.BudgetUs || now - frameStartUs + _tileCostEmaUs > budget.BudgetUs) break;
         }
+        budget.EndFrame(limited);
     }
 
     /// <summary>Frees the meshes and sprite buffers of released tiles within <see cref="WorldRenderSettings.ReleaseBudgetUs"/> (each pool makes progress at least one set per frame).</summary>

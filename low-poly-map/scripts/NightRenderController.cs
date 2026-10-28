@@ -89,6 +89,7 @@ public partial class NightRenderController : WorldEnvironment
                 Tonemap = arg.Substring(10).ToLowerInvariant() == "agx" ? ToneMapper.AgX : ToneMapper.Filmic;
             else if (arg == "--no-exposure") ExternalView = false;
             else if (arg == "--no-glow") _testNoGlow = true;
+            else if (arg.StartsWith("--glow-levels=", System.StringComparison.Ordinal) && int.TryParse(arg.Substring(14), out var gl)) Look.GlowLevels = gl;
             else if (arg == "--no-shadows") _noShadows = true;
             else if (arg.StartsWith("--glow-blend=", System.StringComparison.Ordinal)) _testBlend = arg.Substring(13);
             else if (arg.StartsWith("--cam-alt=", System.StringComparison.Ordinal) && float.TryParse(arg.Substring(10), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var ca)) _testAlt = ca;
@@ -207,6 +208,9 @@ public partial class NightRenderController : WorldEnvironment
                     int drawn = Bridge.CountTerrainInFrustum(Camera, out int byRule, out long tris);
                     terr = $" terrain: held {Bridge.TerrainCover.Loaded} (by ring {string.Join("/", Bridge.TerrainCover.LoadedByRing)}), visible by rule {byRule}, in frustum {drawn}, tris in frustum {tris:N0}, held tris {Bridge.TerrainCover.TrianglesLoaded:N0};";
                 }
+                var byRing = new int[4];
+                int points = Bridge.CountSpriteDrawsInFrustum(Camera, byRing, out int pools);
+                GD.Print($"[NightRender] sprite draws in frustum: point meshes {points} (by ring {string.Join("/", byRing)}), street pools {pools}");
                 GD.Print($"[NightRender] shot stats: viewport draw calls {draws}; vector building meshes held {Bridge.Cover.Loaded}, visible by rule {vecRule}, in frustum {vec};{terr} cam alt {Camera.AltitudeAgl:0} m AGL");
             }
             var img = GetViewport().GetTexture().GetImage();

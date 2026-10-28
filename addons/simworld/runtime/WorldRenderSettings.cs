@@ -17,7 +17,7 @@ public partial class WorldRenderSettings : Resource
     [Export] public long UploadBudgetUs { get; set; } = 2000;
     [Export] public int MaxTilesPerFrame { get; set; } = 2;
     /// <summary>
-    /// Draw every world material once at start (tiny, in front of the camera, for 24 frames) so the engine compiles the 14 permutations the tiles use,
+    /// Draw every world material once at start (tiny, in front of the camera, for 24 frames) so the engine compiles the 10 permutations the tiles use,
     /// including the dithering ones of the LOD fades, during loading and not on the first fade (10 to 25 ms). Needs <see cref="WorldView.Camera"/>; skipped headless.
     /// </summary>
     [Export] public bool PrewarmMaterials { get; set; } = true;
@@ -28,6 +28,30 @@ public partial class WorldRenderSettings : Resource
     /// within this budget; at least one set per frame whatever the budget, so a long queue still drains).
     /// </summary>
     [Export] public long ReleaseBudgetUs { get; set; } = 1000;
+    /// <summary>
+    /// While many ready tiles are waiting (a cold start, a teleport; <see cref="UploadBacklogDeep"/> tiles or more behind the one being uploaded) and the camera
+    /// is slow (below <see cref="UploadBurstMaxSpeedMps"/>) the per-frame upload budget is this many microseconds and <see cref="UploadBurstMaxTiles"/> tiles
+    /// instead of <see cref="UploadBudgetUs"/> / <see cref="MaxTilesPerFrame"/>. Steady flight keeps the normal budget. 0 = no burst.
+    /// </summary>
+    [Export] public long UploadBudgetBurstUs { get; set; } = 4000;
+    [Export] public int UploadBurstMaxTiles { get; set; } = 4;
+    [Export] public int UploadBacklogDeep { get; set; } = 24;
+    [Export] public float UploadBurstMaxSpeedMps { get; set; } = 60f;
+    /// <summary>
+    /// A pooled tile keeps the instance buffer of its street pool MultiMesh (64 bytes per lamp, grow-only while it is in use) when it is released only up to this
+    /// many lamps; a bigger one is freed. The default is lower on a mobile OS, where the node pool has to stay small.
+    /// </summary>
+    [Export] public int SpriteMaxRetainedInstances { get; set; } = OS.HasFeature("mobile") ? 1024 : 4096;
+    /// <summary>
+    /// Draw the building light sprites at all (the far light carpet of R1..R3 and the clusters). Off for a low tier: street lamps, beacons and airport lights stay.
+    /// Read when the view builds its pool. Windows still show on near buildings.
+    /// </summary>
+    [Export] public bool BuildingLightSprites { get; set; } = true;
+    /// <summary>
+    /// Dither material clones made up front for the fade bursts (during <see cref="PrewarmMaterials"/>): fading tiles at once = <c>fades.max_active</c>
+    /// swaps x this many tiles per swap (the coarse tile and its four children). Without the reserve the clones are made when the first swaps start.
+    /// </summary>
+    [Export] public int FadeReserveTilesPerSwap { get; set; } = 5;
     /// <summary>
     /// Debug checks that cost frame time: the periodic cover verification (<see cref="VerifyIntervalS"/>, about a thousand dictionaries through
     /// <c>debug_tiles</c>) and the one-time <c>debug_stats</c> print at the first tile (7 to 21 ms). Off by default; a host turns it on for self-tests and smoke runs.
@@ -71,7 +95,7 @@ public partial class WorldRenderSettings : Resource
     /// <summary>
     /// True (default): the window / sprite cross-fade, the street light pool fade and the light sprites' far end follow the live LOD edges of the library
     /// (<c>lod_edges_m</c>, api 1.10): with D = the R2 to R1 edge the blend runs <see cref="BlendStartShare"/> x D .. <see cref="BlendEndShare"/> x D, the pool fade
-    /// <see cref="PoolStartShare"/> x D .. <see cref="PoolEndShare"/> x D, and the sprites fade out <see cref="LightFadeShare"/> x .. 1 x <c>bands.max_distance_m</c>.
+    /// <see cref="PoolStartShare"/> x D .. min(<see cref="PoolEndShare"/> x D, D / hysteresis), and the sprites fade out <see cref="LightFadeShare"/> x .. 1 x <c>bands.max_distance_m</c>.
     /// The shares reproduce the fixed values (900 / 2000, 1200 / 2500, 21000 / 25000 m) at D = 2500 m and a 25 km maximum distance. False = the fixed values below.
     /// </summary>
     [Export] public bool BlendFollowsLod { get; set; } = true;
@@ -201,21 +225,6 @@ public partial class WorldRenderSettings : Resource
         m.SetShaderParameter("seed_tint_value_var", SeedTintValueVar);
     }
 
-    /// <summary>Airport lights: the sprite shader with fixed colours (no tint variety), no window cross-fade, no thinning, bright and a little bigger.</summary>
-    public void ApplyToAirportLights(ShaderMaterial m)
-    {
-        ApplyToLights(m);
-        m.SetShaderParameter("intensity", AirportLightIntensity);
-        m.SetShaderParameter("px_min", AirportLightPxMin);
-        m.SetShaderParameter("px_max", AirportLightPxMax);
-        m.SetShaderParameter("blend_start_m", -2f);
-        m.SetShaderParameter("blend_end_m", -1f);
-        m.SetShaderParameter("color_variation", 0f);
-        m.SetShaderParameter("graze_min", -2f);
-        m.SetShaderParameter("graze_max", -1.5f);
-        m.SetShaderParameter("alt_keep_min", 1f);
-    }
-
     public void ApplyToMarkings(ShaderMaterial m)
     {
         m.SetShaderParameter("marking_color", new Vector3(MarkingColor.R, MarkingColor.G, MarkingColor.B));
@@ -276,8 +285,14 @@ public partial class WorldRenderSettings : Resource
     [Export] public float StreetPoolIntensity { get; set; } = 0.22f;
     [Export] public float StreetPoolFadeStartM { get; set; } = 1200f;
     [Export] public float StreetPoolFadeEndM { get; set; } = 2500f;
+    /// <summary>
+    /// Pools exist (a MultiMesh filled, a draw call) only on tiles of this ring or finer: they fade out by about the R2 / R1 edge, so a coarser tile never shows
+    /// one and would pay a draw call and its vertex work for nothing; and they are drawn only while the tile is within the fade end of the camera
+    /// (<c>min(D, D / hysteresis)</c> with the live R2 / R1 edge D when <see cref="BlendFollowsLod"/>). 1 = R0 and R1; -1 = no pools.
+    /// </summary>
+    [Export(PropertyHint.Range, "-1,3,1")] public int StreetPoolMaxRing { get; set; } = 1;
 
-    // ---- aircraft warning beacons (api 1.2; shaders/beacon_light.gdshader) -------------------
+    // ---- aircraft warning beacons (api 1.2; kind 3 of shaders/light_sprite.gdshader) -------------------
     [ExportGroup("Beacons")]
     /// <summary>Beacon brightness (blooms: above the glow threshold), size in pixels near / far, blink period, share of the period on,
     /// and the brightness left while off (0 = flashing, 1 = steady).</summary>
@@ -287,19 +302,6 @@ public partial class WorldRenderSettings : Resource
     [Export] public float BeaconBlinkPeriodS { get; set; } = 1.5f;
     [Export(PropertyHint.Range, "0.05,1,0.01")] public float BeaconOnShare { get; set; } = 0.45f;
     [Export(PropertyHint.Range, "0,1,0.01")] public float BeaconOffLevel { get; set; } = 0.15f;
-
-    public void ApplyToBeacons(ShaderMaterial m)
-    {
-        m.SetShaderParameter("intensity", BeaconIntensity);
-        m.SetShaderParameter("px_near", BeaconPxNear);
-        m.SetShaderParameter("px_far", BeaconPxFar);
-        m.SetShaderParameter("blink_period_s", BeaconBlinkPeriodS);
-        m.SetShaderParameter("blink_on_share", BeaconOnShare);
-        m.SetShaderParameter("off_level", BeaconOffLevel);
-        m.SetShaderParameter("fade_start_m", LightFadeStartM);
-        m.SetShaderParameter("far_end_m", LightFarEndM);
-        m.SetShaderParameter("fog_light_keep", LightFogKeep);
-    }
 
     public void ApplyToBuilding(ShaderMaterial m)
     {
@@ -343,55 +345,5 @@ public partial class WorldRenderSettings : Resource
         m.SetShaderParameter("roughness_value", TerrainRoughness);
         m.SetShaderParameter("darken", TerrainDarken);
         ApplySeedPalette(m);
-    }
-
-    public void ApplyToLights(ShaderMaterial m)
-    {
-        m.SetShaderParameter("blend_start_m", WindowSpriteBlendStartM);
-        m.SetShaderParameter("blend_end_m", WindowSpriteBlendEndM);
-        m.SetShaderParameter("intensity", LightIntensity);
-        m.SetShaderParameter("px_min", LightPxMin);
-        m.SetShaderParameter("px_max", LightPxMax);
-        m.SetShaderParameter("px_end_m", LightPxEndM);
-        m.SetShaderParameter("far_end_m", LightFarEndM);
-        m.SetShaderParameter("fade_start_m", LightFadeStartM);
-        m.SetShaderParameter("cluster_bright_gain", LightClusterBrightGain);
-        m.SetShaderParameter("cluster_world_m", LightClusterWorldM);
-        m.SetShaderParameter("falloff_ref_m", LightFalloffRefM);
-        m.SetShaderParameter("fog_light_keep", LightFogKeep);
-        m.SetShaderParameter("lift_m", LightLiftM);
-        m.SetShaderParameter("graze_min", LightGrazeMin);
-        m.SetShaderParameter("graze_max", LightGrazeMax);
-        m.SetShaderParameter("blur_start_m", LightBlurStartM);
-        m.SetShaderParameter("blur_end_m", LightBlurEndM);
-        m.SetShaderParameter("blur_px", LightBlurPx);
-        m.SetShaderParameter("alt_thin_start_m", LightAltThinStartM);
-        m.SetShaderParameter("alt_thin_end_m", LightAltThinEndM);
-        m.SetShaderParameter("alt_keep_min", LightAltKeepMin);
-        m.SetShaderParameter("color_variation", LightColorVariation);
-        m.SetShaderParameter("cool_tint", new Vector3(LightCoolTint.R, LightCoolTint.G, LightCoolTint.B));
-        m.SetShaderParameter("amber_tint", new Vector3(LightAmberTint.R, LightAmberTint.G, LightAmberTint.B));
-        m.SetShaderParameter("cool_share", LightCoolShare);
-        m.SetShaderParameter("amber_share", LightAmberShare);
-        m.SetShaderParameter("brightness_jitter", LightBrightnessJitter);
-    }
-
-    /// <summary>The street lamp material: the building-light parameters, its own intensity, and no window cross-fade (lamps are drawn
-    /// at every distance: a blend range below zero keeps the shader's blend factor at 1).</summary>
-    public void ApplyToStreetPools(ShaderMaterial m)
-    {
-        m.SetShaderParameter("radius_m", StreetPoolRadiusM);
-        m.SetShaderParameter("intensity", StreetPoolIntensity);
-        m.SetShaderParameter("fade_start_m", StreetPoolFadeStartM);
-        m.SetShaderParameter("fade_end_m", StreetPoolFadeEndM);
-    }
-
-    public void ApplyToStreetLights(ShaderMaterial m)
-    {
-        ApplyToLights(m);
-        m.SetShaderParameter("intensity", StreetLightIntensity);
-        m.SetShaderParameter("blend_start_m", -2f);
-        m.SetShaderParameter("blend_end_m", -1f);
-        m.SetShaderParameter("color_variation", 0f); // lamp type varies per road (lights.street.alt_color / alt_share)
     }
 }

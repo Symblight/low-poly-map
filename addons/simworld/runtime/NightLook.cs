@@ -54,6 +54,13 @@ public partial class NightLook : Resource
     [Export(PropertyHint.Range, "0.3,1,0.01")] public float TerrainDayFogEndShare { get; set; } = 0.95f;
     [Export] public float TerrainDayFogCurve { get; set; } = 1.7f;
 
+    /// <summary>
+    /// Bloom levels in use: 1/2, 1/4, 1/8 resolution and the 1/16 one, the wide haze around the light carpet (4, the desktop look). A phone sets 3 (no 1/16 pass: a
+    /// smaller halo, one downsample / upsample pass less).
+    /// </summary>
+    [Export(PropertyHint.Range, "1,4,1")] public int GlowLevels { get; set; } = 4;
+    private static readonly float[] GlowLevelStrengths = { 0.6f, 1.0f, 0.8f, 0.5f };
+
     /// <summary>Values written by the last <see cref="Update"/>, for debug overlays.</summary>
     public float GlowThresholdNow { get; private set; }
     public float GlowIntensityNow { get; private set; }
@@ -61,7 +68,7 @@ public partial class NightLook : Resource
     /// <summary>Everything that does not change per frame: bloom levels and the fog setup.</summary>
     public void ApplyStatic(Godot.Environment env)
     {
-        // Bloom: half-resolution first level, three levels (1/2, 1/4, 1/8); no bloom term, so only the threshold decides.
+        // Bloom: half-resolution first level, up to four levels (1/2, 1/4, 1/8, 1/16: GlowLevels); no bloom term, so only the threshold decides.
         env.GlowEnabled = true;
         env.GlowNormalized = false;
         env.GlowBloom = 0f;
@@ -71,10 +78,9 @@ public partial class NightLook : Resource
         env.GlowHdrLuminanceCap = 12f;
         // SetGlowLevel is 0-based (glow_levels/1 == index 0); 7 levels exist.
         for (int i = 0; i < 7; i++) env.SetGlowLevel(i, 0f);
-        env.SetGlowLevel(0, 0.6f); // 1/2 resolution
-        env.SetGlowLevel(1, 1.0f); // 1/4
-        env.SetGlowLevel(2, 0.8f); // 1/8
-        env.SetGlowLevel(3, 0.5f); // 1/16: the wide haze around the light carpet
+        // Each level is one more downsample and upsample pass; the renderer runs only up to the highest level with a strength above 0.
+        int levels = Mathf.Clamp(GlowLevels, 1, GlowLevelStrengths.Length);
+        for (int i = 0; i < levels; i++) env.SetGlowLevel(i, GlowLevelStrengths[i]);
 
         env.FogEnabled = true;
         env.FogMode = Godot.Environment.FogModeEnum.Depth;

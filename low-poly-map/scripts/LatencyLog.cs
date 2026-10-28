@@ -49,6 +49,10 @@ public partial class LatencyLog : Node
         sb.Append("[LatencyLog] ").Append(when).Append(", ").Append((Time.GetTicksMsec() / 1000.0).ToString("0"))
           .Append(" s since start; queued R0..R3 ").Append(string.Join("/", _stats.Queued))
           .Append(", loaded ").Append(string.Join("/", _stats.Loaded)).Append('\n');
+        if (_stats.HasJobs) sb.Append("  jobs: ").Append(_stats.JobsText()).Append('\n');
+        string mem = _stats.MemoryText();
+        if (mem.Length > 0) sb.Append("  memory MB: ").Append(mem).Append('\n');
+        if (_stats.HasLodStats) sb.Append("  data tiles: ").Append(_stats.DataTilesText()).Append('\n');
         if (_stats.Latency.Count == 0) sb.Append("  no latency data (library api < 1.3, or nothing delivered yet)\n");
         else sb.Append("  stage ms p50/p95/max (n), last 128 tiles per band:\n").Append(Indent(_stats.LatencyText()));
         sb.Append("  host upload ms avg/max:");

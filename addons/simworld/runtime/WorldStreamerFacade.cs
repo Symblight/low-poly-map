@@ -172,6 +172,51 @@ public sealed class StreamerStats
     public int ViewHeightPx;
     /// <summary>Data tiles held / decoded so far (detail z14 + overview z11, api 1.10) and requests the scheduler did not send, because the PMTiles directory has no entry / because the camera moves too fast.</summary>
     public long DataTilesLoaded, DataTilesDecoded, RequestsSkippedEmpty, RequestsSkippedMoving;
+    /// <summary>True when debug_stats carries <c>requests_skipped_empty</c> / <c>requests_skipped_moving</c>. The contract (1.10/1.11) does not define them, so a current library never sends them: <see cref="RequestsSkippedEmpty"/> / <see cref="RequestsSkippedMoving"/> stay 0 and the overlay hides the field.</summary>
+    public bool HasRequestsSkipped;
+    /// <summary>Other <c>data_tiles_*</c> keys the library sends beyond loaded / decoded (e.g. a future <c>data_tiles_evicted</c>), as (key, value); reused, rebuilt on every read. Empty when there are none.</summary>
+    public readonly List<KeyValuePair<string, long>> DataTilesExtra = new();
+    /// <summary>True when debug_stats carries the shared job pool counters (<c>jobs_queued</c> / <c>jobs_running</c> / <c>jobs_cancelled</c>, api 1.10; display only).</summary>
+    public bool HasJobs;
+    public long JobsQueued, JobsRunning, JobsCancelled;
+    /// <summary>The library's memory accounting (debug_stats "memory_mb", api 1.10; MiB): every entry the library sends (budget, total, data_tiles, height_tiles, collision, free_buffers, over_budget; names may change in a minor), reused, rebuilt on every read. Empty when the key is absent.</summary>
+    public readonly List<KeyValuePair<string, double>> MemoryMb = new();
+    /// <summary>"queued 42, running 4, cancelled 0", or "" when the library sends no job counters.</summary>
+    public string JobsText() => HasJobs ? $"queued {JobsQueued}, running {JobsRunning}, cancelled {JobsCancelled}" : "";
+
+    /// <summary>"budget 512, total 30.5 (data_tiles 30.5, height_tiles 0) over_budget 0" in MiB, or "" when the library sends no memory accounting. Known names first, other pools after them.</summary>
+    public string MemoryText()
+    {
+        if (MemoryMb.Count == 0) return "";
+        var sb = new System.Text.StringBuilder();
+        foreach (var name in MemoryHead)
+        {
+            double v = Memory(name);
+            if (!double.IsNaN(v)) sb.Append(sb.Length > 0 ? ", " : "").Append(name).Append(' ').Append(v.ToString("0.#"));
+        }
+        foreach (var kv in MemoryMb)
+            if (System.Array.IndexOf(MemoryHead, kv.Key) < 0) sb.Append(sb.Length > 0 ? ", " : "").Append(kv.Key).Append(' ').Append(kv.Value.ToString("0.#"));
+        return sb.ToString();
+    }
+
+    private static readonly string[] MemoryHead = { "budget", "total", "data_tiles", "height_tiles", "over_budget" };
+
+    /// <summary>"loaded 13, decoded 126, evicted 4": the data_tiles_* counters (known ones, then any other the library sends), "" when none.</summary>
+    public string DataTilesText()
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.Append("loaded ").Append(DataTilesLoaded).Append(", decoded ").Append(DataTilesDecoded);
+        foreach (var kv in DataTilesExtra) sb.Append(", ").Append(kv.Key).Append(' ').Append(kv.Value);
+        if (HasRequestsSkipped) sb.Append(", requests skipped: empty ").Append(RequestsSkippedEmpty).Append(", moving ").Append(RequestsSkippedMoving);
+        return sb.ToString();
+    }
+
+    /// <summary>One entry of <see cref="MemoryMb"/> by name, or NaN when the library does not report it.</summary>
+    public double Memory(string name)
+    {
+        foreach (var kv in MemoryMb) if (kv.Key == name) return kv.Value;
+        return double.NaN;
+    }
     /// <summary>True once the library reports the data levels of the tile source (debug_stats "data_levels", api 1.11; absent before the archive opened, for a seed world and on an older library).</summary>
     public bool HasDataLevels;
     /// <summary>Detail and overview zoom of the data tiles; <see cref="TwoLevel"/> = R2/R3 come from the overview level (false = a compatibility archive without simworld_levels); <see cref="LandmarksInArchive"/> = the overview level has a landmarks layer.</summary>
@@ -337,6 +382,10 @@ public sealed class WorldStreamerFacade
     private static readonly StringName KDataTilesDecoded = new("data_tiles_decoded");
     private static readonly StringName KRequestsSkippedEmpty = new("requests_skipped_empty");
     private static readonly StringName KRequestsSkippedMoving = new("requests_skipped_moving");
+    private static readonly StringName KJobsQueued = new("jobs_queued");
+    private static readonly StringName KJobsRunning = new("jobs_running");
+    private static readonly StringName KJobsCancelled = new("jobs_cancelled");
+    private static readonly StringName KMemoryMb = new("memory_mb");
     private static readonly StringName MApiVersion = new("api_version");
     private static readonly StringName KApiMajor = new("api_major");
     private static readonly StringName KApiMinor = new("api_minor");
@@ -925,8 +974,12 @@ public sealed class WorldStreamerFacade
         return v.VariantType == Variant.Type.Dictionary ? v.AsGodotDictionary() : new Dictionary();
     }
 
-    /// <summary>Fills <paramref name="into"/> from debug_stats(). Returns false if unavailable.</summary>
-    public bool DebugStats(StreamerStats into)
+    /// <summary>
+    /// Fills <paramref name="into"/> from debug_stats(). Returns false if unavailable. <paramref name="lodOnly"/> reads just the ring counters, cache / origin / version and the
+    /// screen-space LOD keys (tau_eff, quality, edges, view) and leaves everything else of <paramref name="into"/> untouched: no latency table, memory, jobs, data tile or terrain parsing
+    /// (for the host's 4x per second LOD read, which does not need them).
+    /// </summary>
+    public bool DebugStats(StreamerStats into, bool lodOnly = false)
     {
         if (!IsAvailable) return false;
         var v = _node!.Call(MDebugStats);
@@ -940,7 +993,7 @@ public sealed class WorldStreamerFacade
         if (d.TryGetValue(KOriginLat, out var la)) into.OriginLat = la.AsDouble();
         if (d.TryGetValue(KOriginLon, out var lo)) into.OriginLon = lo.AsDouble();
         if (d.TryGetValue(KVersion, out var ver)) into.Version = ver.AsString();
-        ReadLatency(d, into.Latency);
+        if (!lodOnly) ReadLatency(d, into.Latency);
         into.HasLodStats = d.ContainsKey(KTauEff);
         into.TauEff = d.TryGetValue(KTauEff, out var tau) ? tau.AsDouble() : 0.0;
         into.LodQuality = d.TryGetValue(KLodQuality, out var lq) ? lq.AsDouble() : 1.0;
@@ -952,10 +1005,29 @@ public sealed class WorldStreamerFacade
         }
         into.ViewFovYDeg = d.TryGetValue(KViewFov, out var vf) ? vf.AsDouble() : 0.0;
         into.ViewHeightPx = d.TryGetValue(KViewHeight, out var vh) ? (int)vh.AsInt64() : 0;
+        if (lodOnly) return true;
         into.DataTilesLoaded = d.TryGetValue(KDataTilesLoaded, out var dl) ? dl.AsInt64() : 0;
         into.DataTilesDecoded = d.TryGetValue(KDataTilesDecoded, out var dd) ? dd.AsInt64() : 0;
+        into.HasRequestsSkipped = d.ContainsKey(KRequestsSkippedEmpty) || d.ContainsKey(KRequestsSkippedMoving);
         into.RequestsSkippedEmpty = d.TryGetValue(KRequestsSkippedEmpty, out var se) ? se.AsInt64() : 0;
         into.RequestsSkippedMoving = d.TryGetValue(KRequestsSkippedMoving, out var sm) ? sm.AsInt64() : 0;
+        into.HasJobs = d.ContainsKey(KJobsQueued);
+        into.JobsQueued = d.TryGetValue(KJobsQueued, out var jq) ? jq.AsInt64() : 0;
+        into.JobsRunning = d.TryGetValue(KJobsRunning, out var jr) ? jr.AsInt64() : 0;
+        into.JobsCancelled = d.TryGetValue(KJobsCancelled, out var jc) ? jc.AsInt64() : 0;
+        into.MemoryMb.Clear();
+        if (d.TryGetValue(KMemoryMb, out var mv) && mv.VariantType == Variant.Type.Dictionary)
+            foreach (var kv in mv.AsGodotDictionary())
+                if (kv.Value.VariantType is Variant.Type.Float or Variant.Type.Int) into.MemoryMb.Add(new(kv.Key.AsString(), kv.Value.AsDouble()));
+        into.DataTilesExtra.Clear();
+        foreach (var kv in d)
+        {
+            if (kv.Key.VariantType != Variant.Type.String && kv.Key.VariantType != Variant.Type.StringName) continue;
+            string key = kv.Key.AsString();
+            if (key.StartsWith("data_tiles_", System.StringComparison.Ordinal) && key != "data_tiles_loaded" && key != "data_tiles_decoded"
+                && kv.Value.VariantType is Variant.Type.Int or Variant.Type.Float)
+                into.DataTilesExtra.Add(new(key.Substring(11), kv.Value.AsInt64()));
+        }
         into.HasDataLevels = false;
         if (d.TryGetValue(KDataLevels, out var dlv) && dlv.VariantType == Variant.Type.Dictionary)
         {

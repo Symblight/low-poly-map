@@ -230,6 +230,21 @@ public partial class WorldView : Node3D
     public int PeakActiveTiles { get; private set; }
     /// <summary>Node sets (tile roots) under the pool container: created sets, in use or free.</summary>
     public int TileRootCount => _tileRoot?.GetChildCount() ?? 0;
+    /// <summary>Every node under the vector and terrain pool containers (roots and their children). Diagnostic walk (self-tests): scene node count minus this = nodes that do not belong to the tile pools.</summary>
+    public int PooledNodeCount()
+    {
+        int n = 0;
+        if (_tileRoot != null) n += CountDescendants(_tileRoot);
+        if (_terrainRoot != null) n += CountDescendants(_terrainRoot);
+        return n;
+    }
+
+    private static int CountDescendants(Node node)
+    {
+        int n = 0;
+        foreach (var c in node.GetChildren()) n += 1 + CountDescendants(c);
+        return n;
+    }
 
     private string _lastLoggedStatus = "";
     private string _tileUrl = "";
@@ -771,7 +786,7 @@ public partial class WorldView : Node3D
     /// <summary>Reads <c>lod_edges_m</c>, <c>tau_eff</c>, <c>lod_quality</c> and the view from debug_stats() into the properties above and, when the live R2 to R1 edge moved by more than 5 %, rewrites the cross-fade ranges.</summary>
     public void ReadLod()
     {
-        if (!Streamer.IsAvailable || !Streamer.HasSetView || !Streamer.DebugStats(_lodStats) || !_lodStats.HasLodStats) return;
+        if (!Streamer.IsAvailable || !Streamer.HasSetView || !Streamer.DebugStats(_lodStats, lodOnly: true) || !_lodStats.HasLodStats) return;
         HasLodStats = true;
         TauEff = _lodStats.TauEff;
         LodQuality = _lodStats.LodQuality;

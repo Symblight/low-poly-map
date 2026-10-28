@@ -333,8 +333,10 @@ public partial class DebugOverlay : Control
         if (!_stats.HasLodStats) { sb.Append("  (no LOD stats in debug_stats)\n"); return; }
         sb.Append("  tau_eff ").Append(_stats.TauEff.ToString("0.0")).Append(" px (quality x").Append(_stats.LodQuality.ToString("0.##")).Append(")  edges ")
           .Append(_stats.LodEdgesM[0].ToString("0")).Append('/').Append(_stats.LodEdgesM[1].ToString("0")).Append('/').Append(_stats.LodEdgesM[2].ToString("0")).Append('/').Append(_stats.LodEdgesM[3].ToString("0"))
-          .Append(" m  lib view ").Append(_stats.ViewFovYDeg.ToString("0.#")).Append(" deg / ").Append(_stats.ViewHeightPx).Append(" px  blend D ").Append(Bridge.BlendEdgeM.ToString("0")).Append(" m\n  data tiles ").Append(_stats.DataTilesLoaded).Append(" held / ").Append(_stats.DataTilesDecoded)
-          .Append(" decoded  requests skipped: empty ").Append(_stats.RequestsSkippedEmpty).Append(", moving ").Append(_stats.RequestsSkippedMoving).Append('\n');
+          .Append(" m  lib view ").Append(_stats.ViewFovYDeg.ToString("0.#")).Append(" deg / ").Append(_stats.ViewHeightPx).Append(" px  blend D ").Append(Bridge.BlendEdgeM.ToString("0")).Append(" m\n  data tiles ").Append(_stats.DataTilesText()).Append('\n');
+        if (_stats.HasJobs) sb.Append("jobs: ").Append(_stats.JobsText()).Append('\n');
+        string mem = _stats.MemoryText();
+        if (mem.Length > 0) sb.Append("memory MB: ").Append(mem).Append('\n');
     }
 
     /// <summary>"0.9 px (tau_px 0.9 x scale 1)": the terrain cover's effective screen-space-error threshold (api 1.10: set_terrain_detail is a tau scale, above 1 coarser).</summary>

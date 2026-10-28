@@ -7,7 +7,7 @@ namespace LowPolyMap;
 
 /// <summary>
 /// F3-toggled settings panel (bottom-left; hidden at startup, launch arg <c>--settings-open</c> shows it): flight speed
-/// (live, two-way with <see cref="FreeFlyCamera.Speed"/>), the level of detail (api 1.10: a live "Detail" slider = set_lod_quality, a restart-type
+/// (live, two-way with <see cref="FreeFlyCamera.Speed"/>), the level of detail (api 1.10: a live "Detail" slider = set_lod_quality(1 / detail), right = more detail, a restart-type
 /// "Max distance" = bands.max_distance_m and a read-only readout of the live refine distances; the fixed band edges are gone), the per-ring minimum building height and, with a terrain-capable library (api 1.5), the terrain layer (enable toggle and hills amplitude
 /// apply with the world restart, the detail slider is live through set_terrain_detail without a teleport). Max distance and heights are profile values the library reads at configure time, so
 /// they are applied by <see cref="WorldView.ApplyProfileOverrides"/> (world restart at the camera position): with the
@@ -40,8 +40,10 @@ public partial class SettingsMenu : PanelContainer
     /// <summary>bands.max_distance_m in metres (outer limit of the cover) as shown on the panel (may be ahead of <see cref="AppliedMaxDistance"/>) and as applied.</summary>
     public double MaxDistance => _maxDist;
     public double AppliedMaxDistance => _appliedMaxDist;
-    /// <summary>set_lod_quality scale as shown on the panel (live; the library clamps to 0.25..4) and whether the library has the method (api 1.10).</summary>
+    /// <summary>set_lod_quality scale as shown on the panel (live; the library clamps to 0.25..4; 2 = coarser) and whether the library has the method (api 1.10).</summary>
     public double LodQuality => _quality;
+    /// <summary>The user-facing "Detail" of the vector LOD = 1 / <see cref="LodQuality"/> (the slider's right = more detail).</summary>
+    public double Detail => 1.0 / _quality;
     public bool HasLodQuality { get; private set; }
     /// <summary>True when the profile has bands.max_distance_m (profile_version 7).</summary>
     public bool HasMaxDistance { get; private set; }
@@ -66,8 +68,10 @@ public partial class SettingsMenu : PanelContainer
     public bool AppliedTerrainOn => _appliedTerrainOn;
     public double TerrainAmplitude => _terrainAmp;
     public double AppliedTerrainAmplitude => _appliedTerrainAmp;
-    /// <summary>set_terrain_detail scale as shown on the panel (live).</summary>
+    /// <summary>set_terrain_detail scale as shown on the panel (live; the raw library scale, above 1 = coarser).</summary>
     public double TerrainDetailScale => _terrainDetail;
+    /// <summary>The user-facing "Terrain detail" = 1 / <see cref="TerrainDetailScale"/> (the slider's right = more detail, above 1 is expensive).</summary>
+    public double TerrainDetailLevel => 1.0 / _terrainDetail;
 
     private const double TerrainAmpMax = 3000.0, TerrainAmpDefault = 160.0, TerrainDetailMin = 0.25;
     private bool _terrainOn, _appliedTerrainOn;
@@ -82,7 +86,7 @@ public partial class SettingsMenu : PanelContainer
     private double _quality = 1.0;
     private bool _qualityDirty;
     private double _qualityTimer;
-    private Label _lodLabel = null!;
+    private Label _lodLabel = null!, _terrainLabel = null!;
     private readonly double[] _minH = new double[3];
     private readonly double[] _appliedMinH = new double[3];
     private const int LightRingDefault = 2;
@@ -139,10 +143,11 @@ public partial class SettingsMenu : PanelContainer
 
         // -- level of detail: screen-space error (api 1.10). Quality is live, the maximum distance restarts the world.
         AddHeading(col, "Level of detail (screen-space error)", ResetRange);
-        (_qualitySlider, _qualityBox) = AddRow(col, "Detail (tau x)", System.Math.Log10(QualityMin), System.Math.Log10(QualityMax), 0.001, QualityMin, QualityMax, 0.05, "x");
-        _qualityBox.TooltipText = "set_lod_quality: multiplies the pixel error threshold tau; 2 halves every refine distance (coarser, fewer tiles), 0.5 doubles them; live, no restart";
-        _qualitySlider.ValueChanged += v => { if (!_syncing) SetQuality(System.Math.Round(System.Math.Pow(10, v), 2)); };
-        _qualityBox.ValueChanged += v => { if (!_syncing) SetQuality(v); };
+        // Right = more detail. The slider value d is the user-facing detail; the library gets scale = 1 / d (set_lod_quality, which multiplies tau).
+        (_qualitySlider, _qualityBox) = AddRow(col, "Detail", System.Math.Log10(1.0 / QualityMax), System.Math.Log10(1.0 / QualityMin), 0.001, 1.0 / QualityMax, 1.0 / QualityMin, 0.01, "x");
+        _qualityBox.TooltipText = "Level of detail of the buildings and ground: set_lod_quality(1 / detail). 1 = profile; 2 doubles every refine distance (finer, more tiles), 0.5 halves them (coarser, fewer tiles); live, no restart";
+        _qualitySlider.ValueChanged += v => { if (!_syncing) SetDetail(System.Math.Round(System.Math.Pow(10, v), 2)); };
+        _qualityBox.ValueChanged += v => { if (!_syncing) SetDetail(v); };
         (_maxSlider, _maxBox) = AddRow(col, "Max distance", System.Math.Log10(MaxDistMinM), System.Math.Log10(MaxDistMaxM), 0.001, MaxDistMinM, MaxDistMaxM, 1, " m");
         _maxBox.TooltipText = "bands.max_distance_m: how far the cover reaches (R3 edge); applies with the world restart";
         _maxSlider.ValueChanged += v => { if (!_syncing) SetMaxDistance(RoundDistance(System.Math.Pow(10, v))); };
@@ -176,13 +181,15 @@ public partial class SettingsMenu : PanelContainer
         (_ampSlider, _ampBox) = AddRow(col, "Hills amplitude", 0, TerrainAmpMax, 10, 0, TerrainAmpMax, 10, " m");
         _ampSlider.ValueChanged += v => { if (!_syncing) SetTerrainAmplitude(v); };
         _ampBox.ValueChanged += v => { if (!_syncing) SetTerrainAmplitude(v); };
-        // set_terrain_detail is a scale of the terrain cover's screen-space-error threshold (tau = terrain.tau_px x scale, api 1.10), the same convention as the
-        // vector "Detail (tau x)" row above: the raw scale, log slider, right = COARSER. So it is labelled coarseness, not detail.
-        (_detailSlider, _detailBox) = AddRow(col, "Terrain coarseness", System.Math.Log10(TerrainDetailMin), System.Math.Log10(2.0), 0.001, TerrainDetailMin, 8.0, 0.05, "x");
-        _detailBox.TooltipText = "set_terrain_detail: scale of the terrain error threshold (terrain.tau_px x this). 1 = profile, above 1 = COARSER (fewer, larger tiles, cheaper), "
-            + "below 1 = FINER and expensive: 0.5 roughly doubles the tiles, 0.25 (the minimum) is about 2300 tiles and can stall the streaming and the draw call budget. Live, no restart; the cover changes through ordinary swaps";
-        _detailSlider.ValueChanged += v => { if (!_syncing) SetTerrainDetail(System.Math.Round(System.Math.Pow(10, v), 2)); };
-        _detailBox.ValueChanged += v => { if (!_syncing) SetTerrainDetail(v); };
+        // set_terrain_detail is a scale of the terrain cover's screen-space-error threshold (tau = terrain.tau_px x scale, api 1.10), above 1 = coarser. The slider
+        // shows the user-facing detail d = 1 / scale (right = more detail, like the vector row above); the range follows the library clamp: scale 0.25..detail_scale_max.
+        (_detailSlider, _detailBox) = AddRow(col, "Terrain detail", System.Math.Log10(1.0 / 2.0), System.Math.Log10(1.0 / TerrainDetailMin), 0.001, 1.0 / 2.0, 1.0 / TerrainDetailMin, 0.01, "x");
+        _detailBox.TooltipText = "Terrain level of detail: set_terrain_detail(1 / detail) (tau = terrain.tau_px x scale). 1 = profile; below 1 = coarser (fewer, larger tiles, cheaper); "
+            + "ABOVE 1 IS EXPENSIVE: 2 roughly doubles the terrain tiles, 4 (the maximum, scale 0.25) is about 2300 tiles and can stall the streaming and the draw call budget. Live, no restart; the cover changes through ordinary swaps";
+        _detailSlider.ValueChanged += v => { if (!_syncing) SetTerrainDetailLevel(System.Math.Round(System.Math.Pow(10, v), 2)); };
+        _detailBox.ValueChanged += v => { if (!_syncing) SetTerrainDetailLevel(v); };
+        _terrainLabel = new Label { AutowrapMode = TextServer.AutowrapMode.WordSmart, CustomMinimumSize = new Vector2(Width - 20, 0), Modulate = new Color(1f, 1f, 1f, 0.75f) };
+        col.AddChild(_terrainLabel);
 
         // -- apply
         var applyRow = new HBoxContainer();
@@ -274,8 +281,8 @@ public partial class SettingsMenu : PanelContainer
     private void SyncWidgets()
     {
         _syncing = true;
-        _qualitySlider.SetValueNoSignal(System.Math.Log10(_quality));
-        _qualityBox.SetValueNoSignal(_quality);
+        _qualitySlider.SetValueNoSignal(-System.Math.Log10(_quality));
+        _qualityBox.SetValueNoSignal(System.Math.Round(1.0 / _quality, 3));
         _maxSlider.SetValueNoSignal(System.Math.Log10(_maxDist));
         _maxBox.SetValueNoSignal(_maxDist);
         for (int i = 0; i < 3; i++)
@@ -288,10 +295,10 @@ public partial class SettingsMenu : PanelContainer
         _terrainCheck.SetPressedNoSignal(_terrainOn);
         _ampSlider.SetValueNoSignal(_terrainAmp);
         _ampBox.SetValueNoSignal(_terrainAmp);
-        _detailSlider.MaxValue = System.Math.Log10(_terrainDetailMax);
-        _detailSlider.SetValueNoSignal(System.Math.Log10(System.Math.Clamp(_terrainDetail, TerrainDetailMin, _terrainDetailMax)));
-        _detailBox.MaxValue = _terrainDetailMax;
-        _detailBox.SetValueNoSignal(_terrainDetail);
+        _detailSlider.MinValue = -System.Math.Log10(_terrainDetailMax);
+        _detailSlider.SetValueNoSignal(-System.Math.Log10(System.Math.Clamp(_terrainDetail, TerrainDetailMin, _terrainDetailMax)));
+        _detailBox.MinValue = 1.0 / _terrainDetailMax;
+        _detailBox.SetValueNoSignal(System.Math.Round(1.0 / _terrainDetail, 3));
         _syncing = false;
     }
 
@@ -333,7 +340,14 @@ public partial class SettingsMenu : PanelContainer
         MarkDirty();
     }
 
-    /// <summary>set_lod_quality, live (no restart, no teleport): the pixel error threshold multiplier, clamped to 0.25..4; debounced 0.3 s while the slider moves.</summary>
+    /// <summary>The user-facing detail (0.25..4, right = more detail): sets the quality scale 1 / <paramref name="detail"/>.</summary>
+    public void SetDetail(double detail)
+    {
+        if (!(detail > 0.0) || double.IsInfinity(detail)) return;
+        SetQuality(1.0 / detail);
+    }
+
+    /// <summary>set_lod_quality, live (no restart, no teleport): the pixel error threshold multiplier (the raw library scale, 2 = coarser), clamped to 0.25..4; debounced 0.3 s while the slider moves.</summary>
     public void SetQuality(double scale)
     {
         if (!HasLodQuality) return;
@@ -400,7 +414,14 @@ public partial class SettingsMenu : PanelContainer
         MarkDirty();
     }
 
-    /// <summary>set_terrain_detail, live (no restart): the scale of the terrain cover's error threshold, clamped to 0.25..detail_scale_max; above 1 is coarser, below 1 finer and expensive. The cover follows through ordinary swaps; debounced 0.3 s while the slider moves.</summary>
+    /// <summary>The user-facing terrain detail (1 / detail_scale_max..4, right = more detail, above 1 expensive): sets the terrain scale 1 / <paramref name="detail"/>.</summary>
+    public void SetTerrainDetailLevel(double detail)
+    {
+        if (!(detail > 0.0) || double.IsInfinity(detail)) return;
+        SetTerrainDetail(1.0 / detail);
+    }
+
+    /// <summary>set_terrain_detail, live (no restart): the raw library scale of the terrain cover's error threshold, clamped to 0.25..detail_scale_max; above 1 is coarser, below 1 finer and expensive. The cover follows through ordinary swaps; debounced 0.3 s while the slider moves.</summary>
     public void SetTerrainDetail(double scale)
     {
         if (!HasTerrain) return;
@@ -604,7 +625,16 @@ public partial class SettingsMenu : PanelContainer
         if (Bridge != null && Bridge.HasLodStats)
         {
             var e = Bridge.LodEdgesM;
-            _lodLabel.Text = $"live: tau {Bridge.TauEff:0.##} px, fov {Bridge.LibraryViewFovYDeg:0.#} deg, H {Bridge.LibraryViewHeightPx} px\nrefine distances R0|R1|R2: {e[0]:0}|{e[1]:0}|{e[2]:0} m, max {e[3]:0} m";
+            _lodLabel.Text = $"live: detail x{1.0 / System.Math.Max(Bridge.LodQuality, 1e-6):0.##}, tau {Bridge.TauEff:0.##} px, fov {Bridge.LibraryViewFovYDeg:0.#} deg, H {Bridge.LibraryViewHeightPx} px\nrefine distances R0|R1|R2: {e[0]:0}|{e[1]:0}|{e[2]:0} m, max {e[3]:0} m";
+        }
+
+        if (_terrainLabel != null)
+        {
+            _terrainLabel.Visible = HasTerrain;
+            if (HasTerrain)
+                _terrainLabel.Text = Bridge != null && Bridge.TerrainActive
+                    ? $"live: terrain detail x{1.0 / System.Math.Max(Bridge.TerrainDetail, 1e-6):0.##}" + (Bridge.TerrainTauPx > 0 ? $", tau {Bridge.TerrainTauEff:0.##} px (terrain.tau_px {Bridge.TerrainTauPx:0.##} x scale {Bridge.TerrainDetail:0.##})" : "")
+                    : "terrain layer off";
         }
 
         _statsTimer -= delta;
@@ -677,13 +707,24 @@ public partial class SettingsMenu : PanelContainer
         }, timeoutS);
     }
 
+    private const int NodeGrowthSlack = 8;
+
+    /// <summary>Number of alternating A/B applies of <c>--settings-selftest</c>: 11 by default, <c>--settings-selftest-applies=&lt;n&gt;</c> (4..500) for a leak run.</summary>
+    private static int SelfTestApplies()
+    {
+        foreach (var a in OS.GetCmdlineUserArgs())
+            if (a.StartsWith("--settings-selftest-applies=", System.StringComparison.Ordinal) && int.TryParse(a.Substring(28), out var n))
+                return System.Math.Clamp(n, 4, 500);
+        return 11;
+    }
+
     private async void RunSelfTest()
     {
         var fails = new List<string>();
         try { await SelfTestBody(fails); }
         catch (System.Exception e) { fails.Add("exception: " + e.Message); }
         GD.Print(fails.Count == 0
-            ? "SETTINGS SELFTEST PASS: 12 reconfigures (1 via widgets, 11 alternating), one rejected profile, no pool growth, origin kept, tiles released and reloaded each time"
+            ? $"SETTINGS SELFTEST PASS: {1 + SelfTestApplies()} reconfigures (1 via widgets, {SelfTestApplies()} alternating), one rejected profile, no pool growth, origin kept, tiles released and reloaded each time, no scene node growth outside the pools"
             : "SETTINGS SELFTEST FAIL: " + string.Join("; ", fails));
         GetTree().Quit(fails.Count == 0 ? 0 : 1);
     }
@@ -733,7 +774,7 @@ public partial class SettingsMenu : PanelContainer
             bridge.ReadLod();
             double[] e0 = (double[])bridge.LodEdgesM.Clone();
             int rc0 = bridge.ReconfigureCount;
-            _qualitySlider.Value = System.Math.Log10(2.0);
+            _qualitySlider.Value = System.Math.Log10(0.5); // detail 0.5 = scale 2 = coarser
             await Delay(1.0);
             bridge.ReadLod();
             for (int i = 0; i < 3; i++)
@@ -742,11 +783,24 @@ public partial class SettingsMenu : PanelContainer
             if (System.Math.Abs(bridge.LodQuality - 2.0) > 1e-9 || System.Math.Abs(bridge.TauEff - 8.0) > 0.01) fails.Add($"quality x2: library quality {bridge.LodQuality}, tau_eff {bridge.TauEff} (expected 2 and 8 px)");
             if (bridge.ReconfigureCount != rc0 || ApplyInFlight) fails.Add("the quality slider caused a reconfigure");
             GD.Print($"[SelfTest] quality x2 live: edges {e0[0]:0}/{e0[1]:0}/{e0[2]:0}/{e0[3]:0} -> {bridge.LodEdgesM[0]:0}/{bridge.LodEdgesM[1]:0}/{bridge.LodEdgesM[2]:0}/{bridge.LodEdgesM[3]:0} m, tau_eff {bridge.TauEff:0.##} px, no reconfigure");
+            if (System.Math.Abs(Detail - 0.5) > 1e-9 || System.Math.Abs(_qualityBox.Value - 0.5) > 1e-6) fails.Add($"detail slider 0.5: panel detail {Detail}, box {_qualityBox.Value}");
             _qualityBox.Value = 1.0;
             await Delay(1.0);
             bridge.ReadLod();
             for (int i = 0; i < 3; i++)
                 if (System.Math.Abs(bridge.LodEdgesM[i] / e0[i] - 1.0) > 0.01) fails.Add($"quality x1 (box): R{i} edge {bridge.LodEdgesM[i]:0.#} m, expected back to {e0[i]:0.#}");
+            // Right = more detail: detail 2 (box) = scale 0.5 = every refine distance doubles (clamped to the max distance), tau_eff halves.
+            _qualityBox.Value = 2.0;
+            await Delay(1.0);
+            bridge.ReadLod();
+            if (System.Math.Abs(bridge.LodQuality - 0.5) > 1e-9 || System.Math.Abs(bridge.TauEff - 2.0) > 0.01) fails.Add($"detail 2 (box): library quality {bridge.LodQuality}, tau_eff {bridge.TauEff} (expected 0.5 and 2 px)");
+            for (int i = 0; i < 3; i++)
+                if (bridge.LodEdgesM[i] < e0[i] * 1.5 && bridge.LodEdgesM[i] < bridge.LodEdgesM[3] - 1) fails.Add($"detail 2 (box): R{i} edge {bridge.LodEdgesM[i]:0.#} m, expected about double {e0[i]:0.#}");
+            GD.Print($"[SelfTest] detail 2 (finer) live: edges -> {bridge.LodEdgesM[0]:0}/{bridge.LodEdgesM[1]:0}/{bridge.LodEdgesM[2]:0}/{bridge.LodEdgesM[3]:0} m, tau_eff {bridge.TauEff:0.##} px");
+            _qualitySlider.Value = 0.0;
+            await Delay(1.0);
+            bridge.ReadLod();
+            if (System.Math.Abs(bridge.LodQuality - 1.0) > 1e-9) fails.Add($"detail 1 (slider): library quality {bridge.LodQuality}, expected 1");
             await WaitIdle(150);
         }
 
@@ -763,7 +817,10 @@ public partial class SettingsMenu : PanelContainer
         cam.GlobalPosition = new Vector3(1500f, cam.GlobalPosition.Y, -800f);
         await Delay(0.5);
 
-        for (int k = 0; k < 11; k++)
+        int applies = SelfTestApplies();
+        var nodeSeries = new List<int>();
+        var otherSeries = new List<int>();
+        for (int k = 0; k < applies; k++)
         {
             bool a = k % 2 == 0;
             var minH = a ? minA : minB;
@@ -821,6 +878,11 @@ public partial class SettingsMenu : PanelContainer
                 if (bridge.TerrainCover.Loaded == 0) fails.Add($"apply {k}: no terrain tile after the restart");
             }
             if (k == 1) rootsWarm = bridge.TileRootCount;
+            int nodesNow = (int)Performance.GetMonitor(Performance.Monitor.ObjectNodeCount);
+            nodeSeries.Add(nodesNow);
+            otherSeries.Add(nodesNow - bridge.PooledNodeCount());
+            GD.Print($"[SelfTest] apply {k} nodes: scene {nodesNow}, objects {(int)Performance.GetMonitor(Performance.Monitor.ObjectCount)}, orphans {(int)Performance.GetMonitor(Performance.Monitor.ObjectOrphanNodeCount)}, "
+                + $"outside pools {otherSeries[^1]}, tile roots {bridge.TileRootCount}, pool created {bridge.PoolCreated} free {bridge.PoolFree}, terrain pool created {bridge.TerrainPoolCreated} free {bridge.TerrainPoolFree}");
             if (a) loadedA = bridge.Cover.Loaded; else loadedB = bridge.Cover.Loaded;
         }
 
@@ -849,6 +911,16 @@ public partial class SettingsMenu : PanelContainer
         int nodesEnd = (int)Performance.GetMonitor(Performance.Monitor.ObjectNodeCount);
         GD.Print($"[SelfTest] tile pool: {roots} node sets at the end (after first A+B: {rootsWarm}, peak tiles held {bridge.PeakActiveTiles}, prewarmed 24), "
             + $"{bridge.PoolCreated - bridge.PoolFree} in use; scene nodes {nodesBase} -> {nodesEnd}; last A loaded {loadedA}, last B loaded {loadedB}");
+        // Scene nodes outside the tile pools: pooled tiles may grow to a high-water mark during the first applies (that is not a leak), but nothing else may be created per reconfigure.
+        if (nodeSeries.Count > 4)
+        {
+            int hw = 0;
+            for (int i = 0; i < 4; i++) hw = System.Math.Max(hw, otherSeries[i]);
+            int worst = hw;
+            for (int i = 4; i < otherSeries.Count; i++) worst = System.Math.Max(worst, otherSeries[i]);
+            GD.Print($"[SelfTest] scene nodes per apply: {string.Join(" ", nodeSeries)}; outside the tile pools: {string.Join(" ", otherSeries)}; high-water of the first 4 applies {hw}, max afterwards {worst} (allowed +{NodeGrowthSlack})");
+            if (worst > hw + NodeGrowthSlack) fails.Add($"scene nodes outside the tile pools grew after the warm-up: {worst} vs {hw} in the first four applies (leak of {worst - hw} nodes over {nodeSeries.Count} applies)");
+        }
         if (roots > rootsWarm * 1.15 + 8) fails.Add($"tile pool grew from {rootsWarm} (after the first A+B) to {roots} node sets");
         if (roots != peak) fails.Add($"tile pool has {roots} node sets, expected exactly the peak {peak} (leak or double allocation)");
         if (loadedA >= loadedB) fails.Add($"config A (max distance 6000, quality x2) loaded {loadedA} tiles, not fewer than config B's {loadedB}: the ranges had no effect");

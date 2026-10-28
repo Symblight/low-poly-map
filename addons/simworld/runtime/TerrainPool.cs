@@ -135,7 +135,7 @@ public sealed class TerrainPool
 
     /// <summary>
     /// Uploads the terrain mesh (VERTEX + INDEX, NORMAL with smooth shading) into the tile's reused ArrayMesh, replacing the previous
-    /// surface (re-delivery under the same key, e.g. after set_terrain_detail). Null = nothing usable: the instance is hidden.
+    /// surface (a re-delivery under the same key is not expected since api 1.10, handled anyway). Null = nothing usable: the instance is hidden.
     /// </summary>
     public void SetMesh(TerrainNodes t, Godot.Collections.Array? arrays, float hMin, float hMax)
     {

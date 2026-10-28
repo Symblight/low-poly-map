@@ -10,7 +10,7 @@ namespace SimWorld;
 /// swapped in as a whole, so the old patch keeps working meanwhile) and moves with every origin shift (<see cref="Shift"/>); a HeightMapShape3D has unit
 /// sample spacing, so the body is scaled in x / z by the spacing (y scale stays 1).
 /// <para>The surface is the exact heightfield interpolated linearly between the samples: it differs from the drawn terrain triangles by up to the band's
-/// <c>max_error_m x detail</c> (plus the interpolation error between samples, which grows with the spacing). There is no collision for buildings or for terrain
+/// <c>max_error_m</c> (plus the interpolation error between samples, which grows with the spacing). There is no collision for buildings or for terrain
 /// beyond the patch; with the terrain layer off the ground is flat at 0 m.</para>
 /// </summary>
 public sealed class TerrainCollision

@@ -68,6 +68,14 @@ public partial class WorldView : Node3D
     /// <summary>Distance between collision samples in metres (default 40, so the 33 x 33 patch is about 1.3 km wide).</summary>
     [Export] public float TerrainCollisionSpacingM { get; set; } = 40f;
 
+    /// <summary>
+    /// Host opt-in for the landmark layer (api 1.11, contract 9b), default true: adds <c>"landmarks"</c> to <c>layers</c> on every configure and
+    /// reconfigure when the library has it, and draws the <c>l/z/x/y</c> tiles it then delivers (buildings of 60 m or more of a two-level archive, one
+    /// tile per overview tile, flat set, visible while uploaded, never faded). Off, or on a library below 1.11, the landmarks stay inside the vector
+    /// chunks of every band, exactly as before and no <c>l/</c> key ever arrives. Set before <see cref="Start"/>; change it later through <see cref="ApplyProfileOverrides"/>.
+    /// </summary>
+    [Export] public bool LandmarksEnabled { get; set; } = true;
+
     /// <summary>True when this view runs a seed world (api 1.7): <see cref="SeedWorld"/> was set and the library has the phase S1 API.</summary>
     public bool SeedWorldActive { get; private set; }
     /// <summary>seed_world_info() as read after the last configure; null without a seed world.</summary>
@@ -95,6 +103,23 @@ public partial class WorldView : Node3D
     /// <summary>Human readable tile source actually in use.</summary>
     public string TileSource { get; private set; } = "";
     public TileCover Cover { get; } = new();
+    /// <summary>Landmark layer tile map (api 1.11): a flat set keyed by the "l/z/x/y" key (zoom = the archive's overview zoom). Empty unless <see cref="LandmarksActive"/>.</summary>
+    public LandmarkCover LandmarkCover { get; } = new();
+    /// <summary>True when this view asked for the landmark layer in the last configure (<see cref="LandmarksEnabled"/> and a library with api 1.11). Whether tiles come depends on the archive (a compatibility archive or the seed world has none).</summary>
+    public bool LandmarksActive { get; private set; }
+    /// <summary>Landmark ready deliveries, unloads, and "l/" keys seen in poll_ready, poll_fades or poll_unload since start (the library must never put one in poll_fades, nor send any to a host that did not opt in).</summary>
+    public int LandmarkReadyTotal { get; private set; }
+    public int LandmarkReplacedTotal { get; private set; }
+    public int LandmarkUnloadedTotal { get; private set; }
+    public int LandmarkKeysSeen { get; private set; }
+    public int LandmarkFadeKeysSeen { get; private set; }
+    /// <summary>Per landmark tile upload cost in microseconds: last, max, sum and count.</summary>
+    public long LandmarkUploadUsLast { get; private set; }
+    public long LandmarkUploadUsMax { get; private set; }
+    public long LandmarkUploadUsSum { get; private set; }
+    public int LandmarkUploadCount { get; private set; }
+    /// <summary>Landmark tile node sets handed out by the pool (held).</summary>
+    public int LandmarkNodesHeld => LandmarkCover.Loaded;
     /// <summary>Terrain layer tile map (api 1.5): its own quadtree, root / leaf zoom from the profile (terrain.far_zoom / near_zoom, default 10..14),
     /// ring statistics for 5 rings. Empty unless <see cref="TerrainActive"/>.</summary>
     public TileCover TerrainCover { get; } = new(10, 14);
@@ -112,6 +137,9 @@ public partial class WorldView : Node3D
     public int TerrainRingCount => TerrainActive ? TerrainCover.Rings : 0;
     /// <summary>The set_terrain_detail scale in effect (1 = profile).</summary>
     public double TerrainDetail { get; private set; } = 1.0;
+    /// <summary>Profile <c>terrain.tau_px</c> (the terrain cover's screen-space-error threshold before the <see cref="TerrainDetail"/> scale; 0 on a library without it) and the effective tau = tau_px x scale.</summary>
+    public double TerrainTauPx { get; private set; }
+    public double TerrainTauEff => TerrainTauPx * TerrainDetail;
     /// <summary>Terrain ready deliveries (first and re-deliveries), re-deliveries replaced in place, and unloads.</summary>
     public int TerrainReadyTotal { get; private set; }
     public int TerrainReplacedTotal { get; private set; }
@@ -125,8 +153,8 @@ public partial class WorldView : Node3D
     public readonly int[] TerrainUploadCount = new int[StreamerStats.TerrainRingsMax];
     /// <summary>The ground collision helper; null while <see cref="TerrainCollisionEnabled"/> is off.</summary>
     public TerrainCollision? TerrainCollision => _collision;
-    /// <summary>Tiles held in both layers.</summary>
-    public int TotalLoaded => Cover.Loaded + TerrainCover.Loaded;
+    /// <summary>Tiles held in all layers.</summary>
+    public int TotalLoaded => Cover.Loaded + TerrainCover.Loaded + LandmarkCover.Loaded;
 
     // Overlay counters.
     public long UploadUsLastFrame { get; private set; }
@@ -198,7 +226,7 @@ public partial class WorldView : Node3D
     public string LastReconfigureError { get; private set; } = "";
     /// <summary>True from <see cref="ApplyProfileOverrides"/> until the next frame start runs it.</summary>
     public bool ReconfigurePending => _pendingOverrides != null;
-    /// <summary>Highest <see cref="ActiveTiles"/> seen (checked against the pool size by the settings self-test).</summary>
+    /// <summary>Highest number of pooled tile node sets in use at once (vector tiles plus landmark tiles, since both come from the same pool; checked against the pool size by the settings self-test).</summary>
     public int PeakActiveTiles { get; private set; }
     /// <summary>Node sets (tile roots) under the pool container: created sets, in use or free.</summary>
     public int TileRootCount => _tileRoot?.GetChildCount() ?? 0;
@@ -219,6 +247,7 @@ public partial class WorldView : Node3D
     private TerrainCollision? _collision;
     private bool _loggedFirstTerrainTile;
     private bool _warnedNoTerrainLayer;
+    private bool _loggedNoLandmarks;
     private readonly HashSet<long> _pendingRootsT = new();
     private readonly HashSet<long> _suspectRootsT = new();
     private float _emissionLevel = 1f;
@@ -589,7 +618,7 @@ public partial class WorldView : Node3D
         WorldStreamerFacade.AddSeedWorld(options, path);
     }
 
-    /// <summary>Adds the <c>layers</c> opt-in when the host wants the terrain and the library has it (api 1.5); warns once when it has not.</summary>
+    /// <summary>Adds the <c>layers</c> opt-in: <c>terrain</c> when the host wants it and the library has it (api 1.5; warns once when it has not) and <c>landmarks</c> when <see cref="LandmarksEnabled"/> and the library has the layer (api 1.11).</summary>
     private void AddTerrainLayerOption(Godot.Collections.Dictionary options)
     {
         bool want = EnableTerrain;
@@ -599,7 +628,14 @@ public partial class WorldView : Node3D
             _warnedNoTerrainLayer = true;
             want = false;
         }
-        WorldStreamerFacade.AddLayers(options, want);
+        bool landmarks = LandmarksEnabled && Streamer.HasLandmarkLayer;
+        if (LandmarksEnabled && !landmarks && !_loggedNoLandmarks)
+        {
+            _loggedNoLandmarks = true;
+            GD.Print($"[WorldView] landmark layer off: library api {Streamer.ApiVersionText} has none (needs 1.{WorldStreamerFacade.LandmarksMinApiMinor}); landmarks stay inside the vector tiles");
+        }
+        LandmarksActive = landmarks;
+        WorldStreamerFacade.AddLayers(options, want, landmarks);
         // Keep the flat zone (and so the relief) where the first configure put it: a reconfigure may move the origin (api 1.6).
         WorldStreamerFacade.AddTerrainCenter(options, want && Streamer.HasTerrainActiveFlag, OriginLat, OriginLon);
     }
@@ -609,6 +645,7 @@ public partial class WorldView : Node3D
     {
         TerrainActive = false;
         TerrainReachM = 0f;
+        TerrainTauPx = 0.0;
         if (EnableTerrain && Streamer.HasTerrainLayer
             && profile.TryGetValue("terrain", out var tv) && tv.VariantType == Variant.Type.Dictionary)
         {
@@ -631,6 +668,7 @@ public partial class WorldView : Node3D
                         && bands[bands.Count - 1].AsGodotDictionary().TryGetValue("edge_m", out var edge))
                         TerrainReachM = (float)edge.AsDouble();
                 }
+                TerrainTauPx = t.TryGetValue("tau_px", out var tau) ? tau.AsDouble() : 0.0;
                 TerrainActive = true;
                 // Curved terrain sinks below its flat AABB by d^2/2R up to the far plane / the terrain reach: widen the cull box accordingly.
                 double farM = System.Math.Max(Camera?.Far ?? 0f, TerrainReachM * 1.15);
@@ -646,9 +684,10 @@ public partial class WorldView : Node3D
     }
 
     /// <summary>
-    /// terrain detail (api 1.5): multiplies every terrain band's max_error_m by <paramref name="scale"/> (the library clamps to [0.25, terrain.detail_scale_max]).
-    /// Held terrain tiles are re-delivered under the same keys and replaced in place; no teleport, the vector world is untouched.
-    /// Returns the scale in effect (NaN on a library without the method).
+    /// set_terrain_detail: a scale of the terrain cover's screen-space-error threshold (tau = <c>terrain.tau_px</c> x scale; the library clamps to
+    /// [0.25, terrain.detail_scale_max]). Above 1 is coarser (fewer, larger tiles), below 1 finer and much more expensive (0.25 is about 2300 tiles).
+    /// Since api 1.10 the cover follows through ordinary refines / coarsens (new keys, fades, unloads): held tiles are not re-delivered. No teleport, the
+    /// vector world is untouched. Returns the scale in effect (NaN on a library without the method).
     /// </summary>
     public double SetTerrainDetail(double scale)
     {
@@ -660,6 +699,14 @@ public partial class WorldView : Node3D
     private void AfterConfigure()
     {
         _viewForce = true; // a new world starts with the library's default view: send ours with the next frame
+        if (LandmarkCover.Loaded != 0)
+        {
+            GD.PushError($"[WorldView] landmark tile map still holds {LandmarkCover.Loaded} tiles at configure; releasing them");
+            _dropScratch.Clear();
+            foreach (var n in LandmarkCover.All) _dropScratch.Add(n.Packed);
+            for (int i = 0; i < _dropScratch.Count; i++) ReleaseLandmarkTile(_dropScratch[i]);
+            _dropScratch.Clear();
+        }
         Status = Streamer.Status();
         if (Attributions.Length == 0) Attributions = Streamer.Attributions();
         if (Attributions.Length > 0) GD.Print($"[WorldView] attribution: {string.Join(" | ", Attributions)}");
@@ -907,6 +954,7 @@ public partial class WorldView : Node3D
                 _source.ApplyOriginShift(shift);
                 Cover.Shift(shift);
                 TerrainCover.Shift(shift);
+                LandmarkCover.Shift(shift);
                 _collision?.Shift(shift);
                 if (SeedWorldActive) RefreshSeed(false); // airport positions follow the floating origin
                 OriginShifted?.Invoke(shift);
@@ -917,7 +965,7 @@ public partial class WorldView : Node3D
             // Poll one tile at a time so a single heavy tile cannot drag a second one into the same
             // frame: stop as soon as the budget is spent (Rust keeps the rest queued).
             long t0 = (long)Time.GetTicksUsec();
-            int n0 = ReadyTotal;
+            int n0 = ReadyTotal + LandmarkReadyTotal;
             for (int n = 0; n < _settings.MaxTilesPerFrame; n++)
             {
                 var ready = Streamer.PollReady(1);
@@ -926,6 +974,7 @@ public partial class WorldView : Node3D
                 {
                     if (!WorldStreamerFacade.TryParseReady(d, out var tile)) continue;
                     if (tile.IsTerrain) UploadTerrainTile(in tile);
+                    else if (tile.IsLandmark) UploadLandmarkTile(in tile);
                     else UploadTile(in tile);
                 }
                 if ((long)Time.GetTicksUsec() - t0 >= _settings.UploadBudgetUs) break;
@@ -934,7 +983,7 @@ public partial class WorldView : Node3D
             var unload = Streamer.PollUnload();
             for (int i = 0; i < unload.Length; i++) UnloadTile(unload[i]);
             UploadUsLastFrame = (long)Time.GetTicksUsec() - t0;
-            if (n0 != ReadyTotal) { UploadFrames++; if (UploadUsLastFrame > _settings.UploadBudgetUs) UploadFramesOverBudget++; }
+            if (n0 != ReadyTotal + LandmarkReadyTotal) { UploadFrames++; if (UploadUsLastFrame > _settings.UploadBudgetUs) UploadFramesOverBudget++; }
             if (UploadUsLastFrame > _secUploadMax) _secUploadMax = UploadUsLastFrame;
             UpdateCollision();
             _markings?.Update(_source.GlobalPosition, delta);
@@ -981,7 +1030,9 @@ public partial class WorldView : Node3D
             foreach (var kv in fades)
             {
                 entries++;
-                if (!TileKey.TryParse(kv.Key.AsString(), out long packed, out bool terrainKey)) continue;
+                if (!TileKey.TryParse(kv.Key.AsString(), out long packed, out TileLayer fadeLayer)) continue;
+                if (fadeLayer == TileLayer.Landmarks) { LandmarkKeysSeen++; LandmarkFadeKeysSeen++; continue; } // contract 9b: never listed; a stray key is counted (CoverSelfTest) and ignored
+                bool terrainKey = fadeLayer == TileLayer.Terrain;
                 if (terrainKey) TerrainKeysSeen++;
                 var cover = terrainKey ? TerrainCover : Cover;
                 // A tile that is listed but not uploaded yet is picked up on the call after its upload.
@@ -1204,7 +1255,7 @@ public partial class WorldView : Node3D
 
         _secReady++;
         ReadyTotal++;
-        if (Cover.Loaded > PeakActiveTiles) PeakActiveTiles = Cover.Loaded;
+        if (Cover.Loaded + LandmarkCover.Loaded > PeakActiveTiles) PeakActiveTiles = Cover.Loaded + LandmarkCover.Loaded;
 
         long us = (long)Time.GetTicksUsec() - t0;
         int r = System.Math.Clamp(tile.Ring, 0, 3);
@@ -1230,7 +1281,7 @@ public partial class WorldView : Node3D
     {
         long t0 = (long)Time.GetTicksUsec();
         TerrainKeysSeen++;
-        if (!TileKey.TryParse(tile.Key, out long packed, out bool isTerrainKey) || !isTerrainKey)
+        if (!TileKey.TryParse(tile.Key, out long packed, out TileLayer tileLayer) || tileLayer != TileLayer.Terrain)
         {
             GD.PushError($"[WorldView] terrain ready tile with unparsable key '{tile.Key}'");
             return;
@@ -1240,7 +1291,7 @@ public partial class WorldView : Node3D
         bool replace = TerrainCover.TryGet(packed, out var existing);
         if (replace)
         {
-            // Same key delivered again (set_terrain_detail): replace the mesh in place, keep the node and its visibility.
+            // Same key delivered again (not expected since api 1.10; before it set_terrain_detail did this): replace the mesh in place, keep the node and its visibility.
             nodes = (TerrainNodes)existing;
             TerrainCover.BeginReplace(nodes);
             nodes.Ring = tile.Ring;
@@ -1280,9 +1331,77 @@ public partial class WorldView : Node3D
         }
     }
 
+    private void UploadLandmarkTile(in ReadyTile tile)
+    {
+        long t0 = (long)Time.GetTicksUsec();
+        LandmarkKeysSeen++;
+        if (!TileKey.TryParse(tile.Key, out long packed, out TileLayer layer) || layer != TileLayer.Landmarks)
+        {
+            GD.PushError($"[WorldView] landmark ready tile with unparsable key '{tile.Key}'");
+            return;
+        }
+        var pool = _pool!;
+        // A held key delivered again (the contract says it never is) replaces in place and never adds a second copy.
+        bool replace = LandmarkCover.TryGet(packed, out var nodes);
+        if (replace)
+        {
+            LandmarkCover.BeginReplace(nodes);
+            nodes.Ring = tile.Ring;
+        }
+        else
+        {
+            nodes = pool.Acquire(tile.Key, packed, tile.Ring);
+            nodes.LoadedMs = Time.GetTicksMsec();
+            ChurnDeliver("landmarks", tile.Key);
+        }
+        nodes.Root.Position = tile.Origin;
+        pool.SetMesh(nodes, tile.Mesh);
+        // Lights like R1 (the shared sprite material cross-fades them with the building windows) and the beacons; a landmark tile has no ground
+        // and no street or airport lights (empty in the entry), so those sets of the pooled node stay cleared.
+        pool.SetLights(nodes, tile.Lights, tile.LightColors);
+        pool.SetBeacons(nodes, tile.BeaconLights ?? System.Array.Empty<Vector3>(), tile.BeaconLightColors ?? System.Array.Empty<Color>());
+        if (replace)
+        {
+            LandmarkCover.EndReplace(nodes);
+            LandmarkReplacedTotal++;
+        }
+        else LandmarkCover.Add(nodes);
+        LandmarkReadyTotal++;
+        if (Cover.Loaded + LandmarkCover.Loaded > PeakActiveTiles) PeakActiveTiles = Cover.Loaded + LandmarkCover.Loaded; // landmark tiles take nodes from the same pool
+
+        long us = (long)Time.GetTicksUsec() - t0;
+        LandmarkUploadUsLast = us;
+        if (us > LandmarkUploadUsMax) LandmarkUploadUsMax = us;
+        LandmarkUploadUsSum += us;
+        LandmarkUploadCount++;
+        if (!_loggedFirstLandmark)
+        {
+            _loggedFirstLandmark = true;
+            GD.Print($"[WorldView] first landmark tile {tile.Key} origin={tile.Origin} tris={nodes.Tris} lights={nodes.LightCount} beacons={nodes.BeaconCount}");
+        }
+        if (us > 2000 && _slowLogs < 40)
+        {
+            _slowLogs++;
+            GD.Print($"[WorldView] slow landmark upload {tile.Key} tris={nodes.Tris} lights={nodes.LightCount} beacons={nodes.BeaconCount} {us / 1000.0:0.00} ms");
+        }
+    }
+
+    private bool _loggedFirstLandmark;
+
+    private bool ReleaseLandmarkTile(long packed)
+    {
+        var nodes = LandmarkCover.Remove(packed);
+        if (nodes == null) return false;
+        _pool!.Release(nodes);
+        LandmarkUnloadedTotal++;
+        return true;
+    }
+
     private void UnloadTile(string key)
     {
-        if (!TileKey.TryParse(key, out long packed, out bool terrain)) return;
+        if (!TileKey.TryParse(key, out long packed, out TileLayer layer)) return;
+        if (layer == TileLayer.Landmarks) { LandmarkKeysSeen++; ReleaseLandmarkTile(packed); return; }
+        bool terrain = layer == TileLayer.Terrain;
         if (terrain) { TerrainKeysSeen++; ChurnUnload("terrain", key, TerrainCover.TryGet(packed, out var tn) ? tn : null, "poll_unload"); ReleaseTerrainTile(packed); }
         else { ChurnUnload("world", key, Cover.TryGet(packed, out var vn) ? vn : null, "poll_unload"); ReleaseTile(packed); }
     }
@@ -1488,6 +1607,10 @@ public partial class WorldView : Node3D
         foreach (var n in TerrainCover.All) _dropScratch.Add(n.Packed);
         for (int i = 0; i < _dropScratch.Count; i++) ReleaseTerrainTile(_dropScratch[i]);
         strays += _dropScratch.Count;
+        _dropScratch.Clear();
+        foreach (var n in LandmarkCover.All) _dropScratch.Add(n.Packed);
+        for (int i = 0; i < _dropScratch.Count; i++) ReleaseLandmarkTile(_dropScratch[i]);
+        strays += _dropScratch.Count;
         if (strays > 0)
             GD.PushWarning($"[WorldView] reconfigure: {strays} tiles were not in the library's unload batch of {unload.Length}; released anyway");
         _fading.Clear();
@@ -1561,6 +1684,7 @@ public partial class WorldView : Node3D
             + $"ground={c.GroundTilesVisible}/{c.GroundTilesLoaded} tiles {c.GroundTrianglesVisible}/{c.GroundTrianglesLoaded} tris "
             + $"lights={c.LightsVisible}/{c.LightsLoaded} clusteredTiles={c.ClusteredTilesVisible}/{c.LightTilesVisible} "
             + $"uploadMaxMs={UploadUsMaxLastSecond / 1000.0:0.00} replaced={ReplacedTotal} cover errors={ConsistencyErrors}"
+            + (LandmarksActive ? $" landmarks loaded={LandmarkCover.Loaded} tris={LandmarkCover.TrianglesLoaded} lights={LandmarkCover.LightsLoaded}" : "")
             + (TerrainActive ? $" terrain loaded={TerrainCover.Loaded} visible={string.Join("/", TerrainCover.VisibleByRing)} tris={TerrainCover.TrianglesVisible}/{TerrainCover.TrianglesLoaded}" : "");
     }
 
@@ -1581,7 +1705,7 @@ public partial class WorldView : Node3D
                 for (int i = 0; i < _verifyTiles.Count; i++)
                 {
                     var t = _verifyTiles[i];
-                    if (t.Packed == 0) continue;
+                    if (t.Packed == 0 || t.Layer == TileLayer.Landmarks) continue; // landmark tiles have no quadtree roots (flat set)
                     if (t.State is TileState.Queued or TileState.Fetching or TileState.Meshing)
                     {
                         if (t.Terrain) _pendingRootsT.Add(TileKey.Ancestor(t.Packed, TerrainCover.RootZ));
@@ -1593,6 +1717,7 @@ public partial class WorldView : Node3D
         _report.Clear();
         int errors = Cover.Verify(_pendingRoots, _suspectRoots, _report);
         if (TerrainActive) errors += TerrainCover.Verify(_pendingRootsT, _suspectRootsT, _report);
+        errors += LandmarkCover.Verify(_report);
         ConsistencyChecks++;
         if (errors > 0)
         {

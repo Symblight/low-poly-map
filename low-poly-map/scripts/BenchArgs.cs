@@ -6,7 +6,7 @@ namespace LowPolyMap;
 
 /// <summary>
 /// Test-bench launch arguments for the <see cref="WorldView"/> (host side: the addon itself reads no command line). Applies
-/// <c>--tile-url=</c>, <c>--curvature=</c>, <c>--light-alpha=</c>, <c>--fake-fade=</c>, <c>--profile=</c>, <c>--area=</c>,
+/// <c>--tile-url=</c>, <c>--no-landmarks</c>, <c>--curvature=</c>, <c>--light-alpha=</c>, <c>--fake-fade=</c>, <c>--profile=</c>, <c>--area=</c>,
 /// <c>--set=</c>, <c>--lod-selftest</c>, <c>--view=</c> / <c>--cam-fov=</c> (screen-space LOD view), <c>--world=</c> (seed world), <c>--seed-spot=</c>, <c>--seed-selftest</c>, <c>--cover-selftest</c>, <c>--latency-log=</c> and the terrain arguments (<c>--terrain</c>, <c>--terrain-detail=</c>,
 /// <c>--terrain-reach-km=</c>, <c>--terrain-amplitude=</c>, <c>--far=</c>, <c>--terrain-selftest</c>, <c>--terrain-collision</c>,
 /// <c>--terrain-collision-selftest</c>), then starts the view (the scene turns
@@ -43,6 +43,7 @@ public partial class BenchArgs : Node
         {
             if (arg.StartsWith(TileUrlArg, System.StringComparison.Ordinal)) view.TileUrl = arg.Substring(TileUrlArg.Length); // may be empty -> synthetic
             else if (arg.StartsWith("--world=", System.StringComparison.Ordinal)) view.SeedWorld = arg.Substring(8).Trim(); // seed world manifest (api 1.7); clears the tile URL below
+            else if (arg == "--no-landmarks") view.LandmarksEnabled = false; // api 1.11: do not opt in to the landmark layer; the landmarks stay folded into the vector tiles
             else if (arg.StartsWith("--curvature=", System.StringComparison.Ordinal) && TryNumber(arg.Substring(12), out var cv)) view.Curvature = Mathf.Max((float)cv, 0f);
             else if (arg.StartsWith("--light-alpha=", System.StringComparison.Ordinal) && TryNumber(arg.Substring(14), out var la)) settings.DebugLightAlpha = (float)la;
             else if (arg.StartsWith("--fake-fade=", System.StringComparison.Ordinal) && TryNumber(arg.Substring(12), out var ff)) settings.DebugFakeFade = (float)ff;
@@ -73,8 +74,10 @@ public partial class BenchArgs : Node
         // Terrain collision (addon helper, default off): --terrain-collision turns it on (implies --terrain).
         view.TerrainCollisionEnabled = System.Linq.Enumerable.Contains(OS.GetCmdlineUserArgs(), "--terrain-collision") || TerrainCollisionSelfTest.Requested();
 
-        if (CoverSelfTest.Requested()) CoverSelfTest.Run(view);
+        bool coverSimOk = true;
+        if (CoverSelfTest.Requested()) coverSimOk = CoverSelfTest.Run(view);
         view.Start();
+        if (CoverSelfTest.Requested()) CoverLiveCheck.Attach(view, View?.GetParent(), coverSimOk);
         if (_areaQuality > 0) GD.Print($"[BenchArgs] --area: set_lod_quality({_areaQuality:0.###}) -> in effect {view.SetLodQuality(_areaQuality):0.###} (band edges are screen-space since api 1.10; bands.max_distance_m scaled by the area)");
         double latencyEvery = LatencyLog.Requested();
         if (latencyEvery > 0) LatencyLog.Attach(view, latencyEvery);
@@ -161,7 +164,7 @@ public partial class BenchArgs : Node
     }
 
     /// <summary>
-    /// Terrain arguments: <c>--terrain</c> (opt in to the layer and enable it in the profile), <c>--terrain-detail=&lt;x&gt;</c> (set_terrain_detail after start),
+    /// Terrain arguments: <c>--terrain</c> (opt in to the layer and enable it in the profile), <c>--terrain-detail=&lt;x&gt;</c> (set_terrain_detail after start: a scale of the terrain cover's error threshold, above 1 coarser, below 1 finer and expensive),
     /// <c>--terrain-amplitude=&lt;m&gt;</c> (profile terrain.amplitude_m), <c>--terrain-reach-km=&lt;x&gt;</c> (truncate terrain.bands: bands whose inner edge is below
     /// the reach are kept, the last one is clamped to it), <c>--far=&lt;m&gt;</c> (camera far plane; with terrain on it defaults to the last band edge x 1.15).
     /// The layer is on by default (<c>--no-terrain</c> = flat world; self-tests and <c>--geodetic-test</c> stay flat unless <c>--terrain</c> is given). <c>--terrain-selftest</c> implies <c>--terrain</c>. A visual curvature below 1 turns the real-size horizon cull off. Explicit <c>--set=terrain.*</c> values win.

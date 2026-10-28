@@ -11,7 +11,8 @@ namespace LowPolyMap;
 /// are unloaded), with random interleaving, and runs <see cref="TileCover.Verify"/> after every atomic step.
 /// Uses a private TilePool/TileCover, so the live scene is untouched. Prints PASS/FAIL. Runs the same simulation twice: on the vector
 /// layer (z13..z16, <see cref="TilePool"/>) and on the terrain layer (api 1.5, z10..z14, five rings, <see cref="TerrainPool"/>), each with its own
-/// <see cref="TileCover"/> and its own root zoom for the sibling rule.
+/// <see cref="TileCover"/> and its own root zoom for the sibling rule, and a third time on the landmark layer's flat set (api 1.11,
+/// <see cref="LandmarkCover"/>). With a running world <see cref="CoverLiveCheck"/> then compares the live landmark tile map to <c>debug_tiles</c>.
 /// </summary>
 public static class CoverSelfTest
 {
@@ -43,8 +44,89 @@ public static class CoverSelfTest
             var pool = new TerrainPool(container);
             ok &= RunLayer("terrain z10..z14", 10, 14, 583, 325, (k, ring) => pool.Acquire(TileKey.ToTerrainText(k), k, ring), n => pool.Release((TerrainNodes)n), () => (pool.FreeCount, pool.TotalCreated));
         }
+        ok &= RunLandmarkLayer(container);
         container.QueueFree();
         return ok;
+    }
+
+    /// <summary>
+    /// The landmark layer's flat tile map (api 1.11): random add / replace / remove / shift of "l/z/x/y" tiles over a private <see cref="TilePool"/> and
+    /// <see cref="LandmarkCover"/>, verified after every step (visible whenever held, counters equal a recount, the pool gets every node back).
+    /// </summary>
+    private static bool RunLandmarkLayer(Node3D container)
+    {
+        var pool = new TilePool(container);
+        var cover = new LandmarkCover();
+        var rng = new RandomNumberGenerator { Seed = 777 };
+        var report = new StringBuilder();
+        var held = new List<long>();
+        int errors = 0, steps = 0, replaced = 0, maxHeld = 0;
+        void Check(string what)
+        {
+            steps++;
+            report.Clear();
+            int e = cover.Verify(report);
+            if (e > 0) { errors += e; GD.PushError($"[CoverSelfTest] landmarks after {what}: {e} problem(s)\n{report}"); }
+            if (cover.Loaded != held.Count) { errors++; GD.PushError($"[CoverSelfTest] landmarks after {what}: held {cover.Loaded} != expected {held.Count}"); }
+            if (cover.Loaded > maxHeld) maxHeld = cover.Loaded;
+        }
+        for (int i = 0; i < 3000; i++)
+        {
+            float r = rng.Randf();
+            long k = TileKey.Pack(11, 1160 + (int)(rng.Randi() % 12), 645 + (int)(rng.Randi() % 12));
+            if (r < 0.45f)
+            {
+                if (cover.TryGet(k, out var existing)) // never expected from the library; must replace in place, never add a second copy
+                {
+                    cover.BeginReplace(existing);
+                    existing.Tris = (int)(rng.Randi() % 5000);
+                    existing.LightCount = (int)(rng.Randi() % 400);
+                    cover.EndReplace(existing);
+                    replaced++;
+                    Check("replace " + TileKey.ToLandmarkText(k));
+                    continue;
+                }
+                var n = pool.Acquire(TileKey.ToLandmarkText(k), k, 0);
+                n.Tris = (int)(rng.Randi() % 5000);
+                n.LightCount = (int)(rng.Randi() % 400);
+                n.BeaconCount = (int)(rng.Randi() % 50);
+                n.Root.Position = new Vector3(i, 0, -i);
+                cover.Add(n);
+                held.Add(k);
+                Check("add " + TileKey.ToLandmarkText(k));
+            }
+            else if (r < 0.9f)
+            {
+                if (held.Count == 0) continue;
+                long d = held[(int)(rng.Randi() % (uint)held.Count)];
+                var n = cover.Remove(d);
+                if (n == null) { errors++; GD.PushError("[CoverSelfTest] landmarks: held key not found"); continue; }
+                n.Tris = 0; n.LightCount = 0; n.BeaconCount = 0;
+                pool.Release(n);
+                held.Remove(d);
+                if (cover.Remove(d) != null) { errors++; GD.PushError("[CoverSelfTest] landmarks: removed key still present"); }
+                Check("remove " + TileKey.ToLandmarkText(d));
+            }
+            else
+            {
+                var before = new Dictionary<long, Vector3>();
+                foreach (var n in cover.All) before[n.Packed] = n.Root.Position;
+                var shift = new Vector3(rng.Randf() * 5000f, 0f, rng.Randf() * 5000f);
+                cover.Shift(shift);
+                foreach (var n in cover.All)
+                    if ((n.Root.Position - (before[n.Packed] - shift)).Length() > 1e-3f) { errors++; GD.PushError("[CoverSelfTest] landmarks: shift moved a tile wrongly"); break; }
+                Check("shift");
+            }
+        }
+        foreach (long k in held.ToArray())
+        {
+            var n = cover.Remove(k);
+            if (n != null) { n.Tris = 0; n.LightCount = 0; n.BeaconCount = 0; pool.Release(n); }
+        }
+        bool poolOk = pool.FreeCount == pool.TotalCreated && cover.Loaded == 0 && cover.TrianglesLoaded == 0 && cover.LightsLoaded == 0 && cover.BeaconsLoaded == 0;
+        if (!poolOk) { errors++; GD.PushError($"[CoverSelfTest] landmarks drain: pool free {pool.FreeCount}/{pool.TotalCreated}, loaded {cover.Loaded}, counters {cover.TrianglesLoaded}/{cover.LightsLoaded}/{cover.BeaconsLoaded}"); }
+        GD.Print($"[CoverSelfTest] landmarks flat set {(errors == 0 ? "PASS" : "FAIL")}: {steps} verified steps, {errors} errors, max {maxHeld} tiles held, {replaced} in-place re-uploads, pool created {pool.TotalCreated}");
+        return errors == 0;
     }
 
     private static bool RunLayer(string name, int rootZ, int leafZ, int baseX, int baseY,

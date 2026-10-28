@@ -4,7 +4,9 @@ using Godot.Collections;
 
 namespace SimWorld;
 
-public enum TileState { Queued, Fetching, Meshing, Ready, Failed, Unloading, Unknown }
+public enum TileState { Queued, Fetching, Meshing, Ready, Failed, Unloading, Unknown,
+    /// <summary>Landmark layer only (api 1.11): an overview tile in range without landmarks; built, never delivered.</summary>
+    Empty }
 
 /// <summary>One entry of debug_tiles(): ring, state and the tile rect in local x/z meters.</summary>
 public struct DebugTile
@@ -15,6 +17,8 @@ public struct DebugTile
     public int Ring;
     /// <summary>True for a terrain-layer tile (key "t/z/x/y", api 1.5); <see cref="Packed"/> is then a key of the terrain tile map.</summary>
     public bool Terrain;
+    /// <summary>The layer of the key: world "z/x/y", terrain "t/z/x/y" or landmarks "l/z/x/y" (api 1.11, at the overview zoom, ring 0). A landmark tile has its own tile map: it is neither a vector nor a terrain tile.</summary>
+    public TileLayer Layer;
     public TileState State;
     public Vector2 Min;
     public Vector2 Max;
@@ -31,6 +35,8 @@ public struct ReadyTile
     public string Key;
     /// <summary>True for a terrain-layer entry (api 1.5: layer "terrain", key "t/z/x/y"); false for the vector layer.</summary>
     public bool IsTerrain;
+    /// <summary>True for a landmark-layer entry (api 1.11: layer "landmarks", key "l/z/x/y", ring 0): it carries the vector keys (mesh with windows, lights, beacons; no ground), drawn like a vector tile but kept in the landmark tile map.</summary>
+    public bool IsLandmark;
     /// <summary>Terrain mesh Array (VERTEX, INDEX, optional NORMAL), relative to <see cref="Origin"/>; null when absent. Terrain entries only.</summary>
     public Godot.Collections.Array? Terrain;
     /// <summary>Lowest / highest surface vertex (m above MSL) of a terrain tile.</summary>
@@ -166,6 +172,14 @@ public sealed class StreamerStats
     public int ViewHeightPx;
     /// <summary>Data tiles held / decoded so far (detail z14 + overview z11, api 1.10) and requests the scheduler did not send, because the PMTiles directory has no entry / because the camera moves too fast.</summary>
     public long DataTilesLoaded, DataTilesDecoded, RequestsSkippedEmpty, RequestsSkippedMoving;
+    /// <summary>True once the library reports the data levels of the tile source (debug_stats "data_levels", api 1.11; absent before the archive opened, for a seed world and on an older library).</summary>
+    public bool HasDataLevels;
+    /// <summary>Detail and overview zoom of the data tiles; <see cref="TwoLevel"/> = R2/R3 come from the overview level (false = a compatibility archive without simworld_levels); <see cref="LandmarksInArchive"/> = the overview level has a landmarks layer.</summary>
+    public int DetailZoom, OverviewZoom;
+    public bool TwoLevel, LandmarksInArchive;
+    /// <summary>True while the landmark layer runs (debug_stats landmarks_* keys, api 1.11): tiles delivered and held, in range waiting / being meshed, in range without landmarks.</summary>
+    public bool HasLandmarkStats;
+    public int LandmarksLoaded, LandmarksPending, LandmarksEmpty;
     public double CacheMb;
     public double OriginLat;
     public double OriginLon;
@@ -220,7 +234,7 @@ public sealed class WorldStreamerFacade
     /// (poll_fades, ground_height_at, debug_tiles, configure_world / world_profile, the host API), so nothing is probed.</summary>
     public const int MinApiMinor = 0;
     /// <summary>Highest contract minor this facade knows. A library above it gets one info line.</summary>
-    public const int LatestKnownMinor = 10;
+    public const int LatestKnownMinor = 11;
     /// <summary>First contract minor of <see cref="ExpectedApiMajor"/> with the terrain layer (layers option, "t/" keys, set_terrain_detail).</summary>
     public const int TerrainMinApiMinor = 5;
     /// <summary>First contract minor with the <c>terrain_center</c> option and the status key <c>terrain_active</c> (api 1.6).</summary>
@@ -229,6 +243,8 @@ public sealed class WorldStreamerFacade
     public const int SeedWorldMinApiMinor = 7;
     /// <summary>First contract minor with <c>set_view(fov_y_deg, viewport_h_px, forward)</c> (screen-space LOD) and the <c>tau_eff</c> / data tile debug_stats fields (api 1.10; 1.8 and 1.9 are reserved).</summary>
     public const int SetViewMinApiMinor = 10;
+    /// <summary>First contract minor with two-level archives and the landmark layer: <c>layers</c> value <c>"landmarks"</c>, "l/z/x/y" keys, <c>data_levels</c> / <c>landmarks_*</c> in debug_stats (api 1.11).</summary>
+    public const int LandmarksMinApiMinor = 11;
 
     private static readonly StringName ClassNameSn = new(ClassNameText);
     private static readonly StringName MConfigure = new("configure");
@@ -314,6 +330,10 @@ public sealed class WorldStreamerFacade
     private static readonly StringName KViewHeight = new("view_height_px");
     private static readonly StringName MSetLodQuality = new("set_lod_quality");
     private static readonly StringName KDataTilesLoaded = new("data_tiles_loaded");
+    private static readonly StringName KDataLevels = new("data_levels");
+    private static readonly StringName KLandmarksLoaded = new("landmarks_loaded");
+    private static readonly StringName KLandmarksPending = new("landmarks_pending");
+    private static readonly StringName KLandmarksEmpty = new("landmarks_empty");
     private static readonly StringName KDataTilesDecoded = new("data_tiles_decoded");
     private static readonly StringName KRequestsSkippedEmpty = new("requests_skipped_empty");
     private static readonly StringName KRequestsSkippedMoving = new("requests_skipped_moving");
@@ -521,15 +541,21 @@ public sealed class WorldStreamerFacade
         };
 
     /// <summary>
-    /// Adds the host opt-in <c>layers</c> option (api 1.4+): <c>["world", "terrain"]</c> when <paramref name="terrain"/>, else nothing is
+    /// Adds the host opt-in <c>layers</c> option (api 1.4+): <c>["world", "terrain"]</c> when <paramref name="terrain"/>, plus <c>"landmarks"</c>
+    /// (api 1.11, "I draw the landmark layer") when <paramref name="landmarks"/>; with neither nothing is
     /// added (the library's default is <c>["world"]</c>, exactly the pre-terrain behaviour). The terrain is active only together with the
     /// profile key <c>terrain.enabled</c>; passing the layer means "I draw terrain tiles".
     /// </summary>
-    public static void AddLayers(Dictionary options, bool terrain)
+    public static void AddLayers(Dictionary options, bool terrain, bool landmarks = false)
     {
-        if (terrain) options[KOptLayers] = new string[] { "world", "terrain" };
+        if (terrain && landmarks) options[KOptLayers] = new string[] { "world", "terrain", "landmarks" };
+        else if (terrain) options[KOptLayers] = new string[] { "world", "terrain" };
+        else if (landmarks) options[KOptLayers] = new string[] { "world", "landmarks" };
         else options.Remove(KOptLayers);
     }
+
+    /// <summary>True when the library has the landmark layer (api 1.11): the <c>layers</c> value <c>"landmarks"</c>, "l/z/x/y" keys, <c>data_levels</c> and <c>landmarks_*</c> in debug_stats. A library below it would reject the value as an unknown layer, so the host does not send it.</summary>
+    public bool HasLandmarkLayer => IsAvailable && KnownCompatible && ApiMinor >= LandmarksMinApiMinor;
 
     /// <summary>Sets (or removes) the <c>terrain_center</c> option [lat, lon] (api 1.6): the centre of the terrain's flat zone, kept across reconfigures.</summary>
     public static void AddTerrainCenter(Dictionary options, bool set, double lat, double lon)
@@ -725,7 +751,9 @@ public sealed class WorldStreamerFacade
         tile = default;
         if (!d.TryGetValue(KKey, out var k)) return false;
         tile.Key = k.AsString();
-        tile.IsTerrain = d.TryGetValue(KLayer, out var layer) && layer.VariantType == Variant.Type.String && layer.AsString() == "terrain";
+        string layerName = d.TryGetValue(KLayer, out var layer) && layer.VariantType == Variant.Type.String ? layer.AsString() : "";
+        tile.IsTerrain = layerName == "terrain";
+        tile.IsLandmark = layerName == "landmarks";
         if (tile.IsTerrain)
         {
             // Terrain entries (api 1.5) carry only the terrain mesh; every vector key is empty.
@@ -801,8 +829,10 @@ public sealed class WorldStreamerFacade
     private bool? _hasSetTerrainDetail;
 
     /// <summary>
-    /// set_terrain_detail(scale) (api 1.5): multiplies every terrain band's max_error_m by the scale (clamped by the library to
-    /// [0.25, terrain.detail_scale_max]); held terrain tiles are re-meshed and re-delivered under the same keys, nothing is unloaded.
+    /// set_terrain_detail(scale) (api 1.5; behaviour since 1.10): a scale of the terrain cover's screen-space-error threshold, tau = terrain.tau_px x scale
+    /// (clamped by the library to [0.25, terrain.detail_scale_max]): above 1 is COARSER (fewer, larger tiles), below 1 is FINER and much more expensive
+    /// (0.25 is about 2300 tiles). The change arrives as ordinary refines / coarsens (new keys, fades, unloads); held tiles are not re-delivered
+    /// (before 1.10 the scale multiplied max_error_m and every held key was re-delivered in place).
     /// Returns the scale in effect, or NaN when the library lacks the method (older than api 1.5) or is unavailable.
     /// </summary>
     public double SetTerrainDetail(double scale)
@@ -926,6 +956,20 @@ public sealed class WorldStreamerFacade
         into.DataTilesDecoded = d.TryGetValue(KDataTilesDecoded, out var dd) ? dd.AsInt64() : 0;
         into.RequestsSkippedEmpty = d.TryGetValue(KRequestsSkippedEmpty, out var se) ? se.AsInt64() : 0;
         into.RequestsSkippedMoving = d.TryGetValue(KRequestsSkippedMoving, out var sm) ? sm.AsInt64() : 0;
+        into.HasDataLevels = false;
+        if (d.TryGetValue(KDataLevels, out var dlv) && dlv.VariantType == Variant.Type.Dictionary)
+        {
+            var dl2 = dlv.AsGodotDictionary();
+            into.HasDataLevels = true;
+            into.DetailZoom = dl2.TryGetValue("detail", out var dz) ? (int)dz.AsInt64() : 0;
+            into.OverviewZoom = dl2.TryGetValue("overview", out var oz) ? (int)oz.AsInt64() : 0;
+            into.TwoLevel = dl2.TryGetValue("two_level", out var tl) && tl.AsBool();
+            into.LandmarksInArchive = dl2.TryGetValue("landmarks", out var lm) && lm.AsBool();
+        }
+        into.HasLandmarkStats = d.ContainsKey(KLandmarksLoaded);
+        into.LandmarksLoaded = d.TryGetValue(KLandmarksLoaded, out var lml) ? (int)lml.AsInt64() : 0;
+        into.LandmarksPending = d.TryGetValue(KLandmarksPending, out var lmp) ? (int)lmp.AsInt64() : 0;
+        into.LandmarksEmpty = d.TryGetValue(KLandmarksEmpty, out var lme) ? (int)lme.AsInt64() : 0;
         into.HasTerrain = d.ContainsKey(KTerrainLoaded);
         System.Array.Clear(into.TerrainQueued); System.Array.Clear(into.TerrainFetching);
         System.Array.Clear(into.TerrainMeshing); System.Array.Clear(into.TerrainLoaded);
@@ -1012,7 +1056,8 @@ public sealed class WorldStreamerFacade
             if (d.TryGetValue(KKey, out var key))
             {
                 t.Key = key.AsString();
-                if (!TileKey.TryParse(t.Key, out t.Packed, out t.Terrain)) t.Packed = 0;
+                if (!TileKey.TryParse(t.Key, out t.Packed, out t.Layer)) t.Packed = 0;
+                t.Terrain = t.Layer == TileLayer.Terrain;
             }
             if (d.TryGetValue(KRing, out var r)) t.Ring = (int)r.AsInt64();
             if (d.TryGetValue(KState, out var st)) t.State = ParseState(st.AsString());
@@ -1032,6 +1077,7 @@ public sealed class WorldStreamerFacade
         "ready" => TileState.Ready,
         "failed" => TileState.Failed,
         "unloading" => TileState.Unloading,
+        "empty" => TileState.Empty,
         _ => TileState.Unknown,
     };
 }

@@ -59,6 +59,16 @@ public partial class LatencyLog : Node
             if (n == 0) { sb.Append('-'); continue; }
             sb.Append((_view.TileUploadUsSum[r] / 1000.0 / n).ToString("0.00")).Append('/').Append((_view.TileUploadUsMax[r] / 1000.0).ToString("0.00"));
         }
+        if (_view.LandmarksActive)
+        {
+            sb.Append("\n  landmarks (api 1.11): ");
+            if (_stats.HasLandmarkStats) sb.Append("loaded ").Append(_stats.LandmarksLoaded).Append(", pending ").Append(_stats.LandmarksPending).Append(", empty ").Append(_stats.LandmarksEmpty).Append("; ");
+            sb.Append("host nodes held ").Append(_view.LandmarkCover.Loaded).Append(", delivered ").Append(_view.LandmarkReadyTotal).Append(", unloaded ").Append(_view.LandmarkUnloadedTotal)
+              .Append(", l/ keys in poll_fades ").Append(_view.LandmarkFadeKeysSeen);
+            if (_view.LandmarkUploadCount > 0)
+                sb.Append("; upload ms avg/max ").Append((_view.LandmarkUploadUsSum / 1000.0 / _view.LandmarkUploadCount).ToString("0.00")).Append('/').Append((_view.LandmarkUploadUsMax / 1000.0).ToString("0.00"));
+        }
+        sb.Append("\n  upload frame ms: max/1s ").Append((_view.UploadUsMaxLastSecond / 1000.0).ToString("0.00")).Append(", frames over budget ").Append(_view.UploadFramesOverBudget).Append('/').Append(_view.UploadFrames);
         GD.Print(sb.ToString());
     }
 

@@ -208,14 +208,17 @@ public partial class GeodeticFlightTest : Node
         {
             var t = _tiles[i];
             // Terrain tiles (api 1.5) live in their own tile map; the key z/x/y alone would match a vector tile of the same slippy tile.
-            if (t.Packed == 0 || t.State != TileState.Ready || !(t.Terrain ? bridge.TerrainCover : bridge.Cover).TryGet(t.Packed, out var nodes)) continue;
+            if (t.Packed == 0 || t.State != TileState.Ready) continue;
+            TileNodes? nodes;
+            if (t.Layer == TileLayer.Landmarks) { if (!bridge.LandmarkCover.TryGet(t.Packed, out nodes)) continue; } // api 1.11: the landmark tile map
+            else if (!(t.Terrain ? bridge.TerrainCover : bridge.Cover).TryGet(t.Packed, out nodes)) continue;
             var c = (t.Min + t.Max) * 0.5f;
             double err = new Vector2(nodes.Root.Position.X - c.X, nodes.Root.Position.Z - c.Y).Length();
             _tilesChecked++;
             if (err > _maxTileErr) _maxTileErr = err;
             // Terrain roots are placed at the tile centre of the Mercator projection at the tile's latitude, the debug rect is the projected corners:
             // the two differ by about 0.1 % of the tile width on 22 km tiles (23 m at z10) - a Rust-side projection detail, tolerated up to 0.15 %.
-            double limit = t.Terrain ? System.Math.Max(TileLimitM, 0.0015 * (t.Max.X - t.Min.X)) : TileLimitM;
+            double limit = t.Terrain || t.Layer == TileLayer.Landmarks ? System.Math.Max(TileLimitM, 0.0015 * (t.Max.X - t.Min.X)) : TileLimitM;
             if (err > limit)
             {
                 _tileMismatches++;

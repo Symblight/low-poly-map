@@ -176,9 +176,12 @@ public partial class SettingsMenu : PanelContainer
         (_ampSlider, _ampBox) = AddRow(col, "Hills amplitude", 0, TerrainAmpMax, 10, 0, TerrainAmpMax, 10, " m");
         _ampSlider.ValueChanged += v => { if (!_syncing) SetTerrainAmplitude(v); };
         _ampBox.ValueChanged += v => { if (!_syncing) SetTerrainAmplitude(v); };
-        (_detailSlider, _detailBox) = AddRow(col, "Detail (error x)", TerrainDetailMin, 2.0, 0.05, TerrainDetailMin, 8.0, 0.05, "x");
-        _detailBox.TooltipText = "set_terrain_detail: multiplies the terrain error per band (smaller = more triangles); live, no restart";
-        _detailSlider.ValueChanged += v => { if (!_syncing) SetTerrainDetail(v); };
+        // set_terrain_detail is a scale of the terrain cover's screen-space-error threshold (tau = terrain.tau_px x scale, api 1.10), the same convention as the
+        // vector "Detail (tau x)" row above: the raw scale, log slider, right = COARSER. So it is labelled coarseness, not detail.
+        (_detailSlider, _detailBox) = AddRow(col, "Terrain coarseness", System.Math.Log10(TerrainDetailMin), System.Math.Log10(2.0), 0.001, TerrainDetailMin, 8.0, 0.05, "x");
+        _detailBox.TooltipText = "set_terrain_detail: scale of the terrain error threshold (terrain.tau_px x this). 1 = profile, above 1 = COARSER (fewer, larger tiles, cheaper), "
+            + "below 1 = FINER and expensive: 0.5 roughly doubles the tiles, 0.25 (the minimum) is about 2300 tiles and can stall the streaming and the draw call budget. Live, no restart; the cover changes through ordinary swaps";
+        _detailSlider.ValueChanged += v => { if (!_syncing) SetTerrainDetail(System.Math.Round(System.Math.Pow(10, v), 2)); };
         _detailBox.ValueChanged += v => { if (!_syncing) SetTerrainDetail(v); };
 
         // -- apply
@@ -285,8 +288,8 @@ public partial class SettingsMenu : PanelContainer
         _terrainCheck.SetPressedNoSignal(_terrainOn);
         _ampSlider.SetValueNoSignal(_terrainAmp);
         _ampBox.SetValueNoSignal(_terrainAmp);
-        _detailSlider.MaxValue = _terrainDetailMax;
-        _detailSlider.SetValueNoSignal(System.Math.Min(_terrainDetail, _terrainDetailMax));
+        _detailSlider.MaxValue = System.Math.Log10(_terrainDetailMax);
+        _detailSlider.SetValueNoSignal(System.Math.Log10(System.Math.Clamp(_terrainDetail, TerrainDetailMin, _terrainDetailMax)));
         _detailBox.MaxValue = _terrainDetailMax;
         _detailBox.SetValueNoSignal(_terrainDetail);
         _syncing = false;
@@ -397,7 +400,7 @@ public partial class SettingsMenu : PanelContainer
         MarkDirty();
     }
 
-    /// <summary>set_terrain_detail, live: re-meshes the held terrain tiles under the same keys (no restart); debounced 0.3 s while the slider moves.</summary>
+    /// <summary>set_terrain_detail, live (no restart): the scale of the terrain cover's error threshold, clamped to 0.25..detail_scale_max; above 1 is coarser, below 1 finer and expensive. The cover follows through ordinary swaps; debounced 0.3 s while the slider moves.</summary>
     public void SetTerrainDetail(double scale)
     {
         if (!HasTerrain) return;
@@ -652,7 +655,7 @@ public partial class SettingsMenu : PanelContainer
             for (int i = 0; i < _stats.TerrainRings; i++) tb += _stats.TerrainQueued[i] + _stats.TerrainFetching[i] + _stats.TerrainMeshing[i];
             terrain = $", terrain busy {tb}, library holds {TerrainLoadedTotal()}, host cover {b.TerrainCover.Loaded} (pool in use {b.TerrainPoolCreated - b.TerrainPoolFree})";
         }
-        return $"queued+fetching+meshing R0..R3 {Ring(busy)}, loaded {Ring(_stats.Loaded)}, cover {b.Cover.Loaded}, tile roots {b.TileRootCount} (in use {b.PoolCreated - b.PoolFree}){terrain}";
+        return $"queued+fetching+meshing R0..R3 {Ring(busy)}, loaded {Ring(_stats.Loaded)}, cover {b.Cover.Loaded}{(b.LandmarksActive ? $" + landmarks {b.LandmarkCover.Loaded}" : "")}, tile roots {b.TileRootCount} (in use {b.PoolCreated - b.PoolFree}){terrain}";
     }
 
     private int LoadedTotal() { int n = 0; foreach (var v in _stats.Loaded) n += v; return n; }
@@ -805,7 +808,7 @@ public partial class SettingsMenu : PanelContainer
             await WaitFor(() => { bridge.Streamer.DebugStats(_stats); return LoadedTotal() == bridge.Cover.Loaded; }, 5);
             bridge.Streamer.DebugStats(_stats);
             if (LoadedTotal() != bridge.Cover.Loaded) fails.Add($"apply {k}: library holds {LoadedTotal()} tiles, host cover {bridge.Cover.Loaded}");
-            if (bridge.PoolCreated - bridge.PoolFree != bridge.Cover.Loaded) fails.Add($"apply {k}: pool in use {bridge.PoolCreated - bridge.PoolFree} != cover {bridge.Cover.Loaded}");
+            if (bridge.PoolCreated - bridge.PoolFree != bridge.Cover.Loaded + bridge.LandmarkCover.Loaded) fails.Add($"apply {k}: pool in use {bridge.PoolCreated - bridge.PoolFree} != cover {bridge.Cover.Loaded} + landmarks {bridge.LandmarkCover.Loaded}");
             if (bridge.TileRootCount != bridge.PoolCreated) fails.Add($"apply {k}: tile roots {bridge.TileRootCount} != pool created {bridge.PoolCreated}");
             if (bridge.Cover.Loaded == 0) fails.Add($"apply {k}: nothing loaded after the restart");
             if (bridge.TerrainActive)

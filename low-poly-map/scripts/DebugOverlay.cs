@@ -231,10 +231,11 @@ public partial class DebugOverlay : Control
                 AppendRings(sb, "terrain queued  ", _stats.TerrainQueued, _stats.TerrainRings, "T");
                 AppendRings(sb, "terrain meshing ", _stats.TerrainMeshing, _stats.TerrainRings, "T");
                 AppendRings(sb, "terrain loaded  ", _stats.TerrainLoaded, _stats.TerrainRings, "T");
-                sb.Append("terrain tris ").Append(_stats.TerrainTris.ToString("N0")).Append("  detail x").Append(_stats.TerrainDetail.ToString("0.##")).Append('\n');
+                sb.Append("terrain tris ").Append(_stats.TerrainTris.ToString("N0")).Append("  tau ").Append(TerrainTauText(_stats.TerrainDetail)).Append('\n');
             }
             sb.Append("cache ").Append(_stats.CacheMb.ToString("0.0")).Append(" MB\n");
             AppendViewLine(sb, streamer);
+            AppendDataLine(sb);
         }
 
         if (Bridge != null)
@@ -336,6 +337,42 @@ public partial class DebugOverlay : Control
           .Append(" decoded  requests skipped: empty ").Append(_stats.RequestsSkippedEmpty).Append(", moving ").Append(_stats.RequestsSkippedMoving).Append('\n');
     }
 
+    /// <summary>"0.9 px (tau_px 0.9 x scale 1)": the terrain cover's effective screen-space-error threshold (api 1.10: set_terrain_detail is a tau scale, above 1 coarser).</summary>
+    private string TerrainTauText(double scale)
+    {
+        double px = Bridge?.TerrainTauPx ?? 0.0;
+        return px > 0
+            ? $"{(px * scale).ToString("0.##")} px (terrain.tau_px {px.ToString("0.##")} x scale {scale.ToString("0.##")}; higher = coarser)"
+            : $"scale x{scale.ToString("0.##")} (higher = coarser)";
+    }
+
+    /// <summary>Data levels and landmark layer (api 1.11): the archive's detail / overview zoom and whether R2 / R3 come from the overview, landmark tiles loaded / pending / empty and the nodes the host holds for them.</summary>
+    private void AppendDataLine(StringBuilder sb)
+    {
+        if (Bridge == null) return;
+        sb.Append("data levels: ");
+        if (_stats.HasDataLevels)
+            sb.Append(_stats.TwoLevel ? "two-level" : "compat").Append(" detail z").Append(_stats.DetailZoom).Append(" / overview z").Append(_stats.OverviewZoom)
+              .Append(_stats.LandmarksInArchive ? ", landmarks in archive" : ", no landmarks layer");
+        else sb.Append("n/a (library ").Append(Bridge.Streamer.ApiVersionText).Append(Bridge.SeedWorldActive ? ", seed world" : ", archive not open yet or api < 1.11").Append(')');
+        sb.Append("\nlandmarks: ");
+        if (!Bridge.LandmarksActive) sb.Append(Bridge.LandmarksEnabled ? "layer unavailable (api < 1.11)" : "layer off (--no-landmarks: folded into the vector tiles)");
+        else
+        {
+            if (_stats.HasLandmarkStats)
+                sb.Append("loaded ").Append(_stats.LandmarksLoaded).Append("  pending ").Append(_stats.LandmarksPending).Append("  empty ").Append(_stats.LandmarksEmpty).Append("  ");
+            else sb.Append("layer requested, none reported  ");
+            var lc = Bridge.LandmarkCover;
+            sb.Append("| nodes held ").Append(lc.Loaded).Append("  tris ").Append(lc.TrianglesLoaded.ToString("N0")).Append("  lights ").Append(lc.LightsLoaded.ToString("N0"))
+              .Append("  beacons ").Append(lc.BeaconsLoaded.ToString("N0"));
+            if (Bridge.LandmarkUploadCount > 0)
+                sb.Append("  upload ms last/max/avg ").Append((Bridge.LandmarkUploadUsLast / 1000.0).ToString("0.0")).Append('/').Append((Bridge.LandmarkUploadUsMax / 1000.0).ToString("0.0"))
+                  .Append('/').Append((Bridge.LandmarkUploadUsSum / 1000.0 / Bridge.LandmarkUploadCount).ToString("0.0"));
+            if (Bridge.LandmarkFadeKeysSeen > 0) sb.Append("  [l/ KEYS IN poll_fades: ").Append(Bridge.LandmarkFadeKeysSeen).Append(']');
+        }
+        sb.Append('\n');
+    }
+
     /// <summary>World seed (api 1.7): generator and phases, the data source of the finest vector tile under the camera, airports near, load warnings.</summary>
     private void AppendSeedLine(StringBuilder sb)
     {
@@ -349,7 +386,7 @@ public partial class DebugOverlay : Control
             for (int i = 0; i < _tiles.Count; i++)
             {
                 var t = _tiles[i];
-                if (t.Terrain || t.Ring >= bestRing || t.State != TileState.Ready) continue;
+                if (t.Terrain || t.Layer == TileLayer.Landmarks || t.Ring >= bestRing || t.State != TileState.Ready) continue;
                 if (p.X < t.Min.X || p.X > t.Max.X || p.Z < t.Min.Y || p.Z > t.Max.Y) continue;
                 bestRing = t.Ring;
                 under = $"{t.Source} (R{t.Ring} {t.Key})";
@@ -423,7 +460,7 @@ public partial class DebugOverlay : Control
             for (int i = 0; i < _tiles.Count; i++)
             {
                 var t = _tiles[i];
-                if (t.Terrain || t.Ring != ring) continue; // terrain tiles (api 1.5) live in their own tile map and are 22 km wide: not on this minimap
+                if (t.Terrain || t.Layer == TileLayer.Landmarks || t.Ring != ring) continue; // landmark tiles (api 1.11, overview-sized, flat set) and terrain tiles (api 1.5) live in their own tile map and are 22 km wide: not on this minimap
                 int vis = cover != null && t.Packed != 0 ? cover.StateOf(t.Packed) : -1;
                 bool isVisible = vis == (int)TileCover.Vis.Visible;
                 if (!isVisible && !_showHidden) continue;

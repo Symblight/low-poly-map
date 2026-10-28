@@ -2,8 +2,11 @@ using System;
 
 namespace SimWorld;
 
+/// <summary>The layer a tile key belongs to: the vector world ("z/x/y"), the terrain ("t/z/x/y", api 1.5) or the landmarks ("l/z/x/y", api 1.11).</summary>
+public enum TileLayer { World = 0, Terrain = 1, Landmarks = 2 }
+
 /// <summary>
-/// Allocation-free helpers for tile keys (both layers). A key "z/x/y" is packed into a long so that parents, siblings and
+/// Allocation-free helpers for tile keys (all layers). A key "z/x/y" is packed into a long so that parents, siblings and
 /// children can be computed by arithmetic without building strings (z in bits 48+, x in 24..47, y in 0..23).
 /// </summary>
 public static class TileKey
@@ -36,17 +39,18 @@ public static class TileKey
     public static long Sibling(long k, int q) => Pack(Z(k), (X(k) & ~1) + (q & 1), (Y(k) & ~1) + (q >> 1));
 
     /// <summary>
-    /// Parses "z/x/y" (vector layer) or "t/z/x/y" (terrain layer, api 1.5) without logging. <paramref name="terrain"/> tells the layer;
-    /// the packed value is the same z/x/y packing for both (each layer has its own tile map, so the two never mix).
+    /// Parses "z/x/y" (vector layer), "t/z/x/y" (terrain layer, api 1.5) or "l/z/x/y" (landmark layer, api 1.11) without logging.
+    /// <paramref name="layer"/> tells the layer; the packed value is the same z/x/y packing for all three (each layer has its own tile map,
+    /// so the maps never mix).
     /// </summary>
-    public static bool TryParse(string key, out long packed, out bool terrain)
+    public static bool TryParse(string key, out long packed, out TileLayer layer)
     {
         packed = 0;
-        terrain = false;
+        layer = TileLayer.World;
         var span = key.AsSpan();
-        if (span.Length > 2 && span[0] == 't' && span[1] == '/')
+        if (span.Length > 2 && span[1] == '/' && (span[0] == 't' || span[0] == 'l'))
         {
-            terrain = true;
+            layer = span[0] == 't' ? TileLayer.Terrain : TileLayer.Landmarks;
             span = span.Slice(2);
         }
         int a = span.IndexOf('/');
@@ -61,11 +65,11 @@ public static class TileKey
         return true;
     }
 
-    /// <summary>Vector-layer keys only: false (silently) for a terrain key "t/z/x/y", which belongs to the terrain tile map.</summary>
+    /// <summary>Vector-layer keys only: false (silently) for a terrain key "t/z/x/y" or a landmark key "l/z/x/y", which belong to their own tile maps.</summary>
     public static bool TryParse(string key, out long packed)
     {
-        bool ok = TryParse(key, out packed, out bool terrain);
-        if (terrain) { packed = 0; return false; }
+        bool ok = TryParse(key, out packed, out TileLayer layer);
+        if (layer != TileLayer.World) { packed = 0; return false; }
         return ok;
     }
 
@@ -73,4 +77,7 @@ public static class TileKey
 
     /// <summary>Key text of the terrain layer: "t/z/x/y".</summary>
     public static string ToTerrainText(long k) => "t/" + ToText(k);
+
+    /// <summary>Key text of the landmark layer: "l/z/x/y".</summary>
+    public static string ToLandmarkText(long k) => "l/" + ToText(k);
 }

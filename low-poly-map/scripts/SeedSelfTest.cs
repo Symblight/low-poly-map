@@ -150,6 +150,12 @@ public partial class SeedSelfTest : Node
         _view.Streamer.DebugTiles(_tiles);
         foreach (var t in _tiles)
         {
+            if (t.Layer == TileLayer.Landmarks) // api 1.11: a flat third map (a seed world delivers none; "empty" = built, never delivered)
+            {
+                if (t.State is TileState.Queued or TileState.Fetching or TileState.Meshing or TileState.Unloading) return false;
+                if (t.State == TileState.Ready && !_view.LandmarkCover.TryGet(t.Packed, out _)) return false;
+                continue;
+            }
             if (t.State != TileState.Ready) return false;
             if (!(t.Terrain ? _view.TerrainCover : _view.Cover).TryGet(t.Packed, out _)) return false;
         }
@@ -191,6 +197,7 @@ public partial class SeedSelfTest : Node
         int seedTiles = 0, terrainTiles = 0;
         foreach (var t in _tiles)
         {
+            if (t.Layer == TileLayer.Landmarks) continue;
             if (t.Terrain) { terrainTiles++; if (t.Source != "terrain") { Fail("source " + name, $"terrain tile {t.Key} has source '{t.Source}'"); break; } }
             else { seedTiles++; if (t.Source != "seed") { Fail("source " + name, $"vector tile {t.Key} has source '{t.Source}'"); break; } }
         }
@@ -233,7 +240,7 @@ public partial class SeedSelfTest : Node
         _view.Streamer.DebugTiles(_tiles);
         foreach (var t in _tiles)
         {
-            if (t.Terrain || t.State != TileState.Ready || (ring >= 0 && t.Ring != ring)) continue;
+            if (t.Terrain || t.Layer == TileLayer.Landmarks || t.State != TileState.Ready || (ring >= 0 && t.Ring != ring)) continue;
             if (p.X < t.Min.X || p.X > t.Max.X || p.Z < t.Min.Y || p.Z > t.Max.Y) continue;
             if (!_view.Cover.TryGet(t.Packed, out var n)) continue;
             if (needGround && !(n.HasGround && n.GroundTris > 0)) continue;

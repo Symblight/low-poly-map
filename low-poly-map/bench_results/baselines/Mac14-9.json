@@ -1,0 +1,57 @@
+{
+  "low-250@release": {
+    "frame_p95_ms": 12.5,
+    "frame_mean_ms": 8.341,
+    "avg_fps": 119.9,
+    "gpu_p95_ms": 0,
+    "draw_calls_mean": 977,
+    "process_mb_last": 888.5,
+    "seconds": 60,
+    "library_flavour": "release",
+    "recorded_utc": "2026-10-28T17:33:19Z"
+  },
+  "climb@release": {
+    "frame_p95_ms": 13.75,
+    "frame_mean_ms": 6.492,
+    "avg_fps": 154,
+    "gpu_p95_ms": 0,
+    "draw_calls_mean": 548,
+    "process_mb_last": 1041.5,
+    "seconds": 60,
+    "library_flavour": "release",
+    "recorded_utc": "2026-10-28T17:34:41Z"
+  },
+  "zoom@release": {
+    "frame_p95_ms": 11,
+    "frame_mean_ms": 4.016,
+    "avg_fps": 249,
+    "gpu_p95_ms": 0,
+    "draw_calls_mean": 539,
+    "process_mb_last": 1230,
+    "seconds": 60,
+    "library_flavour": "release",
+    "recorded_utc": "2026-10-28T17:35:52Z"
+  },
+  "night-low@release": {
+    "frame_p95_ms": 3,
+    "frame_mean_ms": 2.143,
+    "avg_fps": 466.7,
+    "gpu_p95_ms": 0,
+    "draw_calls_mean": 955,
+    "process_mb_last": 920.6,
+    "seconds": 60,
+    "library_flavour": "release",
+    "recorded_utc": "2026-10-28T17:37:02Z"
+  },
+  "reconfigure@release": {
+    "frame_p95_ms": 10.5,
+    "frame_mean_ms": 6.742,
+    "avg_fps": 148.3,
+    "gpu_p95_ms": 0,
+    "draw_calls_mean": 797,
+    "process_mb_last": 1508.4,
+    "seconds": 60,
+    "library_flavour": "release",
+    "recorded_utc": "2026-10-28T17:38:13Z"
+  }
+}

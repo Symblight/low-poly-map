@@ -17,6 +17,7 @@ namespace LowPolyMap;
 /// </summary>
 public partial class NightRenderController : WorldEnvironment
 {
+    bool _noShadows;
     public enum ToneMapper { Filmic = 0, AgX = 1 }
 
     [Export] public WorldView? Bridge { get; set; }
@@ -88,6 +89,7 @@ public partial class NightRenderController : WorldEnvironment
                 Tonemap = arg.Substring(10).ToLowerInvariant() == "agx" ? ToneMapper.AgX : ToneMapper.Filmic;
             else if (arg == "--no-exposure") ExternalView = false;
             else if (arg == "--no-glow") _testNoGlow = true;
+            else if (arg == "--no-shadows") _noShadows = true;
             else if (arg.StartsWith("--glow-blend=", System.StringComparison.Ordinal)) _testBlend = arg.Substring(13);
             else if (arg.StartsWith("--cam-alt=", System.StringComparison.Ordinal) && float.TryParse(arg.Substring(10), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var ca)) _testAlt = ca;
             else if (arg.StartsWith("--cam-pitch=", System.StringComparison.Ordinal) && float.TryParse(arg.Substring(12), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var cp)) _testPitch = cp;
@@ -238,7 +240,7 @@ public partial class NightRenderController : WorldEnvironment
         {
             Sun.LightColor = DaySun.Lerp(NightMoon, night);
             Sun.LightEnergy = Mathf.Lerp(1f, 0.05f, night);
-            Sun.ShadowEnabled = night < 0.5f; // shadows off at night
+            Sun.ShadowEnabled = night < 0.5f && !_noShadows; // shadows off at night (and with --no-shadows, for perf A/B)
         }
     }
 }

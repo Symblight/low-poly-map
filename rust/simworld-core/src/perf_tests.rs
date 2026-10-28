@@ -172,14 +172,16 @@ fn perf_idle_worker_cpu() {
 #[ignore]
 fn perf_synthetic_cold_fill() {
     for terrain in [false, true] {
-        let mut v = Vec::new();
+        let (mut v, mut cpu) = (Vec::new(), Vec::new());
         for _ in 0..3 {
             let mut w = world();
+            let c0 = process_cpu_us();
             assert!(w.configure_world(options(terrain)).ok);
-            v.push(settle(&mut w, 60.0));
+            v.push((settle(&mut w, 60.0) * 1000.0).round() / 1000.0);
+            cpu.push(((process_cpu_us() - c0) as f64 / 1e4).round() / 100.0);
             w.shutdown();
         }
-        eprintln!("cold fill {:7}: {:?} s", if terrain { "terrain" } else { "flat" }, v.iter().map(|s| (s * 1000.0).round() / 1000.0).collect::<Vec<_>>());
+        eprintln!("cold fill {:7}: {v:?} s wall, {cpu:?} s process CPU", if terrain { "terrain" } else { "flat" });
     }
 }
 
@@ -226,4 +228,28 @@ fn perf_job_pool_trickle() {
         others.saturating_sub(work) as f64 / 1000.0 / frames as f64
     );
     assert!(pool.shutdown(Duration::from_secs(1)));
+}
+
+/// The synthetic overview data tile (z11) under the origin with the terrain on: generation time,
+/// and resolving every block base on top (what an eager generation paid).
+#[test]
+#[ignore]
+fn perf_synthetic_overview_tile() {
+    use crate::data::{synthetic_data_tile, DataLevel};
+    let mut w = crate::profile::WorldProfile::default();
+    w.terrain.enabled = true;
+    let profile = crate::profile::Profile::new(w).unwrap();
+    let frame = crate::geo::Frame::new(VILNIUS.0, VILNIUS.1);
+    let terrain = crate::Terrain::from_profile(&profile, VILNIUS.0, VILNIUS.1);
+    let key = crate::geo::tile_for(VILNIUS.0, VILNIUS.1, 11);
+    let mut best = (f64::INFINITY, f64::INFINITY);
+    for _ in 0..3 {
+        let t = Instant::now();
+        let dt = synthetic_data_tile(key, DataLevel::Overview, frame, &terrain, &profile);
+        let gen = t.elapsed().as_secs_f64() * 1000.0;
+        let all: Vec<usize> = (0..dt.buildings.len()).collect();
+        let _ = dt.lazy_bases.based(&dt.buildings, &all, &dt.proj);
+        best = (best.0.min(gen), best.1.min(t.elapsed().as_secs_f64() * 1000.0));
+    }
+    eprintln!("synthetic overview {key} with terrain: generated in {:.1} ms, {:.1} ms with every block base", best.0, best.1);
 }

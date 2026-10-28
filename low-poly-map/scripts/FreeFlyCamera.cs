@@ -163,8 +163,25 @@ public partial class FreeFlyCamera : Camera3D, IWorldCameraSource
         GD.Print($"[FreeFlyCamera] altitude -> {altAgl:0} m AGL");
     }
 
+    /// <summary>
+    /// Scripted control (benchmarks): the camera takes no input and does not move on its own; the driver places it every frame with
+    /// <see cref="Place"/>.
+    /// </summary>
+    public bool Scripted { get; set; }
+
+    /// <summary>Puts the camera at <paramref name="position"/> with the given velocity (what update_camera reports), look direction and vertical field of view (degrees).</summary>
+    public void Place(Vector3 position, Vector3 velocity, float yaw, float pitch, float fovDeg)
+    {
+        GlobalPosition = position;
+        Velocity = velocity;
+        SetLook(yaw, pitch);
+        BaseFov = fovDeg;
+        Fov = fovDeg;
+    }
+
     public override void _Process(double delta)
     {
+        if (Scripted) return;
         Move(delta);
         float fov = Input.IsPhysicalKeyPressed(Key.Z) ? BaseFov / ZoomFactor : BaseFov;
         if (BaseFov > 0f && !Mathf.IsEqualApprox(Fov, fov)) Fov = fov;

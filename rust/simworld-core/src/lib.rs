@@ -71,7 +71,7 @@ pub const API_MAJOR: u32 = 1;
 /// Contract (`docs/contract.md`) minor version. A minor bump is additive only.
 /// Independent of the crate version; must equal the `api_version:` line of `docs/contract.md`
 /// (pinned by `tests::api_version_matches_contract_doc`).
-pub const API_MINOR: u32 = 10;
+pub const API_MINOR: u32 = 11;
 
 #[cfg(test)]
 mod tests {

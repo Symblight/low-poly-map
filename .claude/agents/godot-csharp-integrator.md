@@ -34,6 +34,8 @@ It covers the `WorldStreamer` methods and per-frame call order, the ready-tile d
 
 Host-side usage (not contract, this project's choices):
 
+- Landmark layer (api 1.11, contract 9b): `l/z/x/y` keys arrive only when `configure_world` `layers` contains `"landmarks"`; pass it only once `TileKey` parses `l/` keys and a landmark pool draws them (visible while uploaded, never faded). Until then the library folds landmarks into the vector chunks.
+
 - Create the node with `ClassDB.Instantiate("WorldStreamer")` and call it through `GodotObject.Call(...)`. Wrap all calls in one typed C# facade (`WorldStreamerFacade`) so nothing else touches method or key strings.
 - Check `api_version()` once after creating the node (fallback: `debug_stats()["api_major"/"api_minor"]`): a different major is never driven; a lower minor logs which facade features are missing; a library without `api_version` falls back to method probing with a warning.
 - `configure` once in `_Ready`. Default origin: Vilnius 54.6872, 25.2797. Empty `tile_url` = synthetic city. `cache_dir` = `user://tile_cache` globalized.

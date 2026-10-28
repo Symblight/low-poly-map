@@ -43,6 +43,9 @@ pub enum LayerKind {
     World,
     /// The terrain mesh: zooms `terrain.far_zoom..=terrain.near_zoom`, keys `"t/z/x/y"`.
     Terrain,
+    /// Landmarks (api 1.11, Tiles and LOD v2 step T2b): one tile per overview data tile, keys
+    /// `"l/z/x/y"` at the overview zoom (root = leaf zoom), additive refinement (never faded).
+    Landmarks,
 }
 
 impl LayerKind {
@@ -51,6 +54,7 @@ impl LayerKind {
         match self {
             LayerKind::World => "world",
             LayerKind::Terrain => "terrain",
+            LayerKind::Landmarks => "landmarks",
         }
     }
     /// Key prefix (`"t/"` for terrain, none for the vector world).
@@ -58,6 +62,7 @@ impl LayerKind {
         match self {
             LayerKind::World => "",
             LayerKind::Terrain => "t/",
+            LayerKind::Landmarks => "l/",
         }
     }
 }
@@ -77,12 +82,18 @@ impl LayerKey {
     pub const fn terrain(key: TileKey) -> Self {
         Self { layer: LayerKind::Terrain, key }
     }
-    /// Parse `"z/x/y"` or `"t/z/x/y"`.
+    pub const fn landmarks(key: TileKey) -> Self {
+        Self { layer: LayerKind::Landmarks, key }
+    }
+    /// Parse `"z/x/y"`, `"t/z/x/y"` or `"l/z/x/y"`.
     pub fn parse(s: &str) -> Option<Self> {
-        match s.strip_prefix("t/") {
-            Some(r) => TileKey::parse(r).map(Self::terrain),
-            None => TileKey::parse(s).map(Self::world),
+        if let Some(r) = s.strip_prefix("t/") {
+            return TileKey::parse(r).map(Self::terrain);
         }
+        if let Some(r) = s.strip_prefix("l/") {
+            return TileKey::parse(r).map(Self::landmarks);
+        }
+        TileKey::parse(s).map(Self::world)
     }
 }
 
@@ -445,7 +456,7 @@ impl ViewPoint {
         self.root_candidates_at(l.reach_m() * l.hysteresis, l.root_zoom, max_top_m, out)
     }
 
-    fn root_candidates_at(&self, reach: f64, root_zoom: u8, max_top_m: f64, out: &mut Vec<TileKey>) {
+    pub(crate) fn root_candidates_at(&self, reach: f64, root_zoom: u8, max_top_m: f64, out: &mut Vec<TileKey>) {
         let v = (self.alt - max_top_m).max(0.0);
         if v >= reach {
             return;

@@ -38,6 +38,8 @@ lowpolymap/rust/
                           #   state.rs (TileState, Entry, ReadyTile, Stats, CpuStats), fade.rs (Fade, fade_gap_m),
                           #   sim.rs (GodotSim: the host visibility rule), tests.rs
       fetch.rs            # PMTiles over HTTPS range requests + SQLite disk cache (own cache thread; docs/spec-tile-cache.md)
+      data.rs             # Tiles v2 data tiles: DataLevels (detail z14 / overview z11 / compat), decode, chunks cut in memory,
+                          #   landmark tiles (l/z/x/y, api 1.11), synthetic data levels; scheduler/data.rs DataStore, scheduler/landmarks.rs
       mvt.rs              # vector tile decode -> Building structs
       mesher.rs           # simplify, extrude walls, earcut roofs, merge per tile
       ground.rs           # ground areas + road strips per tile

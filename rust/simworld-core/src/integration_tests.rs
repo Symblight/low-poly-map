@@ -109,7 +109,7 @@ fn bench_update_camera_cost() {
                         let result = build_tile(key, ring, frame, &payload, &Profile::default());
                         let _ = s.handle(WorkerMsg::Decoded { key, ring, job, result }, t_start);
                     }
-                    Job::Terrain { .. } | Job::FetchData { .. } | Job::DecodeData { .. } | Job::MeshChunk { .. } => {
+                    Job::Terrain { .. } | Job::FetchData { .. } | Job::DecodeData { .. } | Job::MeshChunk { .. } | Job::MeshLandmarks { .. } => {
                         unreachable!("vector layer, per-tile scheduler")
                     }
                 }

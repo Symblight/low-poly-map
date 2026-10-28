@@ -77,8 +77,10 @@ pub struct WorldOptions {
     /// Replaces the diagnostics switches when set.
     pub diagnostics: Option<Diagnostics>,
     /// Layers the host draws (`configure_world` option `layers`, api 1.4): `None` = `["world"]`.
-    /// Known names: `world` (the vector world, always on) and `terrain` (procedural relief;
-    /// active only together with the profile's `terrain.enabled`). An unknown name is an error.
+    /// Known names: `world` (the vector world, always on), `terrain` (procedural relief;
+    /// active only together with the profile's `terrain.enabled`) and **[1.11]** `landmarks`
+    /// (the host draws the landmark layer, `l/z/x/y`; without it landmarks of a two-level
+    /// archive are folded into the vector chunks). An unknown name is an error.
     pub layers: Option<Vec<String>>,
     /// Centre `(lat, lon)` of the terrain's flat zone (`configure_world` option `terrain_center`,
     /// api 1.6): `None` = the world origin. A host that reconfigures with a new origin (a
@@ -199,7 +201,7 @@ pub struct SeedInfo {
 }
 
 /// Layer names `configure_world` accepts in `layers`.
-pub const KNOWN_LAYERS: &[&str] = &["world", "terrain"];
+pub const KNOWN_LAYERS: &[&str] = &["world", "terrain", "landmarks"];
 
 /// Warning logged once per configure when the profile enables the terrain but the host did not
 /// request the layer.
@@ -298,6 +300,14 @@ pub struct WorldStats {
     pub data_tiles_decoded: u64,
     /// Data tile fetches completed since configure (disk cache or network).
     pub data_tiles_fetched: u64,
+    /// Of those: overview tiles, and tiles absent from the archive (empty).
+    pub data_tiles_fetched_overview: u64,
+    pub data_tiles_fetched_empty: u64,
+    /// The landmark layer (api 1.11; zero unless the host requested it and the source has
+    /// landmarks).
+    pub landmarks: crate::scheduler::LandmarkStats,
+    /// The data levels of the source (`None`: per-tile source, or the archive has not opened yet).
+    pub data_levels: Option<crate::data::DataLevels>,
 }
 
 fn first4(a: [i32; MAX_RINGS]) -> [i32; RING_COUNT] {
@@ -365,6 +375,8 @@ pub struct World {
     /// section 6). Kept across configures (the budget follows the new profile; owners clear
     /// their own pool when their data becomes stale); cleared by `shutdown`.
     memory: MemoryBudget,
+    /// Tests: an archive source is read per tile in every band, like api 1.7 (no data tiles).
+    per_tile_archive: bool,
 }
 
 /// With `diagnostics.profile` on, the streaming latency table is logged this often.
@@ -407,6 +419,7 @@ impl World {
             seed: None,
             seed_cache: None,
             memory: MemoryBudget::new(mb_to_bytes(crate::profile::Memory::default().budget_mb)),
+            per_tile_archive: false,
         }
     }
 
@@ -486,6 +499,26 @@ impl World {
                     self.log.error(&format!("WorldStreamer: {s}"));
                     self.health.set_fatal(&s);
                 }
+                WorkerMsg::Levels(l) => {
+                    if sched.set_data_levels(l) {
+                        let what = if l.two_level {
+                            format!(
+                                "two-level archive (detail z{}, overview z{}{})",
+                                l.detail,
+                                l.overview,
+                                match (l.landmarks, sched.landmark_layer_active()) {
+                                    (false, _) => "",
+                                    (true, true) => ", landmark layer",
+                                    (true, false) => ", landmarks folded into the chunks",
+                                }
+                            )
+                        } else {
+                            "archive without simworld_levels (zooms 13..16, compatibility levels)".to_string()
+                        };
+                        self.log.info(&format!("WorldStreamer: data levels: {what}"));
+                    }
+                }
+                WorkerMsg::OpenFailed(e) => self.health.record_fetch(&Err(e), now),
                 m @ (WorkerMsg::TerrainBuilt { .. } | WorkerMsg::Dropped { layer: LayerKind::Terrain, .. }) => {
                     if let WorkerMsg::TerrainBuilt { result: Err(e), .. } = &m {
                         self.health.record_decode_failure(e, now);
@@ -524,6 +557,7 @@ impl World {
             let d = |j: &Job| match *j {
                 Job::Terrain { key, .. } => t.camera_distance(key),
                 Job::FetchData { key, .. } | Job::DecodeData { key, .. } => w.data_distance(key),
+                Job::MeshLandmarks { key, .. } => w.landmark_distance(key),
                 Job::Fetch { key, .. } | Job::Decode { key, .. } | Job::MeshChunk { key, .. } => w.camera_distance(key),
             };
             d(a).total_cmp(&d(b))
@@ -555,6 +589,7 @@ impl World {
                 let prio = match &j {
                     Job::Terrain { key, .. } => self.terrain_sched.as_ref().map(|t| t.job_priority(*key)),
                     Job::FetchData { key, .. } | Job::DecodeData { key, .. } => self.scheduler.as_ref().map(|s| s.data_job_priority(*key)),
+                    Job::MeshLandmarks { key, .. } => self.scheduler.as_ref().map(|s| Priority::on_demand(s.landmark_distance(*key))),
                     Job::Fetch { key, .. } | Job::Decode { key, .. } | Job::MeshChunk { key, .. } => {
                         self.scheduler.as_ref().map(|s| s.job_priority(*key))
                     }
@@ -707,6 +742,7 @@ impl World {
         self.local = LocalSpace::default();
         self.pending_shift = [0.0; 3];
         let wants_terrain = o.layers.as_ref().is_some_and(|l| l.iter().any(|x| x == "terrain"));
+        let wants_landmarks = o.layers.as_ref().is_some_and(|l| l.iter().any(|x| x == "landmarks"));
         // Validation warnings once per load (a reused world logged them already).
         let fresh_seed = seed.as_ref().is_some_and(|s| !self.seed_cache.as_ref().is_some_and(|c| Arc::ptr_eq(c, s)));
         if let Some(s) = &seed {
@@ -741,11 +777,19 @@ impl World {
                 w.set_seed(self.seed.clone());
                 let mut s = Scheduler::new(frame, w.is_synthetic(), self.profile.clone()).with_terrain(self.terrain.clone());
                 s.set_lod_view(&self.lod_view, self.lod_quality);
-                if !w.is_synthetic() {
-                    // Tiles v2 (T2a): R0 / R1 are cut from detail data tiles. An archive without
-                    // `simworld_levels` metadata (zooms 13..16) is read with the compatibility
-                    // levels (detail z14); two-level archives come with step T2b.
-                    s = s.with_data_levels(crate::data::DataLevels::COMPAT);
+                // Tiles v2: chunks are cut from data tiles. An archive's levels are known once it
+                // opened (`WorkerMsg::Levels`: two-level, or the compatibility levels of an archive
+                // without `simworld_levels`); the synthetic city is a two-level source generated
+                // in memory (T2c); a seed world keeps its per-tile generator.
+                if self.seed.is_none() {
+                    s = if w.is_synthetic() {
+                        s.with_data_levels(crate::data::DataLevels::SYNTHETIC)
+                    } else if self.per_tile_archive {
+                        s
+                    } else {
+                        s.with_data_pending()
+                    };
+                    s = s.with_landmark_layer(wants_landmarks);
                 }
                 self.scheduler = Some(s);
                 if self.terrain.is_active() {
@@ -856,6 +900,7 @@ impl World {
         // The host keeps whatever we handed out before: unload it with the next drain_unload.
         if let Some(s) = &mut self.scheduler {
             self.stale_unloads.extend(s.delivered_keys().into_iter().map(LayerKey::world));
+            self.stale_unloads.extend(s.delivered_landmark_keys().into_iter().map(LayerKey::landmarks));
             // The decoded data tiles go with the scheduler: out of the memory budget.
             s.release_memory(&mut self.memory);
         }
@@ -1115,6 +1160,11 @@ impl World {
                 self.unload_buf.extend(self.key_tmp.iter().map(|&key| LayerKey { layer, key }));
             }
         }
+        if let Some(s) = &mut self.scheduler {
+            self.key_tmp.clear();
+            s.drain_landmark_unload(&mut self.key_tmp);
+            self.unload_buf.extend(self.key_tmp.iter().map(|&key| LayerKey::landmarks(key)));
+        }
         &self.unload_buf
     }
 
@@ -1171,7 +1221,18 @@ impl World {
             data_tiles_loaded: data.loaded,
             data_tiles_decoded: data.decoded,
             data_tiles_fetched: data.fetched,
+            data_tiles_fetched_overview: data.fetched_overview,
+            data_tiles_fetched_empty: data.fetched_empty,
+            landmarks: self.scheduler.as_ref().map(|s| s.landmark_stats()).unwrap_or_default(),
+            data_levels: self.scheduler.as_ref().and_then(|s| s.data_levels()),
         }
+    }
+
+    /// Tests and benches: read an archive per tile in every band (the api 1.7 behaviour; a
+    /// two-level archive then shows nothing). Takes effect at the next configure.
+    #[cfg(test)]
+    pub(crate) fn set_per_tile_archive(&mut self, on: bool) {
+        self.per_tile_archive = on;
     }
 
     /// The memory budget (Terrain v2 section 6): pool owners register their items with a byte
@@ -1268,6 +1329,11 @@ impl World {
     }
 
     /// Whether the terrain-mesh layer runs (terrain active and configured).
+    pub fn landmark_layer_active(&self) -> bool {
+        self.scheduler.as_ref().is_some_and(|s| s.landmark_layer_active())
+    }
+
+    /// The terrain-mesh layer runs (api 1.5).
     pub fn terrain_layer_active(&self) -> bool {
         self.terrain_sched.is_some()
     }
@@ -1307,8 +1373,8 @@ impl World {
         match layer {
             LayerKind::Terrain => "terrain",
             LayerKind::World if self.seed.is_some() => "seed",
-            LayerKind::World if self.worker.as_ref().is_some_and(|w| w.is_synthetic()) => "synthetic",
-            LayerKind::World => "archive",
+            LayerKind::World | LayerKind::Landmarks if self.worker.as_ref().is_some_and(|w| w.is_synthetic()) => "synthetic",
+            LayerKind::World | LayerKind::Landmarks => "archive",
         }
     }
 
@@ -1422,6 +1488,9 @@ impl World {
             if let Some(s) = s {
                 s.for_each_tile(|key, ring, state, rect| f(LayerKey { layer, key }, ring, state, local.rect_to_local(rect)));
             }
+        }
+        if let Some(s) = &self.scheduler {
+            s.for_each_landmark(|key, state, rect| f(LayerKey::landmarks(key), 0, state, local.rect_to_local(rect)));
         }
     }
 }

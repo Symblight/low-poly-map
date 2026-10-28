@@ -211,3 +211,42 @@ fn perf_stream_cold_fill() {
     );
     assert!(w.shutdown());
 }
+
+/// Overview data tiles of the real archive (`SIMWORLD_V2_ARCHIVE`) decoded with the terrain on
+/// (perf review 2 item 7): thread CPU of the decode per tile (best of 3) for the 9 z11 tiles
+/// around the densest one, the time before any of its 64 chunks can mesh.
+#[test]
+#[ignore]
+fn perf_stream_overview_decode() {
+    let Ok(v2) = std::env::var("SIMWORLD_V2_ARCHIVE") else {
+        eprintln!("SIMWORLD_V2_ARCHIVE not set; skipped");
+        return;
+    };
+    let (url, _) = crate::data_world_tests::serve(std::fs::read(v2).expect("v2 archive"));
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let f = crate::fetch::Fetcher::new(&url, "", Arc::new(std::sync::atomic::AtomicU64::new(0)), crate::fetch::FetchParams::default(), Box::new(|_| {})).unwrap();
+    let mut w = crate::profile::WorldProfile::default();
+    w.terrain.enabled = true;
+    let profile = crate::profile::Profile::new(w).unwrap();
+    let frame = crate::geo::Frame::new(VILNIUS.0, VILNIUS.1);
+    let terrain = crate::Terrain::from_profile(&profile, VILNIUS.0, VILNIUS.1);
+    let (mut total, mut worst, mut blocks) = (0.0f64, (0.0f64, crate::geo::TileKey::new(0, 0, 0)), 0usize);
+    for dy in 0..3u32 {
+        for dx in 0..3u32 {
+            let key = crate::geo::TileKey::new(11, 1166 + dx, 649 + dy);
+            let Ok((bytes, _)) = rt.block_on(f.fetch(key)) else { continue };
+            let mut best = f64::INFINITY;
+            for _ in 0..3 {
+                let c = crate::diag::thread_cpu_us();
+                let dt = crate::data::decode_overview_tile(key, frame, &terrain, &bytes, &profile).unwrap();
+                best = best.min((crate::diag::thread_cpu_us() - c) as f64 / 1e3);
+                blocks = blocks.max(dt.buildings.len());
+            }
+            total += best;
+            if best > worst.0 {
+                worst = (best, key);
+            }
+        }
+    }
+    eprintln!("overview decode with terrain, 9 tiles around 11/1167/650: total {total:.0} ms CPU, worst {:.0} ms ({}), most blocks in a tile {blocks}", worst.0, worst.1);
+}

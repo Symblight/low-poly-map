@@ -1200,7 +1200,11 @@ pub fn decode_overview_on(bytes: &[u8], key: TileKey, frame: Frame, terrain: &Te
     decode_roads(&reader, &layers, &mut ground.roads, profile, extent)?;
     ground.sort();
     let proj = TileProjector::new(key, frame, extent).with_terrain(terrain.clone());
-    let mut blocks = decode_building_layer(&reader, &layers, BLOCKS_LAYER, extent, &proj, &landuse)?;
+    // Block bases are left open (placeholder from the flat projector): the R2 chunks that mesh a
+    // block resolve it with `proj` (`data::LazyBases`, perf review 2 item 7: thousands of blocks
+    // sampled the terrain along every edge before any chunk of the tile could start).
+    let flat = TileProjector::new(key, frame, extent);
+    let mut blocks = decode_building_layer(&reader, &layers, BLOCKS_LAYER, extent, &flat, &landuse)?;
     sort_buildings(&mut blocks);
     let mut landmarks = decode_building_layer(&reader, &layers, LANDMARKS_LAYER, extent, &proj, &landuse)?;
     sort_buildings(&mut landmarks);

@@ -259,11 +259,12 @@ pub fn decode_data_tile(key: TileKey, frame: Frame, terrain: &Terrain, bytes: &[
     Ok(DataTile::detail(key, d.buildings, d.ground, d.proj, t0))
 }
 
-/// Decode an overview data tile ([`crate::mvt::decode_overview_on`]).
+/// Decode an overview data tile ([`crate::mvt::decode_overview_on`]); the block bases stay open
+/// until a chunk meshes them ([`DataTile::with_open_bases`]).
 pub fn decode_overview_tile(key: TileKey, frame: Frame, terrain: &Terrain, bytes: &[u8], profile: &Profile) -> Result<DataTile, String> {
     let t0 = Instant::now();
     let d = decode_overview_on(bytes, key, frame, terrain, profile)?;
-    Ok(DataTile::overview(key, d.blocks, d.landmarks, d.lights, d.light_landmark, d.ground, d.proj, t0))
+    Ok(DataTile::overview(key, d.blocks, d.landmarks, d.lights, d.light_landmark, d.ground, d.proj, t0).with_open_bases())
 }
 
 /// Decode a data tile of `level`.

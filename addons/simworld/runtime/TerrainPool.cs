@@ -24,6 +24,8 @@ public sealed class TerrainPool
 {
     private readonly Node3D _container;
     private readonly Stack<TerrainNodes> _free = new();
+    private readonly PoolTrimmer _trimmer;
+    private readonly System.Action<TerrainNodes> _destroy;
     private readonly ShaderMaterial _material;
     private readonly ShaderMaterial _fadeMaterial;
 
@@ -36,7 +38,10 @@ public sealed class TerrainPool
     /// </summary>
     public float CullMargin { get; set; } = TilePool.CurveCullMargin;
 
+    /// <summary>Node sets that exist now (in use plus free); a trimmed set no longer counts.</summary>
     public int TotalCreated { get; private set; }
+    /// <summary>Node sets destroyed by <see cref="Trim"/> since start.</summary>
+    public int Trimmed => _trimmer.Trimmed;
     public int FreeCount => _free.Count;
     public ShaderMaterial Material => _material;
     public ShaderMaterial FadeMaterial => _fadeMaterial;
@@ -45,6 +50,8 @@ public sealed class TerrainPool
     {
         _container = container;
         settings ??= new WorldRenderSettings();
+        _trimmer = new PoolTrimmer("terrain tiles", settings);
+        _destroy = Destroy;
         string shaders = (addonRoot ?? AddonPaths.Root) + "/shaders";
         _material = new ShaderMaterial { Shader = GD.Load<Shader>(shaders + "/terrain.gdshader") };
         _fadeMaterial = new ShaderMaterial { Shader = TilePool.LoadDitherVariant(shaders + "/terrain.gdshader") };
@@ -71,6 +78,20 @@ public sealed class TerrainPool
         t.Ring = ring;
         t.MeshInstance.ExtraCullMargin = CullMargin;
         return t;
+    }
+
+    /// <summary>Once per frame: destroys a few idle node sets when the free list has stayed above its margin (see <see cref="PoolTrimmer"/>). Returns how many.</summary>
+    public int Trim(double delta)
+    {
+        int n = _trimmer.Step(delta, TotalCreated - _free.Count, _free, _destroy);
+        TotalCreated -= n;
+        return n;
+    }
+
+    private void Destroy(TerrainNodes t)
+    {
+        _container.RemoveChild(t.Root);
+        t.Root.QueueFree();
     }
 
     public void Release(TerrainNodes t)

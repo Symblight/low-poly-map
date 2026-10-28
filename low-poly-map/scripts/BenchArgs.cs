@@ -7,7 +7,7 @@ namespace LowPolyMap;
 /// <summary>
 /// Test-bench launch arguments for the <see cref="WorldView"/> (host side: the addon itself reads no command line). Applies
 /// <c>--tile-url=</c>, <c>--no-landmarks</c>, <c>--curvature=</c>, <c>--light-alpha=</c>, <c>--fake-fade=</c>, <c>--profile=</c>, <c>--area=</c>,
-/// <c>--set=</c>, <c>--lod-selftest</c>, <c>--view=</c> / <c>--cam-fov=</c> (screen-space LOD view), <c>--world=</c> (seed world), <c>--seed-spot=</c>, <c>--seed-selftest</c>, <c>--cover-selftest</c>, <c>--latency-log=</c> and the terrain arguments (<c>--terrain</c>, <c>--terrain-detail=</c>,
+/// <c>--set=</c>, <c>--lod-selftest</c>, <c>--view=</c> / <c>--cam-fov=</c> (screen-space LOD view), <c>--render-scale=</c> (3D render scale), <c>--memory-budget-mb=</c>, <c>--pool-trim-hold=</c>, <c>--world=</c> (seed world), <c>--seed-spot=</c>, <c>--seed-selftest</c>, <c>--cover-selftest</c>, <c>--latency-log=</c> and the terrain arguments (<c>--terrain</c>, <c>--terrain-detail=</c>,
 /// <c>--terrain-reach-km=</c>, <c>--terrain-amplitude=</c>, <c>--far=</c>, <c>--terrain-selftest</c>, <c>--terrain-collision</c>,
 /// <c>--terrain-collision-selftest</c>), then starts the view (the scene turns
 /// <c>AutoStart</c> off). See low-poly-map/CLAUDE.md.
@@ -53,6 +53,13 @@ public partial class BenchArgs : Node
                 view.Camera.Fov = (float)cf;
             }
             else if (arg.StartsWith("--view=", System.StringComparison.Ordinal)) ParseViewOverride(view, arg.Substring(7));
+            else if (arg.StartsWith("--render-scale=", System.StringComparison.Ordinal) && TryNumber(arg.Substring(15), out var rs) && rs >= 0.25 && rs <= 2) // like rendering/scaling_3d/scale: set_view then carries the 3D render height
+            {
+                view.GetViewport().Scaling3DScale = (float)rs;
+                GD.Print($"[BenchArgs] 3D render scale {rs:0.##} (project setting rendering/scaling_3d/scale)");
+            }
+            else if (arg.StartsWith("--memory-budget-mb=", System.StringComparison.Ordinal) && TryNumber(arg.Substring(19), out var mb)) settings.MemoryBudgetMb = (float)mb; // e.g. 224 = the mobile default
+            else if (arg.StartsWith("--pool-trim-hold=", System.StringComparison.Ordinal) && TryNumber(arg.Substring(17), out var th)) settings.PoolTrimHoldS = th; // seconds before idle pool sets are freed; 0 = never
             else if (arg.StartsWith(ProfileArg, System.StringComparison.Ordinal)) view.ProfilePath = arg.Substring(ProfileArg.Length).Trim();
             // A second instance (e.g. a screenshot run while the bench is open) needs its own cache folder: the cache is locked per folder.
             else if (arg.StartsWith("--cache-dir=", System.StringComparison.Ordinal)) view.CacheDir = arg.Substring(12).Trim();

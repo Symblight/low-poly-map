@@ -170,6 +170,9 @@ public partial class WorldView : Node3D
     public int PoolCreated => _pool?.TotalCreated ?? 0;
     public int TerrainPoolFree => _terrainPool?.FreeCount ?? 0;
     public int TerrainPoolCreated => _terrainPool?.TotalCreated ?? 0;
+    /// <summary>Idle node sets the pools destroyed (<see cref="PoolTrimmer"/>); <see cref="PoolCreated"/> counts the sets that exist now.</summary>
+    public int PoolTrimmed => _pool?.Trimmed ?? 0;
+    public int TerrainPoolTrimmed => _terrainPool?.Trimmed ?? 0;
     /// <summary>The shared opaque terrain material (tests, debug UI).</summary>
     public ShaderMaterial? TerrainMaterial => _terrainPool?.Material;
     /// <summary>Frames that polled at least one tile / frames whose poll+upload exceeded the 2 ms budget (one big tile can).</summary>
@@ -262,7 +265,7 @@ public partial class WorldView : Node3D
     private TerrainCollision? _collision;
     private bool _loggedFirstTerrainTile;
     private bool _warnedNoTerrainLayer;
-    private bool _loggedNoLandmarks;
+    private bool _loggedNoLandmarks, _loggedMemoryBudget;
     private readonly HashSet<long> _pendingRootsT = new();
     private readonly HashSet<long> _suspectRootsT = new();
     private float _emissionLevel = 1f;
@@ -584,7 +587,8 @@ public partial class WorldView : Node3D
             BaseProfileOverrides = new Godot.Collections.Dictionary();
             options.Remove("profile_path");
             options.Remove("profile_overrides");
-            if (TerrainEnabled) options["profile_overrides"] = ComposeOverrides(null);
+            var retry = ComposeOverrides(null);
+            if (retry.Count > 0) options["profile_overrides"] = retry;
             result = Streamer.ConfigureWorld(options);
         }
         if (!result.Ok)
@@ -619,6 +623,11 @@ public partial class WorldView : Node3D
             if (!t.ContainsKey("enabled")) t["enabled"] = true;
             if (!t.ContainsKey("flat_radius_m")) t["flat_radius_m"] = 0.0;
             if (!t.ContainsKey("flat_blend_m")) t["flat_blend_m"] = 0.0;
+        }
+        if (MemoryBudget.Apply(merged, _settings.MemoryBudgetMb, ProfilePath, Streamer.HasSetView) && !_loggedMemoryBudget)
+        {
+            _loggedMemoryBudget = true;
+            GD.Print($"[WorldView] memory.budget_mb {_settings.MemoryBudgetMb:0.#} (WorldRenderSettings.MemoryBudgetMb; the library default is 512)");
         }
         if (panel != null) MergeInto(merged, panel);
         return merged;
@@ -1001,6 +1010,8 @@ public partial class WorldView : Node3D
             if (n0 != ReadyTotal + LandmarkReadyTotal) { UploadFrames++; if (UploadUsLastFrame > _settings.UploadBudgetUs) UploadFramesOverBudget++; }
             if (UploadUsLastFrame > _secUploadMax) _secUploadMax = UploadUsLastFrame;
             UpdateCollision();
+            _pool!.Trim(delta);
+            _terrainPool!.Trim(delta);
             _markings?.Update(_source.GlobalPosition, delta);
             _lodReadT += delta;
             if (_lodReadT >= LodReadIntervalS) { _lodReadT = 0; ReadLod(); }
@@ -1123,92 +1134,6 @@ public partial class WorldView : Node3D
             sb.Append(' ');
         }
         return sb.ToString();
-    }
-
-    private float _lastFov = -1f, _lastHeight = -1f;
-
-    /// <summary>Tells the sprite shader how many metres one pixel spans per metre of depth (changes with fov / window size).</summary>
-    private void UpdateSpriteScale()
-    {
-        if (Camera == null || _pool == null) return;
-        if (!ReadCameraView(out float fov, out float h)) return;
-        if (h < 1f) h = 720f;
-        if (fov == _lastFov && h == _lastHeight) return;
-        _lastFov = fov;
-        _lastHeight = h;
-        float k = 2f * Mathf.Tan(Mathf.DegToRad(fov) * 0.5f) / h;
-        _pool.SetSpritePxPerDepth(k);
-    }
-
-    /// <summary>
-    /// The camera's vertical field of view in degrees and the height in physical pixels of the viewport it renders to (a window with
-    /// content scale mode "viewport": the content scale height, a <see cref="SubViewport"/>: its size). A camera that keeps the width has
-    /// a horizontal fov, converted with the viewport aspect. False without a camera or with an orthogonal / frustum projection.
-    /// </summary>
-    private bool ReadCameraView(out float fovYDeg, out float heightPx)
-    {
-        fovYDeg = 0f;
-        heightPx = 0f;
-        var cam = Camera;
-        if (cam == null || cam.Projection != Camera3D.ProjectionType.Perspective) return false;
-        var vp = cam.GetViewport();
-        fovYDeg = cam.Fov;
-        if (cam.KeepAspect == Camera3D.KeepAspectEnum.Width)
-        {
-            var rect = vp.GetVisibleRect().Size;
-            float aspect = rect.Y > 0f ? rect.X / rect.Y : 16f / 9f;
-            fovYDeg = Mathf.RadToDeg(2f * Mathf.Atan(Mathf.Tan(Mathf.DegToRad(fovYDeg) * 0.5f) / aspect));
-        }
-        heightPx = vp switch
-        {
-            SubViewport sv => sv.Size.Y,
-            Window w => w.ContentScaleMode == Window.ContentScaleModeEnum.Viewport && w.ContentScaleSize.Y > 0 ? w.ContentScaleSize.Y : w.Size.Y,
-            _ => GetWindow().Size.Y,
-        };
-        return true;
-    }
-
-    /// <summary>Vertical fov (degrees), viewport height (pixels, after <see cref="WorldRenderSettings.LodPixelScale"/> or the override) and look direction that set_view carries / would carry; 0 until the first frame.</summary>
-    public float ViewFovYDeg { get; private set; }
-    public int ViewHeightPx { get; private set; }
-    public Vector3 ViewForward { get; private set; }
-
-    private const float ViewFovEpsDeg = 0.05f;
-    private static readonly float ViewForwardCos = Mathf.Cos(Mathf.DegToRad(2f));
-    private float? _viewFovOverride;
-    private int? _viewHOverride;
-    private bool _viewForce = true;
-
-    /// <summary>
-    /// Test aid: replaces the camera's vertical fov (degrees) and / or the viewport height (pixels, not scaled by <see cref="WorldRenderSettings.LodPixelScale"/>)
-    /// that go into set_view; null = measure again. Takes effect with the next frame.
-    /// </summary>
-    public void SetViewOverride(float? fovYDeg, int? heightPx)
-    {
-        _viewFovOverride = fovYDeg;
-        _viewHOverride = heightPx;
-        _viewForce = true;
-    }
-
-    /// <summary>
-    /// set_view (api 1.10) step, before update_camera: sends the camera's vertical fov, the viewport height in physical pixels and the look direction
-    /// when one of them changed (fov by more than 0.05 degrees, height at all, direction by more than 2 degrees) and after every configure. The values
-    /// are measured even on a library without set_view (overlay), but only a library with it gets the call.
-    /// </summary>
-    private void UpdateView()
-    {
-        if (!ReadCameraView(out float fov, out float h)) return;
-        if (_viewFovOverride.HasValue) fov = _viewFovOverride.Value;
-        int hp = _viewHOverride ?? Mathf.Max(1, Mathf.RoundToInt(h * _settings.LodPixelScale));
-        var fwd = -Camera!.GlobalTransform.Basis.Z;
-        fwd = fwd.LengthSquared() > 1e-8f ? fwd.Normalized() : Vector3.Forward;
-        ViewFovYDeg = fov;
-        ViewHeightPx = hp;
-        ViewForward = fwd;
-        if (fov <= 0f || !Streamer.HasSetView) return;
-        var s = Streamer;
-        if (!_viewForce && Mathf.Abs(fov - (float)s.LastViewFovYDeg) <= ViewFovEpsDeg && hp == s.LastViewHeightPx && fwd.Dot(s.LastViewForward) >= ViewForwardCos) return;
-        if (s.SetView(fov, hp, fwd)) _viewForce = false;
     }
 
     private void UploadTile(in ReadyTile tile)

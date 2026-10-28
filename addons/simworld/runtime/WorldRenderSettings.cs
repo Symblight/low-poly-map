@@ -21,10 +21,35 @@ public partial class WorldRenderSettings : Resource
     /// <summary>Seconds between cover consistency checks (0 = never).</summary>
     [Export] public double VerifyIntervalS { get; set; } = 5.0;
 
+    // ---- memory -------------------------------------------------------------------------------
+    /// <summary>
+    /// Seconds the free list of a node pool must stay above its margin before the surplus is freed (a few sets per frame); 0 = pools never shrink.
+    /// The window is tumbling, so the real delay is between one and two times this.
+    /// </summary>
+    [ExportGroup("Memory")]
+    [Export(PropertyHint.Range, "0,120,1,or_greater")] public double PoolTrimHoldS { get; set; } = 30.0;
+    /// <summary>Free node sets a pool always keeps (the margin is the larger of this and <see cref="PoolTrimPeakShare"/> x the recent peak in use).</summary>
+    [Export] public int PoolTrimMinFree { get; set; } = 64;
+    /// <summary>Share of the recent peak of node sets in use that stays free as the margin (0.25 = a quarter).</summary>
+    [Export(PropertyHint.Range, "0,1,0.05")] public float PoolTrimPeakShare { get; set; } = 0.25f;
+    /// <summary>Node sets destroyed per frame while trimming (each is a root with up to 7 children).</summary>
+    [Export(PropertyHint.Range, "1,32,1")] public int PoolTrimPerFrame { get; set; } = 4;
+    /// <summary>
+    /// Budget in MiB of the library's CPU-side pools (profile <c>memory.budget_mb</c>, api 1.10) that <see cref="WorldView"/> passes as a profile override
+    /// at every configure, unless the host's profile overrides or profile file set the key. 0 = the library default (512). The default of this
+    /// property is 224 on a mobile build (<c>OS.HasFeature("mobile")</c>, "ios" or "android") and 0 on desktop. Needs a library with api 1.10.
+    /// </summary>
+    [Export(PropertyHint.Range, "0,65536,1,or_greater")] public float MemoryBudgetMb { get; set; } = DefaultMemoryBudgetMb();
+
+    /// <summary>Platform default of <see cref="MemoryBudgetMb"/>: 224 MiB on mobile (iOS, Android), 0 (library default) elsewhere.</summary>
+    public static float DefaultMemoryBudgetMb() => OS.HasFeature("mobile") || OS.HasFeature("ios") || OS.HasFeature("android") ? MobileMemoryBudgetMb : 0f;
+    public const float MobileMemoryBudgetMb = 224f;
+
     // ---- level of detail ----------------------------------------------------------------------
     /// <summary>
     /// Multiplies the viewport height sent to <c>set_view</c> (api 1.10, screen-space LOD): below 1 the library works with fewer pixels, so tiles refine later
-    /// (a cheap load knob for a phone that renders at a lower resolution); 1 = the physical height of the rendered viewport.
+    /// (a cheap load knob); 1 = the 3D render height. The base is already the viewport height times its 3D render scale (<c>rendering/scaling_3d/scale</c>),
+    /// so a phone that renders at 0.5 scale gets half the pixels without touching this; use it only for an extra bias on top.
     /// </summary>
     [ExportGroup("Level of detail")]
     [Export(PropertyHint.Range, "0.1,4,0.05")] public float LodPixelScale { get; set; } = 1f;

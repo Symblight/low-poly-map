@@ -49,6 +49,10 @@ public partial class LatencyLog : Node
         sb.Append("[LatencyLog] ").Append(when).Append(", ").Append((Time.GetTicksMsec() / 1000.0).ToString("0"))
           .Append(" s since start; queued R0..R3 ").Append(string.Join("/", _stats.Queued))
           .Append(", loaded ").Append(string.Join("/", _stats.Loaded)).Append('\n');
+        sb.Append("  view: fov ").Append(_view.ViewFovYDeg.ToString("0.#")).Append(" deg, set_view H ").Append(_view.ViewHeightPx).Append(" px (viewport ").Append(_view.ViewportHeightPx.ToString("0"))
+          .Append(" x 3D render scale ").Append(_view.RenderScale.ToString("0.##")).Append("), library echo ").Append(_stats.ViewHeightPx).Append(" px\n")
+          .Append("  pools: vector ").Append(_view.PoolCreated - _view.PoolFree).Append(" in use + ").Append(_view.PoolFree).Append(" free (").Append(_view.PoolTrimmed).Append(" trimmed), terrain ")
+          .Append(_view.TerrainPoolCreated - _view.TerrainPoolFree).Append(" in use + ").Append(_view.TerrainPoolFree).Append(" free (").Append(_view.TerrainPoolTrimmed).Append(" trimmed)\n");
         if (_stats.HasJobs) sb.Append("  jobs: ").Append(_stats.JobsText()).Append('\n');
         string mem = _stats.MemoryText();
         if (mem.Length > 0) sb.Append("  memory MB: ").Append(mem).Append('\n');

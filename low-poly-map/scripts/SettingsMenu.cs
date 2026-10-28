@@ -909,7 +909,7 @@ public partial class SettingsMenu : PanelContainer
         int roots = bridge.TileRootCount;
         int peak = System.Math.Max(24, bridge.PeakActiveTiles);
         int nodesEnd = (int)Performance.GetMonitor(Performance.Monitor.ObjectNodeCount);
-        GD.Print($"[SelfTest] tile pool: {roots} node sets at the end (after first A+B: {rootsWarm}, peak tiles held {bridge.PeakActiveTiles}, prewarmed 24), "
+        GD.Print($"[SelfTest] tile pool: {roots} node sets at the end ({bridge.PoolTrimmed} trimmed; after first A+B: {rootsWarm}, peak tiles held {bridge.PeakActiveTiles}, prewarmed 24), "
             + $"{bridge.PoolCreated - bridge.PoolFree} in use; scene nodes {nodesBase} -> {nodesEnd}; last A loaded {loadedA}, last B loaded {loadedB}");
         // Scene nodes outside the tile pools: pooled tiles may grow to a high-water mark during the first applies (that is not a leak), but nothing else may be created per reconfigure.
         if (nodeSeries.Count > 4)
@@ -922,7 +922,9 @@ public partial class SettingsMenu : PanelContainer
             if (worst > hw + NodeGrowthSlack) fails.Add($"scene nodes outside the tile pools grew after the warm-up: {worst} vs {hw} in the first four applies (leak of {worst - hw} nodes over {nodeSeries.Count} applies)");
         }
         if (roots > rootsWarm * 1.15 + 8) fails.Add($"tile pool grew from {rootsWarm} (after the first A+B) to {roots} node sets");
-        if (roots != peak) fails.Add($"tile pool has {roots} node sets, expected exactly the peak {peak} (leak or double allocation)");
+        // Without trimming the pool holds exactly the peak (no leak, no double allocation). With it (PoolTrimmer, e.g. --pool-trim-hold=3) sets that were destroyed
+        // and re-allocated make "ever allocated" larger, so only the sets that exist now are bounded by the peak.
+        if (bridge.PoolTrimmed == 0 ? roots != peak : roots > peak) fails.Add($"tile pool has {roots} node sets ({bridge.PoolTrimmed} trimmed), expected {(bridge.PoolTrimmed == 0 ? "exactly" : "at most")} the peak {peak} (leak or double allocation)");
         if (loadedA >= loadedB) fails.Add($"config A (max distance 6000, quality x2) loaded {loadedA} tiles, not fewer than config B's {loadedB}: the ranges had no effect");
         if (bridge.ConsistencyErrors > 0) fails.Add($"{bridge.ConsistencyErrors} cover consistency errors");
     }

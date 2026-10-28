@@ -241,7 +241,8 @@ public partial class DebugOverlay : Control
         if (Bridge != null)
         {
             var c = Bridge.Cover;
-            sb.Append("tiles uploaded ").Append(c.Loaded).Append("  pool free ").Append(Bridge.PoolFree).Append('/').Append(Bridge.PoolCreated).Append('\n');
+            sb.Append("tiles uploaded ").Append(c.Loaded).Append("  pool free ").Append(Bridge.PoolFree).Append('/').Append(Bridge.PoolCreated).Append(" (trimmed ").Append(Bridge.PoolTrimmed)
+              .Append(")  terrain pool free ").Append(Bridge.TerrainPoolFree).Append('/').Append(Bridge.TerrainPoolCreated).Append(" (trimmed ").Append(Bridge.TerrainPoolTrimmed).Append(")\n");
             sb.Append("visible  R0 ").Append(c.VisibleByRing[0]).Append("  R1 ").Append(c.VisibleByRing[1])
               .Append("  R2 ").Append(c.VisibleByRing[2]).Append("  R3 ").Append(c.VisibleByRing[3]).Append('\n');
             sb.Append("hidden by children ").Append(c.HiddenByChildren).Append("  waiting siblings ").Append(c.WaitingSiblings).Append('\n');
@@ -327,7 +328,8 @@ public partial class DebugOverlay : Control
     private void AppendViewLine(StringBuilder sb, WorldStreamerFacade streamer)
     {
         if (Bridge == null) return;
-        sb.Append("view: fov_y ").Append(Bridge.ViewFovYDeg.ToString("0.0")).Append(" deg  H ").Append(Bridge.ViewHeightPx).Append(" px  set_view ");
+        sb.Append("view: fov_y ").Append(Bridge.ViewFovYDeg.ToString("0.0")).Append(" deg  H ").Append(Bridge.ViewHeightPx).Append(" px (3D render: viewport ").Append(Bridge.ViewportHeightPx.ToString("0"))
+          .Append(" x scale ").Append(Bridge.RenderScale.ToString("0.##")).Append(")  set_view ");
         if (!streamer.HasSetView) { sb.Append("unavailable (api ").Append(streamer.ApiVersionText).Append("): fixed bands\n"); return; }
         sb.Append(streamer.SetViewCalls).Append(" calls");
         if (!_stats.HasLodStats) { sb.Append("  (no LOD stats in debug_stats)\n"); return; }

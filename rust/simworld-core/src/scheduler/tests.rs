@@ -754,6 +754,49 @@ fn failures_back_off_and_retry_and_block_only_their_group() {
     assert_eq!(dp().backoff(20), Duration::from_secs(30));
 }
 
+/// Step J1: mesh jobs are cancelled like fetches. A removed tile's running mesh job is reported
+/// by `drain_cancelled`; its `Dropped` reply frees the slot without a failure; a late result of
+/// the stale generation is ignored. Re-deliveries queue as prefetch, fresh tiles on demand.
+#[test]
+fn orphaned_mesh_jobs_are_cancelled_and_free_their_slots() {
+    let frame = Frame::new(VILNIUS.0, VILNIUS.1);
+    let mut s = Scheduler::new(frame, true, dp());
+    let t0 = Instant::now();
+    let mut jobs = Vec::new();
+    s.update([0.0, 0.0, 8000.0], [0.0; 3], t0, &mut jobs);
+    let decodes: Vec<(TileKey, usize, u64)> = jobs
+        .drain(..)
+        .map(|j| match j {
+            Job::Decode { key, ring, job, .. } => (key, ring, job),
+            _ => panic!("decode expected (synthetic)"),
+        })
+        .collect();
+    assert!(!decodes.is_empty());
+    for d in &decodes {
+        let p = s.job_priority(d.0);
+        assert_eq!(p.urgency, crate::jobs::Urgency::OnDemand, "fresh tiles are on demand");
+    }
+    let mut ids = Vec::new();
+    s.drain_cancelled(&mut ids);
+    assert!(ids.is_empty(), "nothing orphaned while the cover stands");
+    let far = [200_000.0, 0.0, 8000.0];
+    s.update(far, [0.0; 3], t0, &mut jobs);
+    s.drain_cancelled(&mut ids);
+    let mut want: Vec<u64> = decodes.iter().map(|d| d.2).collect();
+    want.sort_unstable();
+    ids.sort_unstable();
+    assert_eq!(ids, want, "every running mesh job of a removed tile is reported");
+    let (k0, r0, j0) = decodes[0];
+    for &(key, ring, job) in &decodes[1..] {
+        assert!(s.handle(WorkerMsg::Dropped { layer: LayerKind::World, key, ring, job }, t0).is_none());
+    }
+    // A result that slipped through before the cancel took effect is dropped by its id.
+    assert!(s.handle(WorkerMsg::Decoded { key: k0, ring: r0, job: j0, result: Ok(fake_data(k0, r0)) }, t0).is_none());
+    assert_eq!(s.inflight().1, [0; MAX_RINGS], "every slot is free again");
+    assert!(s.pop_ready(true).is_none(), "nothing stale is ready");
+    assert_eq!(s.stats().failed.iter().sum::<i32>(), 0);
+}
+
 #[test]
 fn orphaned_fetches_are_cancelled_and_free_their_slots() {
     let frame = Frame::new(VILNIUS.0, VILNIUS.1);

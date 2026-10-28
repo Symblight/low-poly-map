@@ -185,7 +185,12 @@ fn m4_budget() {
             }
             s.update(cam, [0.0; 3], Instant::now(), &mut jobs);
             for j in jobs.drain(..) {
-                worker.submit(j);
+                let prio = match &j {
+                    crate::worker::Job::Fetch { key, .. } | crate::worker::Job::Decode { key, .. } | crate::worker::Job::Terrain { key, .. } => {
+                        s.job_priority(*key)
+                    }
+                };
+                worker.submit(j, prio);
             }
             while let Some(t) = s.pop_ready(true) {
                 for m in [&t.mesh, &t.ground] {

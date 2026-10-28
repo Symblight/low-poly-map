@@ -1,4 +1,4 @@
-//! Buildings -> flat, merged vertex buffers (rayon worker; pure Rust, no Godot types).
+//! Buildings -> flat, merged vertex buffers (job pool worker; pure Rust, no Godot types).
 //!
 //! Per building: resolve profile / heights (`resolve`), clip the footprint to the target
 //! rectangle in exact tile pixel space, Douglas–Peucker simplify (0.5 m R0, 2 m R1; vertices

@@ -23,6 +23,7 @@
 pub mod diag;
 pub mod fetch;
 pub mod geo;
+pub mod jobs;
 pub mod ground;
 pub mod latency;
 pub mod lights;

@@ -1,8 +1,13 @@
 //! Threads: a small tokio runtime for I/O (fetch; the disk cache has its own thread, owned by
-//! [`crate::fetch::DiskCache`]) and a dedicated rayon pool for
-//! CPU work (MVT decode / synthetic generation / meshing / lights). Results go back to
-//! the main thread over one crossbeam channel. Workers only produce plain Rust structs; they
-//! never call Godot APIs, and panics are caught and turned into error messages.
+//! [`crate::fetch::DiskCache`]) and one [`JobPool`] (priority queue + fixed worker threads,
+//! [`crate::jobs`]) for the CPU work of both layers (MVT decode / synthetic generation /
+//! meshing / lights, terrain TINs). Results go back to the main thread over one crossbeam
+//! channel. Workers only produce plain Rust structs; they never call Godot APIs, and panics are
+//! caught and turned into error messages.
+//!
+//! Every CPU job ends with exactly one reply: its result (`Decoded` / `TerrainBuilt`), or
+//! [`WorkerMsg::Dropped`] when it was cancelled ([`Worker::cancel`]: the scheduler orphaned that
+//! generation) before or while it ran. Build stages check the cancel flag in between.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,6 +18,8 @@ use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender};
 use tokio::task::AbortHandle;
 
+use crate::jobs::{default_threads, JobEnd, JobPool, JobSpec, JobStats, PoolConfig, Priority};
+use crate::rings::LayerKind;
 use crate::fetch::{DiskCache, FetchError, FetchErrorKind, FetchParams, Fetcher, Note, Source};
 use crate::geo::{Frame, TileKey};
 use crate::lights::LightSet;
@@ -81,10 +88,10 @@ mod tests {
             }
             None
         };
-        w.submit(Job::Fetch { key, ring: 0, job: 7 });
+        w.submit(Job::Fetch { key, ring: 0, job: 7 }, Priority::on_demand(0.0));
         std::thread::sleep(std::time::Duration::from_millis(300));
         assert!(fetched(&w).is_none(), "the server never answers");
-        w.cancel(&[7, 99]); // unknown ids are ignored
+        w.cancel(LayerKind::World, &[7, 99]); // unknown ids are ignored
         let t0 = std::time::Instant::now();
         let (job, result) = loop {
             if let Some(r) = fetched(&w) {
@@ -224,6 +231,9 @@ pub enum WorkerMsg {
     Decoded { key: TileKey, ring: usize, job: u64, result: Result<TileData, String> },
     /// Result of a [`Job::Terrain`] (routed to the terrain layer's scheduler).
     TerrainBuilt { key: TileKey, ring: usize, job: u64, result: Result<TileData, String> },
+    /// A `Decode` (`layer` World) or `Terrain` job that was cancelled before or while it ran
+    /// (a stale generation, or shutdown): frees its slot, carries no result.
+    Dropped { layer: LayerKind, key: TileKey, ring: usize, job: u64 },
     Info(String),
     /// Logged as a (rate-limited) warning on the main thread.
     Warn(String),
@@ -308,12 +318,33 @@ pub fn build_tile_on(
     payload: &Payload,
     profile: &Profile,
 ) -> Result<TileData, String> {
+    build_tile_stoppable(key, ring, frame, terrain, payload, profile, &never).map(|d| d.expect("never stopped"))
+}
+
+fn never() -> bool {
+    false
+}
+
+/// [`build_tile_on`] with a cancel probe checked between stages: `Ok(None)` = stopped. The
+/// output of a build that is not stopped is identical.
+fn build_tile_stoppable(
+    key: TileKey,
+    ring: usize,
+    frame: Frame,
+    terrain: &Terrain,
+    payload: &Payload,
+    profile: &Profile,
+    stop: &dyn Fn() -> bool,
+) -> Result<Option<TileData>, String> {
     let t0 = std::time::Instant::now();
     let want_ground = profile.ground_params(ring).is_some();
     let want_streets = ring >= profile.lights.street.min_ring as usize;
+    if stop() {
+        return Ok(None);
+    }
     let DecodedTile { buildings, ground: gf, proj } =
         decode_payload_on(key, frame, terrain, payload, want_ground, want_ground || want_streets, profile)?;
-    Ok(finish_tile(buildings, gf, &proj, ring, profile, &[], t0))
+    Ok(finish_tile(buildings, gf, &proj, ring, profile, &[], t0, stop))
 }
 
 /// The seed generator's tile (api 1.7, `docs/spec-world-seed.md` section 7): generated in tile
@@ -327,6 +358,22 @@ pub fn build_seed_tile_on(
     seed: &SeedWorld,
     profile: &Profile,
 ) -> Result<TileData, String> {
+    build_seed_tile_stoppable(key, ring, frame, terrain, seed, profile, &never).map(|d| d.expect("never stopped"))
+}
+
+/// [`build_seed_tile_on`] with a cancel probe (see [`build_tile_stoppable`]).
+fn build_seed_tile_stoppable(
+    key: TileKey,
+    ring: usize,
+    frame: Frame,
+    terrain: &Terrain,
+    seed: &SeedWorld,
+    profile: &Profile,
+    stop: &dyn Fn() -> bool,
+) -> Result<Option<TileData>, String> {
+    if stop() {
+        return Ok(None);
+    }
     let t0 = std::time::Instant::now();
     let want_ground = profile.ground_params(ring).is_some();
     let want_streets = ring >= profile.lights.street.min_ring as usize;
@@ -342,10 +389,12 @@ pub fn build_seed_tile_on(
     if !(want_ground || want_streets) {
         gf.roads.clear();
     }
-    Ok(finish_tile(buildings, gf, &proj, ring, profile, &st.airport_lights, t0))
+    Ok(finish_tile(buildings, gf, &proj, ring, profile, &st.airport_lights, t0, stop))
 }
 
-/// Mesh, ground and lights of a decoded or generated tile (shared by every source).
+/// Mesh, ground and lights of a decoded or generated tile (shared by every source). `stop` is
+/// checked between the stages (safe points); `None` = stopped.
+#[allow(clippy::too_many_arguments)]
 fn finish_tile(
     buildings: Vec<Building>,
     gf: GroundFeatures,
@@ -354,10 +403,20 @@ fn finish_tile(
     profile: &Profile,
     airport_lights: &[crate::seed::world::AirportLightPx],
     t0: std::time::Instant,
-) -> TileData {
+    stop: &dyn Fn() -> bool,
+) -> Option<TileData> {
     let want_streets = ring >= profile.lights.street.min_ring as usize;
+    if stop() {
+        return None;
+    }
     let mesh = mesh_tile(&buildings, proj, ring, profile);
+    if stop() {
+        return None;
+    }
     let ground = mesh_ground(&gf, proj, ring, profile);
+    if stop() {
+        return None;
+    }
     let mut lights = if ring >= profile.lights.min_ring as usize { LightSet::from_buildings(&buildings, profile) } else { LightSet::default() };
     if want_streets {
         lights.set_streets(&gf.roads, proj, profile);
@@ -372,7 +431,7 @@ fn finish_tile(
     let building_count = buildings.len();
     let max_height = buildings.iter().map(|b| crate::mesher::resolve(b, profile).height).fold(0.0f32, f32::max);
     drop(buildings);
-    TileData {
+    Some(TileData {
         building_count,
         lights: Arc::new(lights),
         mesh,
@@ -380,7 +439,7 @@ fn finish_tile(
         max_height,
         cpu_us: t0.elapsed().as_micros() as u64,
         terrain: None,
-    }
+    })
 }
 
 /// Terrain layer: the TIN of terrain tile `key` (ring = index in `terrain.bands`) as a
@@ -418,9 +477,20 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Pool job id of a layer's job (the two schedulers number their jobs independently).
+fn pool_id(layer: LayerKind, job: u64) -> u64 {
+    match layer {
+        LayerKind::World => job & !TERRAIN_TAG,
+        LayerKind::Terrain => job | TERRAIN_TAG,
+    }
+}
+
+const TERRAIN_TAG: u64 = 1 << 63;
+
 pub struct Worker {
     rt: Option<tokio::runtime::Runtime>,
-    pool: rayon::ThreadPool,
+    /// CPU work of both layers (decode / mesh / terrain), one priority queue.
+    pool: JobPool,
     tx: Sender<WorkerMsg>,
     rx: Receiver<WorkerMsg>,
     fetcher: Option<Arc<Fetcher>>,
@@ -469,13 +539,9 @@ impl Worker {
         reuse: Option<Arc<DiskCache>>,
     ) -> Result<Self, String> {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(cpus.saturating_sub(2).clamp(2, 4))
-            .thread_name(|i| format!("simplane-cpu-{i}"))
-            .panic_handler(|_| {}) // jobs catch their own panics; never abort the host
-            .build()
-            .map_err(|e| format!("rayon pool: {e}"))?;
+        // Desktop: cores - 2, clamped to 2..=4 (as the rayon pool before). iOS will set a QoS
+        // class per thread through `PoolConfig::on_thread_start` (not built).
+        let pool = JobPool::new(PoolConfig::new(default_threads(), "simplane-cpu"))?;
         let cache_cap = FetchParams::from_profile(&profile).cache_cap_bytes;
         let cache_bytes = reuse.as_ref().map_or_else(|| Arc::new(AtomicU64::new(0)), |c| c.bytes_counter());
         let (rt, fetcher) = if url.is_empty() {
@@ -554,11 +620,13 @@ impl Worker {
     /// finishes), then the disk cache either is handed back open (`keep_cache`, for a
     /// re-configure with the same source and folder) or is closed (pending writes flushed,
     /// WAL checkpointed, file closed). Returns whether everything finished within `wait`, and
-    /// the kept cache. CPU jobs on the rayon pool are not waited for; they never touch the
-    /// disk and their results are discarded. Dropping a `Worker` instead only signals the
-    /// stop and the cache close, without waiting.
+    /// the kept cache. CPU jobs are cancelled (queued ones at once, running ones at their next
+    /// safe point) but not waited for; they never touch the disk and their results are
+    /// discarded. Dropping a `Worker` instead only signals the stop and the cache close,
+    /// without waiting.
     pub fn shutdown(mut self, wait: std::time::Duration, keep_cache: bool) -> (bool, Option<Arc<DiskCache>>) {
         let t0 = std::time::Instant::now();
+        self.pool.shutdown(std::time::Duration::ZERO);
         if let Some(rt) = self.rt.take() {
             rt.shutdown_timeout(wait);
         }
@@ -575,27 +643,45 @@ impl Worker {
         self.cache_bytes.load(Ordering::Relaxed)
     }
 
-    /// Abort the fetches of these jobs (ids the scheduler orphaned: the tile left the cover or
-    /// its pending work became moot). Each still gets its `Fetched` reply, with
-    /// [`FetchErrorKind::Cancelled`], so the in-flight slot is freed at once instead of after
-    /// the request; a fetch that already finished replies normally. Unknown ids are ignored.
-    pub fn cancel(&self, jobs: &[u64]) {
+    /// Cancel these jobs of `layer` (generations the scheduler orphaned: the tile left the
+    /// cover or its pending work became moot). A fetch is aborted and still gets its `Fetched`
+    /// reply, with [`FetchErrorKind::Cancelled`]; a CPU job that has not finished replies
+    /// [`WorkerMsg::Dropped`] (queued: at once, running: at its next safe point). Either way
+    /// the in-flight slot is freed early; a job that already finished replied normally.
+    /// Unknown ids are ignored.
+    pub fn cancel(&self, layer: LayerKind, jobs: &[u64]) {
         if jobs.is_empty() {
             return;
         }
-        let mut map = lock(&self.fetches);
-        for j in jobs {
-            if let Some(h) = map.remove(j) {
-                h.abort();
+        if layer == LayerKind::World {
+            let mut map = lock(&self.fetches);
+            for j in jobs {
+                if let Some(h) = map.remove(j) {
+                    h.abort();
+                }
             }
         }
+        let ids: Vec<u64> = jobs.iter().map(|&j| pool_id(layer, j)).collect();
+        self.pool.cancel(&ids);
+    }
+
+    /// CPU job counters (`debug_stats` `jobs_*`).
+    pub fn job_stats(&self) -> JobStats {
+        self.pool.stats()
+    }
+
+    /// Worker threads of the CPU pool.
+    pub fn cpu_threads(&self) -> usize {
+        self.pool.threads()
     }
 
     pub fn try_recv(&self) -> Option<WorkerMsg> {
         self.rx.try_recv().ok()
     }
 
-    pub fn submit(&self, job: Job) {
+    /// Start a job. CPU jobs (`Decode`, `Terrain`) queue by `prio` in the shared pool; fetches
+    /// go to the I/O runtime (`prio` unused).
+    pub fn submit(&self, job: Job, prio: Priority) {
         match job {
             Job::Fetch { key, ring, job } => {
                 let tx = self.tx.clone();
@@ -631,14 +717,34 @@ impl Worker {
                 let terrain = self.terrain.clone();
                 let profile = self.profile.clone();
                 let seed = self.seed.clone();
-                self.pool.spawn(move || {
-                    let result = catch_unwind(AssertUnwindSafe(|| match (&seed, &payload) {
-                        (Some(s), Payload::Synthetic) => build_seed_tile_on(key, ring, frame, &terrain, s, &profile),
-                        _ => build_tile_on(key, ring, frame, &terrain, &payload, &profile),
-                    }))
+                let on_cancel = self.dropped_reply(LayerKind::World, key, ring, job);
+                let spec = JobSpec::new(pool_id(LayerKind::World, job), prio);
+                self.pool.submit(
+                    spec,
+                    move |ctx| {
+                        let stop = || ctx.is_cancelled();
+                        let result = catch_unwind(AssertUnwindSafe(|| match (&seed, &payload) {
+                            (Some(s), Payload::Synthetic) => build_seed_tile_stoppable(key, ring, frame, &terrain, s, &profile, &stop),
+                            _ => build_tile_stoppable(key, ring, frame, &terrain, &payload, &profile, &stop),
+                        }))
                         .unwrap_or_else(|p| Err(format!("decode panic: {}", panic_text(p))));
-                    let _ = tx.send(WorkerMsg::Decoded { key, ring, job, result });
-                });
+                        // Last safe point: a stale result is dropped here, not sent.
+                        let result = match result {
+                            Ok(None) => return JobEnd::Cancelled,
+                            Ok(Some(_)) if ctx.is_cancelled() => return JobEnd::Cancelled,
+                            Ok(Some(d)) => Ok(d),
+                            Err(e) => Err(e),
+                        };
+                        let failed = result.is_err();
+                        let _ = tx.send(WorkerMsg::Decoded { key, ring, job, result });
+                        if failed {
+                            JobEnd::Failed
+                        } else {
+                            JobEnd::Done(None)
+                        }
+                    },
+                    on_cancel,
+                );
             }
             Job::Terrain { key, ring, job, detail } => {
                 let tx = self.tx.clone();
@@ -646,13 +752,44 @@ impl Worker {
                 let terrain = self.terrain.clone();
                 let profile = self.profile.clone();
                 let seed = self.seed.clone();
-                self.pool.spawn(move || {
-                    let result =
-                        catch_unwind(AssertUnwindSafe(|| build_terrain_data(key, ring, frame, &terrain, &profile, detail, seed.as_deref())))
-                            .unwrap_or_else(|p| Err(format!("terrain panic: {}", panic_text(p))));
-                    let _ = tx.send(WorkerMsg::TerrainBuilt { key, ring, job, result });
-                });
+                let on_cancel = self.dropped_reply(LayerKind::Terrain, key, ring, job);
+                let spec = JobSpec::new(pool_id(LayerKind::Terrain, job), prio);
+                self.pool.submit(
+                    spec,
+                    move |ctx| {
+                        // The TIN build has no inner safe points yet (terrain::tin): checked
+                        // before and after.
+                        if ctx.is_cancelled() {
+                            return JobEnd::Cancelled;
+                        }
+                        let result = catch_unwind(AssertUnwindSafe(|| {
+                            build_terrain_data(key, ring, frame, &terrain, &profile, detail, seed.as_deref())
+                        }))
+                        .unwrap_or_else(|p| Err(format!("terrain panic: {}", panic_text(p))));
+                        if result.is_ok() && ctx.is_cancelled() {
+                            return JobEnd::Cancelled;
+                        }
+                        let failed = result.is_err();
+                        let _ = tx.send(WorkerMsg::TerrainBuilt { key, ring, job, result });
+                        if failed {
+                            JobEnd::Failed
+                        } else {
+                            JobEnd::Done(None)
+                        }
+                    },
+                    on_cancel,
+                );
             }
+        }
+    }
+}
+
+impl Worker {
+    /// The `Dropped` reply of a cancelled CPU job (sent at most once, by the pool).
+    fn dropped_reply(&self, layer: LayerKind, key: TileKey, ring: usize, job: u64) -> impl FnOnce() + Send + 'static {
+        let tx = self.tx.clone();
+        move || {
+            let _ = tx.send(WorkerMsg::Dropped { layer, key, ring, job });
         }
     }
 }

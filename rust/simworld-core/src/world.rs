@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 use crate::diag::{thread_cpu_us, Diagnostics, Log, WarnLimiter};
 use crate::fetch::{DiskCache, FetchParams};
 use crate::geo::{Frame, LocalSpace, TileKey, MERCATOR_MAX_LAT};
+use crate::jobs::{JobStats, Priority};
 use crate::latency::Latency;
 use crate::lock::{canonical_dir, FolderLock, LockError};
 use crate::mesher::MeshData;
@@ -282,6 +283,9 @@ pub struct WorldStats {
     pub terrain_meshing: [i32; MAX_RINGS],
     pub terrain_loaded: [i32; MAX_RINGS],
     pub terrain_tris: u64,
+    /// Shared CPU job pool (both layers): jobs queued (ready or waiting on dependencies),
+    /// running, and cancelled since the world was configured. Zero when not running.
+    pub jobs: JobStats,
 }
 
 fn first4(a: [i32; MAX_RINGS]) -> [i32; RING_COUNT] {
@@ -310,6 +314,8 @@ pub struct World {
     worker: Option<Worker>,
 
     jobs: Vec<Job>,
+    /// Reused id buffer of `cancel_orphans`.
+    cancel_buf: Vec<u64>,
     unload_buf: Vec<LayerKey>,
     fade_buf: Vec<(LayerKey, f32)>,
     key_tmp: Vec<TileKey>,
@@ -363,6 +369,7 @@ impl World {
             terrain_sched: None,
             worker: None,
             jobs: Vec::new(),
+            cancel_buf: Vec::new(),
             unload_buf: Vec::new(),
             fade_buf: Vec::new(),
             key_tmp: Vec::new(),
@@ -456,7 +463,7 @@ impl World {
                     self.log.error(&format!("WorldStreamer: {s}"));
                     self.health.set_fatal(&s);
                 }
-                m @ WorkerMsg::TerrainBuilt { .. } => {
+                m @ (WorkerMsg::TerrainBuilt { .. } | WorkerMsg::Dropped { layer: LayerKind::Terrain, .. }) => {
                     if let WorkerMsg::TerrainBuilt { result: Err(e), .. } = &m {
                         self.health.record_decode_failure(e, now);
                     }
@@ -496,18 +503,33 @@ impl World {
         });
     }
 
-    /// Abort the fetches the vector scheduler orphaned (the terrain layer has no fetch stage).
+    /// Cancel the jobs (fetches and mesh jobs) both layers' schedulers orphaned.
     fn cancel_orphans(&mut self) {
-        let (Some(s), Some(w)) = (&mut self.scheduler, &self.worker) else { return };
-        let mut ids = Vec::new();
-        s.drain_cancelled(&mut ids);
-        w.cancel(&ids);
+        let Some(w) = &self.worker else { return };
+        let mut ids = std::mem::take(&mut self.cancel_buf);
+        if let Some(s) = &mut self.scheduler {
+            s.drain_cancelled(&mut ids);
+            w.cancel(LayerKind::World, &ids);
+            ids.clear();
+        }
+        if let Some(t) = &mut self.terrain_sched {
+            t.drain_cancelled(&mut ids);
+            w.cancel(LayerKind::Terrain, &ids);
+            ids.clear();
+        }
+        self.cancel_buf = ids;
     }
 
+    /// Hand the new jobs to the worker; CPU jobs queue by [`Scheduler::job_priority`] (fresh
+    /// before re-deliveries, then nearest group first, both layers in one heap).
     fn submit_jobs(&mut self) {
         if let Some(w) = &self.worker {
             for j in self.jobs.drain(..) {
-                w.submit(j);
+                let prio = match &j {
+                    Job::Terrain { key, .. } => self.terrain_sched.as_ref().map(|t| t.job_priority(*key)),
+                    Job::Fetch { key, .. } | Job::Decode { key, .. } => self.scheduler.as_ref().map(|s| s.job_priority(*key)),
+                };
+                w.submit(j, prio.unwrap_or(Priority::prefetch(f64::INFINITY)));
             }
         } else {
             self.jobs.clear();
@@ -1089,6 +1111,7 @@ impl World {
             terrain_meshing: tst.meshing,
             terrain_loaded: tst.loaded,
             terrain_tris: tst.tris,
+            jobs: self.worker.as_ref().map(|w| w.job_stats()).unwrap_or_default(),
         }
     }
 

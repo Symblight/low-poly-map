@@ -438,6 +438,10 @@ impl WorldStreamer {
         d.set("version", &GString::from(self.world.version()));
         d.set("api_major", API_MAJOR as i64);
         d.set("api_minor", API_MINOR as i64);
+        // Shared CPU job pool (both layers; Tiles v2 + Terrain v2 step J1).
+        d.set("jobs_queued", st.jobs.queued as i64);
+        d.set("jobs_running", st.jobs.running as i64);
+        d.set("jobs_cancelled", st.jobs.cancelled.min(i64::MAX as u64) as i64);
         if let Some(l) = self.world.latency() {
             d.set("latency", &latency_dict(l));
         }

@@ -64,8 +64,10 @@
 //! Lifecycle per entry: Queued -> Fetching -> Fetched -> Decoding -> Ready -> (delivered) Idle.
 //! Synthetic tiles skip the fetch stage. Errors -> Failed with exponential backoff -> Queued;
 //! after `DECODE_ATTEMPTS` decode failures in a row -> Broken (no more jobs; the coarser tile
-//! stays). A fetch whose entry is removed or reset while it runs is handed to `World` for
-//! `Worker::cancel` (`drain_cancelled`), so the slot frees up before the request finishes.
+//! stays). A fetch or mesh job whose entry is removed or reset while it runs (its generation,
+//! the job id, went stale) is handed to `World` for `Worker::cancel` (`drain_cancelled`), so the
+//! slot frees up before the request or the build finishes (a cancelled mesh job replies
+//! `WorkerMsg::Dropped`).
 //!
 //! # Layers (api 1.5)
 //! One `Scheduler` runs one quadtree layer ([`Layer`]): the vector world (zooms 13..16, the
@@ -97,6 +99,7 @@ use crate::mesher::MeshData;
 use crate::profile::Profile;
 use crate::rings::{above_horizon, children, horizon_line_m, look_ahead, Layer, LayerKind, ViewPoint, MAX_BOX_HEIGHT_M, MAX_RINGS};
 use crate::terrain::Terrain;
+use crate::jobs::Priority;
 use crate::worker::{Job, Payload, WorkerMsg};
 
 // Tuning (world profile): `streaming.max_fetch_per_band` / `max_mesh_per_band` (jobs in flight
@@ -128,8 +131,8 @@ pub struct Scheduler {
     unloading: Vec<Entry>,
     /// Refined parents dropped from Godot (entries stay in the tree, not held).
     dropped: Vec<TileKey>,
-    /// Jobs of fetches still in flight that no entry waits for any more (the tile left the
-    /// cover or its pending work became moot): `World` aborts them (`Worker::cancel`) so their
+    /// Jobs (fetch or mesh) still in flight that no entry waits for any more (the tile left the
+    /// cover or its pending work became moot): `World` cancels them (`Worker::cancel`) so their
     /// slots free up at once.
     cancelled: Vec<u64>,
     next_job: u64,
@@ -237,6 +240,7 @@ impl Scheduler {
             match e.state {
                 TileState::Decoding | TileState::Ready(_) | TileState::Fetched(_) => {
                     // Built (or being built) at the old detail: orphan the result, build again.
+                    orphan_job(&mut self.cancelled, e);
                     e.state = TileState::Queued;
                     e.job = next;
                     next += 1;
@@ -444,7 +448,7 @@ impl Scheduler {
                             retarget = Some(true); // coarsen fade -> refine fade
                         } else if !e.held && !matches!(e.state, TileState::Idle) {
                             // Cancel the pending re-delivery (orphan any in-flight result).
-                            if matches!(e.state, TileState::Fetching) {
+                            if matches!(e.state, TileState::Fetching | TileState::Decoding) {
                                 cancel = Some(e.job);
                             }
                             e.state = TileState::Idle;
@@ -520,7 +524,7 @@ impl Scheduler {
             if e.mark == epoch {
                 return true;
             }
-            orphan_fetch(cancelled, e);
+            orphan_job(cancelled, e);
             if e.held {
                 let mut blank = Entry::blank(e.key, e.ring, e.rect, e.center, default_h);
                 blank.terrain_box = e.terrain_box;
@@ -703,6 +707,16 @@ impl Scheduler {
                     }
                     Err(err) => Some(Self::fail(e, now, "fetch", &err.message, &self.profile)),
                 }
+            }
+            WorkerMsg::Dropped { key, ring, job, .. } => {
+                // A cancelled mesh job: only orphaned generations are cancelled; should a
+                // current one be (shutdown race), ask again.
+                self.decode_inflight[ring] = self.decode_inflight[ring].saturating_sub(1);
+                let e = self.entries.get_mut(&key).filter(|e| e.job == job)?;
+                if matches!(e.state, TileState::Decoding) {
+                    e.state = TileState::Queued;
+                }
+                None
             }
             WorkerMsg::Decoded { key, ring, job, result } | WorkerMsg::TerrainBuilt { key, ring, job, result } => {
                 self.decode_inflight[ring] = self.decode_inflight[ring].saturating_sub(1);
@@ -908,7 +922,7 @@ impl Scheduler {
         let mut stack: Vec<TileKey> = children(k).to_vec();
         while let Some(c) = stack.pop() {
             let Some(mut e) = self.entries.remove(&c) else { continue };
-            orphan_fetch(&mut self.cancelled, &e);
+            orphan_job(&mut self.cancelled, &e);
             if e.split && c.z < leaf {
                 stack.extend(children(c));
             }
@@ -959,7 +973,7 @@ impl Scheduler {
             // The new job id orphans any worker result still in flight (counters are
             // already settled in `handle` before the id check).
             if !matches!(e.state, TileState::Idle) {
-                orphan_fetch(&mut self.cancelled, e);
+                orphan_job(&mut self.cancelled, e);
                 e.state = TileState::Idle;
                 e.job = job;
                 self.next_job += 1;
@@ -1200,6 +1214,17 @@ impl Scheduler {
         (group, e.cam_d, e.ring, e.key)
     }
 
+    /// Queue priority of a job of tile `k` in the shared CPU pool: fresh tiles on demand,
+    /// re-deliveries (the host holds the key) as prefetch; then the delivery order
+    /// ([`Scheduler::order_key`] group distance). The same order `dispatch` lists the jobs in.
+    pub fn job_priority(&self, k: TileKey) -> Priority {
+        match self.entries.get(&k) {
+            Some(e) if e.held => Priority::prefetch(self.order_key(e).0),
+            Some(e) => Priority::on_demand(self.order_key(e).0),
+            None => Priority::prefetch(f64::INFINITY),
+        }
+    }
+
     /// Tracked entries (tests / budget tools).
     pub fn entries(&self) -> impl Iterator<Item = &Entry> {
         self.entries.values()
@@ -1210,9 +1235,9 @@ impl Scheduler {
     }
 }
 
-/// Note the job of a fetch that `e` is about to orphan (removed, or its state reset).
-fn orphan_fetch(cancelled: &mut Vec<u64>, e: &Entry) {
-    if matches!(e.state, TileState::Fetching) {
+/// Note the job of a fetch or mesh job that `e` is about to orphan (removed, or its state reset).
+fn orphan_job(cancelled: &mut Vec<u64>, e: &Entry) {
+    if matches!(e.state, TileState::Fetching | TileState::Decoding) {
         cancelled.push(e.job);
     }
 }

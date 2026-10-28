@@ -5,7 +5,7 @@
 //! Stages of a fresh delivery (re-deliveries of a held tile are not sampled):
 //! `queue` wanted -> job dispatched (waiting for a fetch slot, or a mesh slot for the synthetic
 //! city), `fetch_disk` / `fetch_net` fetch job (disk cache hit / HTTP range request), `mesh_wait`
-//! fetched -> mesh job dispatched, `mesh` mesh job wall time (rayon queue + build), `cpu` the
+//! fetched -> mesh job dispatched, `mesh` mesh job wall time (job pool queue + build), `cpu` the
 //! worker's own build time, `deliver` ready -> handed to the host (waiting for the parent to be
 //! effective, for the host's per-frame poll budget, finer bands first), `total` wanted ->
 //! delivered. `swap` is sampled on the coarse tile: split decided -> refine fade started (all 4

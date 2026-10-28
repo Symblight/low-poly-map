@@ -1,4 +1,4 @@
-//! Vector tile decode -> plain `Building` structs (no Godot types; runs on rayon threads).
+//! Vector tile decode -> plain `Building` structs (no Godot types; runs on the job pool threads).
 //!
 //! Schema (custom planetiler profile):
 //! - layer `buildings`: `id` (OSM id, f64/int), `osm_type` ("way"/"relation"), `kind`, `height`,

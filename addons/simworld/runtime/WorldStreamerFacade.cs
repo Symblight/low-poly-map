@@ -26,44 +26,6 @@ public struct DebugTile
     public string Source;
 }
 
-/// <summary>
-/// Typed view of one poll_ready() dictionary. <see cref="Mesh"/> (buildings) and <see cref="Ground"/> are Mesh.ARRAY_MAX
-/// arrays (null when missing/empty, e.g. empty tiles and all of R3).
-/// </summary>
-public struct ReadyTile
-{
-    public string Key;
-    /// <summary>True for a terrain-layer entry (api 1.5: layer "terrain", key "t/z/x/y"); false for the vector layer.</summary>
-    public bool IsTerrain;
-    /// <summary>True for a landmark-layer entry (api 1.11: layer "landmarks", key "l/z/x/y", ring 0): it carries the vector keys (mesh with windows, lights, beacons; no ground), drawn like a vector tile but kept in the landmark tile map.</summary>
-    public bool IsLandmark;
-    /// <summary>Terrain mesh Array (VERTEX, INDEX, optional NORMAL), relative to <see cref="Origin"/>; null when absent. Terrain entries only.</summary>
-    public Godot.Collections.Array? Terrain;
-    /// <summary>Lowest / highest surface vertex (m above MSL) of a terrain tile.</summary>
-    public float HMin, HMax;
-    public int Ring;
-    public Vector3 Origin;
-    public Vector3[] Lights;
-    public Color[] LightColors;
-    /// <summary>Street lamps (api 1.1; empty from an older library), relative to <see cref="Origin"/>; drawn at every distance.</summary>
-    public Vector3[] StreetLights;
-    public Color[] StreetLightColors;
-    /// <summary>Aircraft warning beacons (api 1.2; empty from an older library): rgb = colour, a = blink phase of the building.</summary>
-    public Vector3[] BeaconLights;
-    public Color[] BeaconLightColors;
-    /// <summary>Airport lights of a seed world (api 1.7; empty otherwise), relative to <see cref="Origin"/>: rgb = fixed colour (blue / white / green / red), a = intensity weight.</summary>
-    public Vector3[] AirportLights;
-    public Color[] AirportLightColors;
-    public Godot.Collections.Array? Mesh;
-    /// <summary>
-    /// True when the dictionary carried a "ground" key at all (an empty Array still counts). Lets the uploader tell
-    /// "no ground for this tile" (R3, or an empty tile) from "this delivery does not speak about ground" (older Rust build).
-    /// </summary>
-    public bool HasGroundKey;
-    /// <summary>Ground mesh Array (VERTEX, NORMAL, COLOR, INDEX), relative to <see cref="Origin"/>. Null when absent or empty (R3).</summary>
-    public Godot.Collections.Array? Ground;
-}
-
 /// <summary>One end of a runway (api 1.7 <c>airports()</c>). Positions are in the local frame of the call (they follow the floating origin).</summary>
 public sealed record RunwayEnd(string Ident, double Lat, double Lon, Vector3 Position, double ThresholdLat, double ThresholdLon, Vector3 ThresholdPosition,
     double DisplacedThresholdM, Vector3 TouchdownPosition, double HeadingDeg);
@@ -788,82 +750,11 @@ public sealed partial class WorldStreamerFacade
     {
         if (!IsAvailable) return;
         using var timing = Timings.Time(StreamerCall.UpdateCamera);
-        _node!.Call(MUpdateCamera, localPos, velocity, altAglM);
+        _argsCamera[0] = localPos; _argsCamera[1] = velocity; _argsCamera[2] = altAglM; // reused: a params array per call is the per-frame garbage
+        _node!.Call(MUpdateCamera, _argsCamera);
     }
 
-    /// <summary>Ready tiles (key, ring, origin, mesh, lights, light_colors). Every requested tile is delivered, even when empty.</summary>
-    public Array<Dictionary> PollReady(int maxTiles)
-    {
-        if (!IsAvailable) return EmptyReady;
-        using var timing = Timings.Time(StreamerCall.PollReady);
-        var v = _node!.Call(MPollReady, maxTiles);
-        return v.VariantType == Variant.Type.Array ? v.AsGodotArray<Dictionary>() : EmptyReady;
-    }
-
-    /// <summary>Typed parse of one poll_ready() entry. False if it has no key.</summary>
-    public static bool TryParseReady(Dictionary d, out ReadyTile tile)
-    {
-        tile = default;
-        if (!d.TryGetValue(KKey, out var k)) return false;
-        tile.Key = k.AsString();
-        string layerName = d.TryGetValue(KLayer, out var layer) && layer.VariantType == Variant.Type.String ? layer.AsString() : "";
-        tile.IsTerrain = layerName == "terrain";
-        tile.IsLandmark = layerName == "landmarks";
-        if (tile.IsTerrain)
-        {
-            // Terrain entries (api 1.5) carry only the terrain mesh; every vector key is empty.
-            if (d.TryGetValue(KRing, out var tr)) tile.Ring = (int)tr.AsInt64();
-            if (d.TryGetValue(KOrigin, out var to)) tile.Origin = to.AsVector3();
-            tile.Terrain = d.TryGetValue(KTerrain, out var tm) ? AsMeshArrays(tm) : null;
-            if (d.TryGetValue(KHMin, out var h0)) tile.HMin = (float)h0.AsDouble();
-            if (d.TryGetValue(KHMax, out var h1)) tile.HMax = (float)h1.AsDouble();
-            tile.Lights = System.Array.Empty<Vector3>();
-            tile.LightColors = System.Array.Empty<Color>();
-            tile.AirportLights = System.Array.Empty<Vector3>();
-            tile.AirportLightColors = System.Array.Empty<Color>();
-            return true;
-        }
-        if (d.TryGetValue(KRing, out var r)) tile.Ring = (int)r.AsInt64();
-        if (d.TryGetValue(KOrigin, out var o)) tile.Origin = o.AsVector3();
-        tile.Lights = d.TryGetValue(KLights, out var l) && l.VariantType == Variant.Type.PackedVector3Array
-            ? l.AsVector3Array() : System.Array.Empty<Vector3>();
-        tile.LightColors = d.TryGetValue(KLightColors, out var c) && c.VariantType == Variant.Type.PackedColorArray
-            ? c.AsColorArray() : System.Array.Empty<Color>();
-        tile.StreetLights = d.TryGetValue(KStreetLights, out var sl) && sl.VariantType == Variant.Type.PackedVector3Array
-            ? sl.AsVector3Array() : System.Array.Empty<Vector3>();
-        tile.StreetLightColors = d.TryGetValue(KStreetLightColors, out var sc) && sc.VariantType == Variant.Type.PackedColorArray
-            ? sc.AsColorArray() : System.Array.Empty<Color>();
-        tile.BeaconLights = d.TryGetValue(KBeaconLights, out var bl) && bl.VariantType == Variant.Type.PackedVector3Array
-            ? bl.AsVector3Array() : System.Array.Empty<Vector3>();
-        tile.BeaconLightColors = d.TryGetValue(KBeaconLightColors, out var bc) && bc.VariantType == Variant.Type.PackedColorArray
-            ? bc.AsColorArray() : System.Array.Empty<Color>();
-
-        tile.AirportLights = d.TryGetValue(KAirportLights, out var al) && al.VariantType == Variant.Type.PackedVector3Array
-            ? al.AsVector3Array() : System.Array.Empty<Vector3>();
-        tile.AirportLightColors = d.TryGetValue(KAirportLightColors, out var ac) && ac.VariantType == Variant.Type.PackedColorArray
-            ? ac.AsColorArray() : System.Array.Empty<Color>();
-
-        tile.Mesh = d.TryGetValue(KMesh, out var m) ? AsMeshArrays(m) : null;
-        tile.HasGroundKey = d.TryGetValue(KGround, out var g);
-        tile.Ground = tile.HasGroundKey ? AsMeshArrays(g) : null;
-        return true;
-    }
-
-    /// <summary>
-    /// A mesh Array is usable when it is an Array whose ARRAY_VERTEX slot is a non-empty
-    /// PackedVector3Array. Returned without copying; padded to Mesh.ARRAY_MAX if Rust sent fewer slots.
-    /// </summary>
-    private static Godot.Collections.Array? AsMeshArrays(Variant v)
-    {
-        if (v.VariantType != Variant.Type.Array) return null;
-        var a = v.AsGodotArray();
-        if (a.Count == 0) return null;
-        var vtx = a[(int)Mesh.ArrayType.Vertex];
-        if (vtx.VariantType != Variant.Type.PackedVector3Array || vtx.AsVector3Array().Length < 3) return null;
-        if (a.Count < (int)Mesh.ArrayType.Max) a.Resize((int)Mesh.ArrayType.Max);
-        return a;
-    }
-
+    private readonly Variant[] _argsCamera = new Variant[3], _argsGround = new Variant[2];
     private bool? _hasGroundHeight;
 
     /// <summary>True if the loaded Rust build exports ground_height_at() (checked once).</summary>
@@ -877,7 +768,8 @@ public sealed partial class WorldStreamerFacade
     public double GroundHeightAt(double localX, double localZ)
     {
         if (!IsAvailable || !HasGroundHeight) return 0.0;
-        var v = _node!.Call(MGroundHeightAt, localX, localZ);
+        _argsGround[0] = localX; _argsGround[1] = localZ;
+        var v = _node!.Call(MGroundHeightAt, _argsGround);
         return v.VariantType == Variant.Type.Float ? v.AsDouble() : 0.0;
     }
 

@@ -7,18 +7,17 @@ namespace SimWorld;
 /// Pool of tile node sets. Nodes stay in the tree (hidden) when released and are re-used, so
 /// no QueueFree / new happens per tile once the pool has warmed up. The one exception is <see cref="Trim"/>: sets that stayed
 /// idle in the free list for a whole window above a margin are destroyed a few per frame (<see cref="PoolTrimmer"/>).
+/// Releasing is two steps (<see cref="Release"/> hides the set at once, <see cref="DrainRetired"/> frees its meshes and sprite buffers within a per-frame
+/// budget), so a big poll_unload batch costs a few hundred microseconds a frame instead of one hitch; a retired set is never handed out before it is cleared.
 /// </summary>
-public sealed class TilePool
+public sealed partial class TilePool
 {
-    private const int FloatsPerInstance = 16;
-    private const int CapacityStep = 256;
-    /// <summary>Alpha of a single light is clamp(sqrt(1)/8) = 0.125; anything clearly above is a cluster.</summary>
-    private const float ClusterAlpha = 0.13f;
-
     private readonly Node3D _container;
     private readonly Stack<TileNodes> _free = new();
+    // Released but not yet cleared (still holding meshes and sprite buffers); oldest first.
+    private readonly RetireQueue<TileNodes> _retiring = new();
     private readonly PoolTrimmer _trimmer;
-    private readonly System.Action<TileNodes> _destroy;
+    private readonly System.Action<TileNodes> _destroy, _finishRetired;
     private readonly Mesh _lightMesh;
     private readonly ShaderMaterial _lightMaterial;
     private readonly Mesh _streetLightMesh;
@@ -37,20 +36,19 @@ public sealed class TilePool
     // The same for the five sprite sets (shader compiled with LOD_DITHER: plain uniform fade_mul instead of the constant 1).
     private readonly FadeMaterials _lightFades, _streetFades, _poolFades, _beaconFades, _airportFades;
 
-    private static readonly StringName PFade = new("fade");
-    private static readonly StringName PFadeParity = new("fade_parity");
-    private static readonly StringName PFadeMul = new("fade_mul");
-
     /// <summary>Debug (user arg --light-alpha=&lt;v&gt;): force every light's weight, ignoring Rust's alpha. Negative = off.</summary>
     public static float DebugLightAlpha { get; set; } = -1f;
-    /// <summary>Extra cull margin (m) for the earth-curvature drop of building and ground meshes; set before the pool is created.</summary>
+    /// <summary>The earth-curvature drop (m) at the camera far plane, for helpers that are not per-tile (the runway markings). Tile sets size their own margin per tile (<see cref="CullMargins"/>, <see cref="SetCullMargin"/>).</summary>
     public static float CurveCullMargin { get; set; }
 
     /// <summary>Node sets that exist now (in use plus free); a trimmed set no longer counts.</summary>
     public int TotalCreated { get; private set; }
     /// <summary>Node sets destroyed by <see cref="Trim"/> since start; <c>TotalCreated + Trimmed</c> is every set ever allocated.</summary>
     public int Trimmed => _trimmer.Trimmed;
-    public int FreeCount => _free.Count;
+    /// <summary>Sets that can be handed out: cleared ones plus the retired ones waiting for <see cref="DrainRetired"/> (cleared on demand).</summary>
+    public int FreeCount => _free.Count + _retiring.Count;
+    /// <summary>Released sets whose meshes and sprite buffers are not freed yet.</summary>
+    public int RetiringCount => _retiring.Count;
     public ShaderMaterial BuildingMaterial => _buildingMaterial;
     /// <summary>The configured dither variants (templates; fading tiles use clones, see <see cref="FadeMaterials"/>).</summary>
     public ShaderMaterial BuildingFadeMaterial => _buildingFades.Template;
@@ -87,6 +85,7 @@ public sealed class TilePool
         settings ??= new WorldRenderSettings();
         _trimmer = new PoolTrimmer("vector tiles", settings);
         _destroy = Destroy;
+        _finishRetired = FinishRetired;
         string shaders = (addonRoot ?? AddonPaths.Root) + "/shaders";
         string textures = (addonRoot ?? AddonPaths.Root) + "/textures";
 
@@ -289,9 +288,14 @@ public sealed class TilePool
     {
         if (!_free.TryPop(out var t))
         {
-            t = Create();
-            TotalCreated++;
+            if (_retiring.TryDequeue(out t)) Clear(t); // never reuse a set before its release ran
+            else
+            {
+                t = Create();
+                TotalCreated++;
+            }
         }
+        ApplySprites(t);
         t.Key = key;
         t.Packed = packed;
         t.Ring = ring;
@@ -305,7 +309,7 @@ public sealed class TilePool
     /// <summary>Once per frame: destroys a few idle node sets when the free list has stayed above its margin (see <see cref="PoolTrimmer"/>). Returns how many.</summary>
     public int Trim(double delta)
     {
-        int n = _trimmer.Step(delta, TotalCreated - _free.Count, _free, _destroy);
+        int n = _trimmer.Step(delta, TotalCreated - FreeCount, _free, _destroy);
         TotalCreated -= n;
         return n;
     }
@@ -316,6 +320,10 @@ public sealed class TilePool
         t.Root.QueueFree();
     }
 
+    /// <summary>
+    /// Takes a tile out of play: hidden at once, fade materials returned, state reset, then queued for <see cref="DrainRetired"/>, which clears its meshes and
+    /// sprite buffers later. The set is not handed out again before that (<see cref="Acquire"/> clears it on demand if the free list is empty).
+    /// </summary>
     public void Release(TileNodes t)
     {
         t.Root.Visible = false;
@@ -323,36 +331,42 @@ public sealed class TilePool
         t.Fade = 1f;
         t.Fading = false;
         t.FadeAwait = false;
-        ClearMesh(t);
-        ClearGround(t);
-        ClearLights(t);
         t.Key = "";
         t.Packed = 0;
         t.Applied = false;
+        _retiring.Enqueue(t);
+    }
+
+    /// <summary>
+    /// Clears retired sets (frees their meshes, empties their sprite sets) and returns them to the free list, until <paramref name="budgetUs"/> microseconds
+    /// are spent; at least one per call when any waits, so the queue cannot stall. Returns how many were cleared.
+    /// </summary>
+    public int DrainRetired(long budgetUs) => _retiring.Drain(budgetUs, _finishRetired);
+
+    private void FinishRetired(TileNodes t)
+    {
+        Clear(t);
         _free.Push(t);
     }
 
-    private static (MultiMeshInstance3D, MultiMesh) CreateSprites(string name, Mesh quad, ShaderMaterial material)
+    private void Clear(TileNodes t)
     {
-        var mm = new MultiMesh
-        {
-            TransformFormat = MultiMesh.TransformFormatEnum.Transform3D,
-            UseColors = true,
-            Mesh = quad,
-        };
-        mm.InstanceCount = 0; // after format/colors are set
-        var mmi = new MultiMeshInstance3D
-        {
-            Name = name,
-            Multimesh = mm,
-            // Also as override so the per-instance fade_mul uniform is found on the MultiMesh instance.
-            MaterialOverride = material,
-            CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
-            Visible = false,
-            // The billboard is expanded in the vertex shader; keep distant sprites out of any frustum-edge pop.
-            ExtraCullMargin = 200f + CurveCullMargin,
-        };
-        return (mmi, mm);
+        ClearMesh(t);
+        ClearGround(t);
+        ClearLights(t);
+    }
+
+    /// <summary>Writes the earth-curvature cull margin (<see cref="CullMargins"/>) to the set's instances; the sprite sets keep their own padding on top.</summary>
+    public void SetCullMargin(TileNodes t, float margin)
+    {
+        t.CullMargin = margin;
+        t.MeshInstance.ExtraCullMargin = margin;
+        t.GroundInstance.ExtraCullMargin = margin;
+        t.Lights.ExtraCullMargin = margin + SpriteCullPad;
+        t.StreetLights.ExtraCullMargin = margin + SpriteCullPad;
+        t.StreetPools.ExtraCullMargin = margin + PoolCullPad;
+        t.Beacons.ExtraCullMargin = margin + SpriteCullPad;
+        t.AirportLights.ExtraCullMargin = margin + SpriteCullPad;
     }
 
     private TileNodes Create()
@@ -368,7 +382,7 @@ public sealed class TilePool
             MaterialOverride = _streetPoolMaterial,
             CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
             Visible = false,
-            ExtraCullMargin = 50f + CurveCullMargin, // the disc reaches below and around the lamp's AABB
+            ExtraCullMargin = PoolCullPad, // the disc reaches below and around the lamp's AABB; the curvature margin is added by SetCullMargin
         };
         var am = new ArrayMesh();
         var mi = new MeshInstance3D
@@ -376,7 +390,6 @@ public sealed class TilePool
             Name = "Mesh",
             Mesh = am,
             MaterialOverride = _buildingMaterial,
-            ExtraCullMargin = CurveCullMargin,
             Visible = false,
         };
         var gm = new ArrayMesh();
@@ -387,85 +400,25 @@ public sealed class TilePool
             MaterialOverride = _groundMaterial,
             // Flat ground never needs to cast shadows (and every shadow caster costs an extra draw call).
             CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
-            ExtraCullMargin = CurveCullMargin,
             Visible = false,
         };
+        var sprites = new Node3D { Name = "Sprites", Visible = _spritesOn };
         var root = new Node3D { Name = "Tile", Visible = false };
         root.AddChild(mi);
         root.AddChild(gi);
-        root.AddChild(mmi);
-        root.AddChild(smi);
-        root.AddChild(pools);
-        root.AddChild(bmi);
-        root.AddChild(ami);
+        sprites.AddChild(mmi);
+        sprites.AddChild(smi);
+        sprites.AddChild(pools);
+        sprites.AddChild(bmi);
+        sprites.AddChild(ami);
+        root.AddChild(sprites);
         _container.AddChild(root);
         return new TileNodes
         {
-            Root = root, MeshInstance = mi, Mesh = am, GroundInstance = gi, GroundMesh = gm, Lights = mmi, LightsMm = mm,
+            Root = root, Sprites = sprites, SpritesShown = _spritesOn, MeshInstance = mi, Mesh = am, GroundInstance = gi, GroundMesh = gm, Lights = mmi, LightsMm = mm,
             StreetLights = smi, StreetLightsMm = smm, StreetPools = pools, Beacons = bmi, BeaconsMm = bmm,
             AirportLights = ami, AirportLightsMm = amm,
         };
-    }
-
-    /// <summary>
-    /// Applies a poll_fades value (0..1, below 1) to a tile: gives each of its seven drawn nodes (building, ground, five sprite sets) its own clone of the
-    /// dithering variant (<see cref="FadeMaterials"/>) and writes fade / fade_parity (parity = z &amp; 1 of the key) into them as plain uniforms.
-    /// The light sprites never dither; their brightness is scaled by the same value instead (<c>fade_mul</c>), so the two additive sides of a swap
-    /// sum to constant brightness (no double-bright flash while R3/R2 lights overlap).
-    /// </summary>
-    public void SetFade(TileNodes t, float fade)
-    {
-        var m = t.FadeMats;
-        if (!t.FadeMaterialActive)
-        {
-            float parity = TileKey.Z(t.Packed) & 1;
-            m[0] = _buildingFades.Rent();
-            m[1] = _groundFades.Rent();
-            m[0]!.SetShaderParameter(PFadeParity, parity);
-            m[1]!.SetShaderParameter(PFadeParity, parity);
-            m[2] = _lightFades.Rent();
-            m[3] = _streetFades.Rent();
-            m[4] = _poolFades.Rent();
-            m[5] = _beaconFades.Rent();
-            m[6] = _airportFades.Rent();
-            t.MeshInstance.MaterialOverride = m[0];
-            t.GroundInstance.MaterialOverride = m[1];
-            t.Lights.MaterialOverride = m[2];
-            t.StreetLights.MaterialOverride = m[3];
-            t.StreetPools.MaterialOverride = m[4];
-            t.Beacons.MaterialOverride = m[5];
-            t.AirportLights.MaterialOverride = m[6];
-            t.FadeMaterialActive = true;
-        }
-        m[0]!.SetShaderParameter(PFade, fade);
-        m[1]!.SetShaderParameter(PFade, fade);
-        for (int i = 2; i < FadeNodes; i++) m[i]!.SetShaderParameter(PFadeMul, fade);
-    }
-
-    /// <summary>Nodes of a tile set that dither or scale with a fade: building, ground, lights, street lamps, street pools, beacons, airport lights.</summary>
-    public const int FadeNodes = 7;
-
-    /// <summary>Back to the opaque materials (no discard) once a tile left its transition, or when it is released; the clones go back to their pools.</summary>
-    public void EndFade(TileNodes t)
-    {
-        if (!t.FadeMaterialActive) return;
-        var m = t.FadeMats;
-        t.MeshInstance.MaterialOverride = _buildingMaterial;
-        t.GroundInstance.MaterialOverride = _groundMaterial;
-        t.Lights.MaterialOverride = _lightMaterial;
-        t.StreetLights.MaterialOverride = _streetLightMaterial;
-        t.StreetPools.MaterialOverride = _streetPoolMaterial;
-        t.Beacons.MaterialOverride = _beaconMaterial;
-        t.AirportLights.MaterialOverride = _airportLightMaterial;
-        _buildingFades.Return(m[0]!);
-        _groundFades.Return(m[1]!);
-        _lightFades.Return(m[2]!);
-        _streetFades.Return(m[3]!);
-        _poolFades.Return(m[4]!);
-        _beaconFades.Return(m[5]!);
-        _airportFades.Return(m[6]!);
-        for (int i = 0; i < FadeNodes; i++) m[i] = null;
-        t.FadeMaterialActive = false;
     }
 
     private void ClearMesh(TileNodes t)
@@ -484,38 +437,21 @@ public sealed class TilePool
         t.GroundInstance.Visible = false;
     }
 
-    private void ClearLights(TileNodes t)
-    {
-        t.LightsMm.VisibleInstanceCount = 0;
-        t.Lights.Visible = false;
-        t.LightCount = 0;
-        t.Clustered = false;
-        t.StreetLightsMm.VisibleInstanceCount = 0;
-        t.StreetLights.Visible = false;
-        t.StreetPools.Visible = false;
-        t.StreetLightCount = 0;
-        t.BeaconsMm.VisibleInstanceCount = 0;
-        t.Beacons.Visible = false;
-        t.BeaconCount = 0;
-        t.AirportLightsMm.VisibleInstanceCount = 0;
-        t.AirportLights.Visible = false;
-        t.AirportLightCount = 0;
-    }
-
     /// <summary>
     /// Uploads <paramref name="arrays"/> (Mesh.ARRAY_MAX layout) into the tile's reused ArrayMesh on the
-    /// calling (main) thread. Null = empty tile (no surface, instance hidden).
+    /// calling (main) thread. Null = empty tile (no surface, instance hidden). Returns false when Godot rejected the arrays.
     /// </summary>
-    public void SetMesh(TileNodes t, Godot.Collections.Array? arrays)
+    public bool SetMesh(TileNodes t, Godot.Collections.Array? arrays)
     {
         ClearMesh(t);
-        if (arrays == null) return;
+        if (arrays == null) return true;
         t.Mesh.AddSurfaceFromArrays(Godot.Mesh.PrimitiveType.Triangles, arrays);
-        if (t.Mesh.GetSurfaceCount() == 0) return; // Godot rejected the arrays (error already printed)
+        if (t.Mesh.GetSurfaceCount() == 0) return false; // Godot rejected the arrays (it printed its own error, without the tile)
         int idx = t.Mesh.SurfaceGetArrayIndexLen(0);
         t.Tris = (idx > 0 ? idx : t.Mesh.SurfaceGetArrayLen(0)) / 3;
         t.HasMesh = true;
         t.MeshInstance.Visible = true;
+        return true;
     }
 
     /// <summary>
@@ -523,100 +459,16 @@ public sealed class TilePool
     /// ArrayMesh. Null = no ground (empty tile; R3 before api 1.3): the instance is hidden. Visibility of the whole tile is the
     /// root's, so ground swaps exactly with the buildings.
     /// </summary>
-    public void SetGround(TileNodes t, Godot.Collections.Array? arrays)
+    public bool SetGround(TileNodes t, Godot.Collections.Array? arrays)
     {
         ClearGround(t);
-        if (arrays == null) return;
+        if (arrays == null) return true;
         t.GroundMesh.AddSurfaceFromArrays(Godot.Mesh.PrimitiveType.Triangles, arrays);
-        if (t.GroundMesh.GetSurfaceCount() == 0) return;
+        if (t.GroundMesh.GetSurfaceCount() == 0) return false;
         int idx = t.GroundMesh.SurfaceGetArrayIndexLen(0);
         t.GroundTris = (idx > 0 ? idx : t.GroundMesh.SurfaceGetArrayLen(0)) / 3;
         t.HasGround = true;
         t.GroundInstance.Visible = true;
-    }
-
-    /// <summary>
-    /// Fills the tile's light MultiMesh from positions relative to the tile origin. Color rgb = light color,
-    /// alpha = intensity weight (0.125 single light .. 1 big cluster); the sprite shader reads it from COLOR.
-    /// </summary>
-    public void SetLights(TileNodes t, Vector3[] lights, Color[] colors)
-    {
-        t.LightCount = lights.Length;
-        t.Clustered = Fill(t.Lights, t.LightsMm, ref t.Buffer, lights, colors);
-    }
-
-    /// <summary>Fills the tile's street lamp MultiMesh (api 1.1), same layout as <see cref="SetLights"/>.</summary>
-    public void SetStreetLights(TileNodes t, Vector3[] lights, Color[] colors)
-    {
-        t.StreetLightCount = lights.Length;
-        Fill(t.StreetLights, t.StreetLightsMm, ref t.StreetBuffer, lights, colors);
-        t.StreetPools.Visible = t.StreetLights.Visible;
-    }
-
-    /// <summary>Fills the tile's beacon MultiMesh (api 1.2); colour alpha is the blink phase, passed through untouched.</summary>
-    public void SetBeacons(TileNodes t, Vector3[] lights, Color[] colors)
-    {
-        t.BeaconCount = lights.Length;
-        Fill(t.Beacons, t.BeaconsMm, ref t.BeaconBuffer, lights, colors, rawAlpha: true);
-    }
-
-    /// <summary>
-    /// Fills the tile's airport light MultiMesh (api 1.7). Rust sends the fixed colour (blue / white / green / red) and the intensity weight in the
-    /// alpha (<c>seed.airport.lights.intensity</c>, 0.35); the sprite shader would read an alpha above 0.125 as a cluster, so the buffer carries
-    /// alpha 0.125 (a single light) and the weight scales the colour instead (weight / reference weight, 1 at the default).
-    /// </summary>
-    public void SetAirportLights(TileNodes t, Vector3[] lights, Color[] colors)
-    {
-        t.AirportLightCount = lights.Length;
-        Fill(t.AirportLights, t.AirportLightsMm, ref t.AirportBuffer, lights, colors, airportWeight: _airportReferenceWeight);
-    }
-
-    /// <summary>Uploads one sprite set; returns true when any light carries a cluster weight.</summary>
-    private static bool Fill(MultiMeshInstance3D mmi, MultiMesh mm, ref float[] buffer, Vector3[] lights, Color[] colors, bool rawAlpha = false, float airportWeight = 0f)
-    {
-        int n = lights.Length;
-        if (n == 0)
-        {
-            mm.VisibleInstanceCount = 0;
-            mmi.Visible = false;
-            return false;
-        }
-
-        int cap = (n + CapacityStep - 1) / CapacityStep * CapacityStep;
-        if (mm.InstanceCount != cap) mm.InstanceCount = cap;
-        int len = cap * FloatsPerInstance;
-        if (buffer.Length != len) buffer = new float[len];
-
-        var buf = buffer;
-        int nc = colors.Length;
-        bool clustered = false;
-        for (int i = 0, o = 0; i < n; i++, o += FloatsPerInstance)
-        {
-            var p = lights[i];
-            buf[o + 0] = 1f; buf[o + 1] = 0; buf[o + 2] = 0; buf[o + 3] = p.X;
-            buf[o + 4] = 0; buf[o + 5] = 1f; buf[o + 6] = 0; buf[o + 7] = p.Y;
-            buf[o + 8] = 0; buf[o + 9] = 0; buf[o + 10] = 1f; buf[o + 11] = p.Z;
-            if (i < nc)
-            {
-                var c = colors[i];
-                if (airportWeight > 0f)
-                {
-                    float k = c.A / airportWeight;
-                    buf[o + 12] = c.R * k; buf[o + 13] = c.G * k; buf[o + 14] = c.B * k; buf[o + 15] = 0.125f;
-                    continue;
-                }
-                float a = DebugLightAlpha >= 0f && !rawAlpha ? DebugLightAlpha : c.A;
-                buf[o + 12] = c.R; buf[o + 13] = c.G; buf[o + 14] = c.B; buf[o + 15] = a;
-                if (a > ClusterAlpha) clustered = true;
-            }
-            else
-            {
-                buf[o + 12] = 1; buf[o + 13] = 0.9f; buf[o + 14] = 0.7f; buf[o + 15] = 0.125f;
-            }
-        }
-        mm.Buffer = buf;
-        mm.VisibleInstanceCount = n;
-        mmi.Visible = true;
-        return clustered;
+        return true;
     }
 }

@@ -99,6 +99,9 @@ public partial class DiagnosticsNode : Node
         PerfMarker.AddMs(PerfCat.UploadVector, u.VectorMs, u.Vector);
         PerfMarker.AddMs(PerfCat.UploadTerrain, u.TerrainMs, u.Terrain);
         PerfMarker.AddMs(PerfCat.UploadLandmarks, u.LandmarkMs, u.Landmarks);
+        PerfMarker.AddMs(PerfCat.UnloadApply, u.UnloadApplyMs, u.Unloaded);
+        PerfMarker.AddMs(PerfCat.FadeApply, u.FadeApplyMs, 1);
+        PerfMarker.AddMs(PerfCat.ReleaseDrain, u.ReleaseDrainMs, 1);
     }
 
     static void Feed(PerfCat cat, StreamerTimings timings, StreamerCall call) => PerfMarker.AddMs(cat, timings.FrameMs(call), timings.FrameCalls(call));

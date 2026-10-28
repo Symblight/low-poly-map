@@ -24,25 +24,22 @@ public sealed class TerrainPool
 {
     private readonly Node3D _container;
     private readonly Stack<TerrainNodes> _free = new();
+    private readonly RetireQueue<TerrainNodes> _retiring = new(); // released, mesh not freed yet (see TilePool.DrainRetired)
     private readonly PoolTrimmer _trimmer;
-    private readonly System.Action<TerrainNodes> _destroy;
+    private readonly System.Action<TerrainNodes> _destroy, _finishRetired;
     private readonly ShaderMaterial _material;
     private readonly FadeMaterials _fades;
 
     private static readonly StringName PFade = new("fade");
     private static readonly StringName PFadeParity = new("fade_parity");
 
-    /// <summary>
-    /// Extra frustum-cull margin (m) of every terrain mesh: the visual earth curvature lowers vertices by d^2 / 2R below the flat tile AABB, which
-    /// is up to 1.8 km at a 150 km far plane (<see cref="WorldView"/> sets it after each configure from the camera far plane and the terrain reach).
-    /// </summary>
-    public float CullMargin { get; set; } = TilePool.CurveCullMargin;
-
     /// <summary>Node sets that exist now (in use plus free); a trimmed set no longer counts.</summary>
     public int TotalCreated { get; private set; }
     /// <summary>Node sets destroyed by <see cref="Trim"/> since start.</summary>
     public int Trimmed => _trimmer.Trimmed;
-    public int FreeCount => _free.Count;
+    /// <summary>Sets that can be handed out: cleared ones plus retired ones waiting for <see cref="DrainRetired"/>.</summary>
+    public int FreeCount => _free.Count + _retiring.Count;
+    public int RetiringCount => _retiring.Count;
     public ShaderMaterial Material => _material;
     /// <summary>The configured dither variant (template; fading tiles use clones, see <see cref="FadeMaterials"/>).</summary>
     public ShaderMaterial FadeMaterial => _fades.Template;
@@ -53,6 +50,7 @@ public sealed class TerrainPool
         settings ??= new WorldRenderSettings();
         _trimmer = new PoolTrimmer("terrain tiles", settings);
         _destroy = Destroy;
+        _finishRetired = FinishRetired;
         string shaders = (addonRoot ?? AddonPaths.Root) + "/shaders";
         _material = new ShaderMaterial { Shader = GD.Load<Shader>(shaders + "/terrain.gdshader") };
         var fadeMaterial = new ShaderMaterial { Shader = TilePool.LoadDitherVariant(shaders + "/terrain.gdshader") };
@@ -72,20 +70,23 @@ public sealed class TerrainPool
     {
         if (!_free.TryPop(out var t))
         {
-            t = Create();
-            TotalCreated++;
+            if (_retiring.TryDequeue(out t)) ClearMesh(t); // never reuse a set before its release ran
+            else
+            {
+                t = Create();
+                TotalCreated++;
+            }
         }
         t.Key = key;
         t.Packed = packed;
         t.Ring = ring;
-        t.MeshInstance.ExtraCullMargin = CullMargin;
         return t;
     }
 
     /// <summary>Once per frame: destroys a few idle node sets when the free list has stayed above its margin (see <see cref="PoolTrimmer"/>). Returns how many.</summary>
     public int Trim(double delta)
     {
-        int n = _trimmer.Step(delta, TotalCreated - _free.Count, _free, _destroy);
+        int n = _trimmer.Step(delta, TotalCreated - FreeCount, _free, _destroy);
         TotalCreated -= n;
         return n;
     }
@@ -96,6 +97,7 @@ public sealed class TerrainPool
         t.Root.QueueFree();
     }
 
+    /// <summary>Hides the tile at once and queues it for <see cref="DrainRetired"/>, which frees its mesh later (see <see cref="TilePool.Release"/>).</summary>
     public void Release(TerrainNodes t)
     {
         t.Root.Visible = false;
@@ -103,11 +105,26 @@ public sealed class TerrainPool
         t.Fade = 1f;
         t.Fading = false;
         t.FadeAwait = false;
-        ClearMesh(t);
         t.Key = "";
         t.Packed = 0;
         t.Applied = false;
+        _retiring.Enqueue(t);
+    }
+
+    /// <summary>Frees the meshes of retired sets within <paramref name="budgetUs"/> microseconds (at least one) and returns them to the free list.</summary>
+    public int DrainRetired(long budgetUs) => _retiring.Drain(budgetUs, _finishRetired);
+
+    private void FinishRetired(TerrainNodes t)
+    {
+        ClearMesh(t);
         _free.Push(t);
+    }
+
+    /// <summary>Earth-curvature cull margin of the tile's mesh (<see cref="CullMargins"/>).</summary>
+    public static void SetCullMargin(TerrainNodes t, float margin)
+    {
+        t.CullMargin = margin;
+        t.MeshInstance.ExtraCullMargin = margin;
     }
 
     private TerrainNodes Create()
@@ -119,8 +136,7 @@ public sealed class TerrainPool
             Mesh = am,
             MaterialOverride = _material,
             CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
-            // Curved vertices sink below the flat tile AABB: widen the cull box by the drop at the camera's far plane.
-            ExtraCullMargin = TilePool.CurveCullMargin,
+            // The curvature margin is written per tile (SetCullMargin).
             Visible = false,
         };
         var root = new Node3D { Name = "TerrainTile", Visible = false };
@@ -164,17 +180,18 @@ public sealed class TerrainPool
     /// Uploads the terrain mesh (VERTEX + INDEX, NORMAL with smooth shading) into the tile's reused ArrayMesh, replacing the previous
     /// surface (a re-delivery under the same key is not expected since api 1.10, handled anyway). Null = nothing usable: the instance is hidden.
     /// </summary>
-    public void SetMesh(TerrainNodes t, Godot.Collections.Array? arrays, float hMin, float hMax)
+    public bool SetMesh(TerrainNodes t, Godot.Collections.Array? arrays, float hMin, float hMax)
     {
         ClearMesh(t);
         t.HMin = hMin;
         t.HMax = hMax;
-        if (arrays == null) return;
+        if (arrays == null) return true;
         t.Mesh.AddSurfaceFromArrays(Mesh.PrimitiveType.Triangles, arrays); // no compress flags: uncompressed positions
-        if (t.Mesh.GetSurfaceCount() == 0) return;
+        if (t.Mesh.GetSurfaceCount() == 0) return false; // rejected by Godot
         int idx = t.Mesh.SurfaceGetArrayIndexLen(0);
         t.Tris = (idx > 0 ? idx : t.Mesh.SurfaceGetArrayLen(0)) / 3;
         t.HasMesh = true;
         t.MeshInstance.Visible = true;
+        return true;
     }
 }

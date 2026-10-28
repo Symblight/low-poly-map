@@ -67,6 +67,9 @@ uniform float floodlight_fade_height_m = 25.0;
 varying float v_roof;
 varying float v_wall;
 varying float v_depth;
+// The wall / roof colour is a property of the building (profile id + seed in COLOR, equal on all its vertices), so it is computed per vertex, not per pixel
+// (palette lookup, the seed variation and the sRGB -> linear conversion with three pow() were a fixed cost of every pixel, up to a 7 km R2 wall).
+varying vec3 v_albedo;
 
 // Palette in sRGB, indexed by profile id 0..5.
 vec3 palette(int p) {
@@ -99,6 +102,12 @@ void vertex() {
 	// Roofs and the underside of raised parts (normal -Y) carry tile-local meter UVs: no windows, no floor lines there.
 	v_roof = step(0.7, NORMAL.y);
 	v_wall = 1.0 - step(0.7, abs(NORMAL.y));
+	int vprofile = clamp(int(floor(COLOR.r * 8.0 + 0.5)), 0, 7);
+	vec3 base = palette(vprofile);
+	// Small per-building variation: brightness and slight warm/cool shift.
+	float k = (COLOR.g - 0.5) * 2.0 * seed_variation;
+	base = clamp(base * (1.0 + k) + vec3(k * 0.05, 0.0, -k * 0.05), 0.0, 1.0);
+	v_albedo = srgb_to_linear(base);
 	VERTEX.y -= earth_curve_drop((MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz);
 	v_depth = -(MODELVIEW_MATRIX * vec4(VERTEX, 1.0)).z;
 }
@@ -108,14 +117,9 @@ void fragment() {
 	if (!lod_dither_keep(FRAGCOORD.xy)) discard;
 #endif
 	int profile = clamp(int(floor(COLOR.r * 8.0 + 0.5)), 0, 7);
-	float seed = COLOR.g;
 	float floor_h = max(COLOR.b * 10.0, 2.0);
 
-	vec3 base = palette(profile);
-	// Small per-building variation: brightness and slight warm/cool shift.
-	float k = (seed - 0.5) * 2.0 * seed_variation;
-	base = clamp(base * (1.0 + k) + vec3(k * 0.05, 0.0, -k * 0.05), 0.0, 1.0);
-	vec3 albedo = srgb_to_linear(base);
+	vec3 albedo = v_albedo;
 
 	// Roofs darker.
 	albedo *= mix(1.0, roof_darken, v_roof);
@@ -139,20 +143,9 @@ void fragment() {
 	vec2 f = fract(UV);
 	float in_window = float(all(greaterThan(f, vec2(0.2, 0.25))) && all(lessThan(f, vec2(0.8, 0.8)))) * windowed;
 
-	// 24 bit seed: g (8 bit in the vertex) mixed with the floor height and building height bytes of the same building.
-	uint s = uint(COLOR.g * 255.0 + 0.5) | (uint(COLOR.b * 255.0 + 0.5) << 8u) | (uint(COLOR.a * 255.0 + 0.5) << 16u);
-	s = pcg(s);
-	float building_factor = 0.6 + 0.8 * float(pcg(s ^ 0x85EBCA6Bu) >> 8u) * (1.0 / 16777216.0);
-	float share = clamp(window_share[profile] * building_factor, 0.0, 1.0);
-	float h1 = hash01(s, cell);
-	float h2 = hash01(s ^ 0x9E3779B9u, cell);
-	float lit = float(h1 < share);                      // monotone in share: windows go off in a fixed order as it falls
-	float glow = lit * (0.85 + 0.3 * h2) * in_window;   // per-window brightness jitter
-	// Average of the grid: the window area is 0.6 x 0.55 = 0.33 of the cell, but only avg_gain of it is shown (see the uniforms), and it
-	// fades to zero with view depth while the sprites take over. No average on windowless walls.
-	float avg = share * avg_gain * windowed * (1.0 - smoothstep(avg_fade_start_m, avg_fade_end_m, v_depth));
 	// 0 while a cell covers several pixels, 1 when it is about one pixel: the grid fades into its average, no shimmer, no pop.
 	// UV is in window units on windowed walls, so fwidth is the cell size in pixels (the 2 m wide cell of an office wall is 1 unit too).
+	// (Derivatives stay outside the branch below: they need uniform control flow.)
 	float w = smoothstep(0.25, 0.75, max(fwidth(UV.x), fwidth(UV.y)));
 
 	// Day: glass cells slightly darker and smoother, also blended to their average with distance.
@@ -162,9 +155,28 @@ void fragment() {
 	ALBEDO = albedo;
 	ROUGHNESS = mix(roughness_value, window_day_roughness, glass);
 	SPECULAR = 0.3;
-	vec3 col = profile_color[profile];
-	vec3 avg_col = mix(col, vec3(dot(col, vec3(0.3333))), avg_desaturate) * avg_tint;
-	vec3 emis = (col * glow * (1.0 - w) + avg_col * avg * w) * window_emission;
+
+	// Emission of lit windows. It is zero on roofs and windowless walls (every R2 / R3 wall, where in_window and the average are multiplied by windowed = 0)
+	// and by day (multiplied by the night factor below), so those pixels skip the hashing: the same image, a fraction of the ALU work. The condition is
+	// constant over a primitive (wall or roof) and over the frame (the night factor is a global).
+	vec3 emis = vec3(0.0);
+	if (windowed > 0.5 && simworld_night_factor > 0.0) {
+		// 24 bit seed: g (8 bit in the vertex) mixed with the floor height and building height bytes of the same building.
+		uint s = uint(COLOR.g * 255.0 + 0.5) | (uint(COLOR.b * 255.0 + 0.5) << 8u) | (uint(COLOR.a * 255.0 + 0.5) << 16u);
+		s = pcg(s);
+		float building_factor = 0.6 + 0.8 * float(pcg(s ^ 0x85EBCA6Bu) >> 8u) * (1.0 / 16777216.0);
+		float share = clamp(window_share[profile] * building_factor, 0.0, 1.0);
+		float h1 = hash01(s, cell);
+		float h2 = hash01(s ^ 0x9E3779B9u, cell);
+		float lit = float(h1 < share);                      // monotone in share: windows go off in a fixed order as it falls
+		float glow = lit * (0.85 + 0.3 * h2) * in_window;   // per-window brightness jitter
+		// Average of the grid: the window area is 0.6 x 0.55 = 0.33 of the cell, but only avg_gain of it is shown (see the uniforms), and it
+		// fades to zero with view depth while the sprites take over. No average on windowless walls.
+		float avg = share * avg_gain * windowed * (1.0 - smoothstep(avg_fade_start_m, avg_fade_end_m, v_depth));
+		vec3 col = profile_color[profile];
+		vec3 avg_col = mix(col, vec3(dot(col, vec3(0.3333))), avg_desaturate) * avg_tint;
+		emis = (col * glow * (1.0 - w) + avg_col * avg * w) * window_emission;
+	}
 
 	// Landmark: floodlit base on the windowless walls (roofs and caps excluded), fading up with the wall height.
 	float flood = float(profile == 6) * v_wall * (1.0 - smoothstep(0.0, max(floodlight_fade_height_m, 0.1), UV.y));

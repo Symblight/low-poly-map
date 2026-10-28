@@ -14,6 +14,8 @@ public partial class WorldView
         public int Vector, Terrain, Landmarks;
         /// <summary>Tiles returned to the pool by poll_unload (all layers).</summary>
         public int Unloaded;
+        /// <summary>Host work after the library calls, ms: applying the poll_unload batch (cover removal, hide, retire), applying poll_fades to the tiles, and the deferred node-set release (<see cref="TilePool.DrainRetired"/>).</summary>
+        public double UnloadApplyMs, FadeApplyMs, ReleaseDrainMs;
         /// <summary>Origin re-centers applied.</summary>
         public int OriginShifts;
     }
@@ -27,6 +29,9 @@ public partial class WorldView
     private UploadFrame _lastUploads;
     private long _tmVectorUs, _tmTerrainUs, _tmLandmarkUs;
     private int _tmVector, _tmTerrain, _tmLandmarks, _tmUnloaded, _tmShifts;
+    private long _tmUnloadApplyUs, _tmFadeApplyUs, _tmReleaseDrainUs;
+    // Cumulative microseconds of the host-side phases (added by _Process).
+    private long _unloadApplyUs, _fadeApplyUs, _releaseDrainUs;
 
     /// <summary>
     /// Closes a timing frame: <see cref="Timings"/> rolls over and <see cref="LastUploads"/> becomes the difference of the cumulative
@@ -46,6 +51,9 @@ public partial class WorldView
             Terrain = TerrainReadyTotal - _tmTerrain,
             Landmarks = LandmarkReadyTotal - _tmLandmarks,
             Unloaded = unloaded - _tmUnloaded,
+            UnloadApplyMs = (_unloadApplyUs - _tmUnloadApplyUs) / 1000.0,
+            FadeApplyMs = (_fadeApplyUs - _tmFadeApplyUs) / 1000.0,
+            ReleaseDrainMs = (_releaseDrainUs - _tmReleaseDrainUs) / 1000.0,
             OriginShifts = OriginShiftCount - _tmShifts,
         };
         _tmVectorUs = vectorUs;
@@ -55,6 +63,9 @@ public partial class WorldView
         _tmTerrain = TerrainReadyTotal;
         _tmLandmarks = LandmarkReadyTotal;
         _tmUnloaded = unloaded;
+        _tmUnloadApplyUs = _unloadApplyUs;
+        _tmFadeApplyUs = _fadeApplyUs;
+        _tmReleaseDrainUs = _releaseDrainUs;
         _tmShifts = OriginShiftCount;
     }
 

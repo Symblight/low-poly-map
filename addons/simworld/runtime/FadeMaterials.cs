@@ -25,7 +25,7 @@ public sealed class FadeMaterials
         _all.Add(template);
     }
 
-    /// <summary>The configured variant (never assigned to a node); read parameters from here.</summary>
+    /// <summary>The configured variant (assigned to no tile node; <see cref="MaterialPrewarm"/> draws it for a few frames at start to compile its shader); read parameters from here.</summary>
     public ShaderMaterial Template => _template;
     /// <summary>Clones that exist (in use plus free).</summary>
     public int Clones => _all.Count - 1;

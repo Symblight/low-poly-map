@@ -82,8 +82,23 @@ public static class WindowSelfTest
         view.SetTime(0.0f, 1f);
         if (view.WindowShareUploads != u1) Fail("23.995 -> 0.0 (0.005 h across the wrap) uploaded again");
 
+        // Light sprites are hidden by day: off below night factor 0.02, on again from 0.05, the last state in between (no toggling around dusk).
+        view.SetTime(12f, 1f);
+        if (!view.SpritesVisible) Fail("sprites hidden at night factor 1");
+        view.SetTime(12f, 0.03f);
+        if (!view.SpritesVisible) Fail("sprites hidden at 0.03 while falling from 1 (they stay until 0.02)");
+        int sw0 = view.SpriteSwitches;
+        view.SetTime(12f, 0.01f);
+        if (view.SpritesVisible) Fail("sprites still shown at night factor 0.01");
+        view.SetTime(12f, 0.03f);
+        if (view.SpritesVisible) Fail("sprites shown at 0.03 while rising from 0 (they wait for 0.05)");
+        view.SetTime(12f, 0.05f);
+        if (!view.SpritesVisible) Fail("sprites hidden at night factor 0.05");
+        if (view.SpriteSwitches != sw0 + 2) Fail($"{view.SpriteSwitches - sw0} sprite switches for one night -> day -> night, expected 2");
+        view.SetTime(12f, 1f);
+
         bool ok = fails.Length == 0;
-        GD.Print(ok ? $"WINDOW SELFTEST PASS: {steps} hours scrubbed 12:00 -> 03:00, shares match the profile tables on both materials, never rise after 18:00, uploads only on hour moves > 0.01 h"
+        GD.Print(ok ? $"WINDOW SELFTEST PASS: {steps} hours scrubbed 12:00 -> 03:00, shares match the profile tables on both materials, never rise after 18:00, uploads only on hour moves > 0.01 h, light sprites switch off below night 0.02 and on from 0.05"
                     : "WINDOW SELFTEST FAIL:\n" + fails);
         return ok;
     }

@@ -39,6 +39,7 @@ public partial class BenchArgs : Node
         if (view == null) { GD.PushError("[BenchArgs] no WorldView assigned"); return; }
         var settings = view.Settings ??= new WorldRenderSettings();
         _sceneFar = view.Camera?.Far ?? -1f;
+        settings.DebugChecks = WantsDebugChecks();
 
         foreach (var arg in OS.GetCmdlineUserArgs())
         {
@@ -97,6 +98,7 @@ public partial class BenchArgs : Node
         if (System.Linq.Enumerable.Contains(OS.GetCmdlineUserArgs(), "--hide-vector")) view.VectorVisible = false;
         if (System.Linq.Enumerable.Contains(OS.GetCmdlineUserArgs(), "--terrain-log")) view.TerrainDebugLog = true;
         if (System.Linq.Enumerable.Contains(OS.GetCmdlineUserArgs(), "--churn-log")) { view.ChurnLog = true; view.OriginShifted += sh => GD.Print($"[Churn] t={Time.GetTicksMsec() / 1000.0:0.00} origin shift {sh}"); view.Reconfigured += (ok, e) => GD.Print($"[Churn] t={Time.GetTicksMsec() / 1000.0:0.00} RECONFIGURE ok={ok} {e}"); }
+        if (UploadMicroBench.Requested()) UploadMicroBench.Attach(View?.GetParent() ?? view);
         if (FadeSelfTest.Requested()) { (View?.GetParent() ?? view).CallDeferred(Node.MethodName.AddChild, new FadeSelfTest { Name = "FadeSelfTest" }); return; }
         if (HoleDetector.Requested(out double holeSecs)) HoleDetector.Attach(view, View?.GetParent(), holeSecs);
         if (HoleFlight.Requested(out int holeSeed)) HoleFlight.Attach(view, View?.GetParent(), holeSeed);
@@ -107,6 +109,23 @@ public partial class BenchArgs : Node
         if (TerrainCollisionSelfTest.Requested()) TerrainCollisionSelfTest.Attach(view, View?.GetParent());
         _fallback = GetParent()?.GetNodeOrNull<MeshInstance3D>("Ground");
         if (_fallback != null && System.Linq.Enumerable.Contains(OS.GetCmdlineUserArgs(), "--hide-fallback")) { _fallback.Visible = false; _fallback = null; }
+    }
+
+    /// <summary>
+    /// The addon's debug checks (periodic cover verification, the first-tile <c>debug_stats</c> print) cost frame time, so they run only where something is
+    /// checked: headless smoke runs, every <c>*-selftest</c>, <c>--geodetic-test</c>, <c>--hole-check</c>, or <c>--debug-checks</c>. A benchmark or soak run never
+    /// has them (unless <c>--debug-checks</c> is given): its numbers are the frame cost without them.
+    /// </summary>
+    private static bool WantsDebugChecks()
+    {
+        bool want = DisplayServer.GetName() == "headless";
+        foreach (var a in OS.GetCmdlineUserArgs())
+        {
+            if (a == "--debug-checks") return true;
+            if (a.StartsWith("--benchmark", System.StringComparison.Ordinal) || a.StartsWith("--soak", System.StringComparison.Ordinal)) return false;
+            if (a.EndsWith("-selftest", System.StringComparison.Ordinal) || a == "--geodetic-test" || a.StartsWith("--hole-check", System.StringComparison.Ordinal)) want = true;
+        }
+        return want;
     }
 
     /// <summary>

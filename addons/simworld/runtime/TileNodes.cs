@@ -3,8 +3,9 @@ using Godot;
 namespace SimWorld;
 
 /// <summary>
-/// The pooled node set that represents one streamed tile: a building MeshInstance3D, a ground MeshInstance3D
-/// and two light MultiMeshInstance3Ds (building lights, street lamps), all children of one root (so one Visible flag and one origin shift cover them).
+/// The pooled node set that represents one streamed tile: a building MeshInstance3D, a ground MeshInstance3D and the light sprite sets (building
+/// lights, street lamps with their ground pools, beacons, airport lights) under one <see cref="Sprites"/> container, all children of one root (so one
+/// Visible flag and one origin shift cover them; the container is the one switch that hides every sprite set by day).
 /// </summary>
 public class TileNodes
 {
@@ -15,10 +16,12 @@ public class TileNodes
     /// <summary>Flat landuse / water / road mesh (R0..R2), reused like <see cref="Mesh"/>.</summary>
     public MeshInstance3D GroundInstance = null!;
     public ArrayMesh GroundMesh = null!;
+    /// <summary>Parent of the five sprite instances below; hidden by <see cref="TilePool.SetSpritesVisible"/> while the night factor is 0 (the sprites add nothing by day).</summary>
+    public Node3D Sprites = null!;
+    /// <summary>Whether <see cref="Sprites"/> is currently shown (mirrors the node so the pool does not read it back).</summary>
+    public bool SpritesShown = true;
     public MultiMeshInstance3D Lights = null!;
     public MultiMesh LightsMm = null!;
-    /// <summary>Reused MultiMesh buffer (transform 12 floats + color 4 floats per instance).</summary>
-    public float[] Buffer = System.Array.Empty<float>();
     /// <summary>Street lamps (api 1.1): same sprite shader, its own material without the window cross-fade.</summary>
     public MultiMeshInstance3D StreetLights = null!;
     public MultiMesh StreetLightsMm = null!;
@@ -27,14 +30,18 @@ public class TileNodes
     /// <summary>Aircraft warning beacons (api 1.2), own blinking material.</summary>
     public MultiMeshInstance3D Beacons = null!;
     public MultiMesh BeaconsMm = null!;
-    public float[] BeaconBuffer = System.Array.Empty<float>();
     public int BeaconCount;
-    public float[] StreetBuffer = System.Array.Empty<float>();
     /// <summary>Airport lights of a seed world (api 1.7): the sprite shader with fixed colours, shown at every distance, always on at night.</summary>
     public MultiMeshInstance3D AirportLights = null!;
     public MultiMesh AirportLightsMm = null!;
-    public float[] AirportBuffer = System.Array.Empty<float>();
     public int AirportLightCount;
+
+    /// <summary>
+    /// The extra frustum-cull margin (m) last written to this set's instances: the earth curvature sinks the drawn vertices below the flat AABB by up
+    /// to d^2 / 2R at the tile's far edge (<see cref="CullMargins"/>). NaN until the first write. <see cref="HalfSpanM"/> = half the tile's diagonal.
+    /// </summary>
+    public float CullMargin = float.NaN;
+    public float HalfSpanM;
 
     public string Key = "";
     /// <summary>Time of the first upload under this key (ms since start); churn diagnostics.</summary>

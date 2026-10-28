@@ -16,9 +16,24 @@ public partial class WorldRenderSettings : Resource
     [ExportGroup("Upload")]
     [Export] public long UploadBudgetUs { get; set; } = 2000;
     [Export] public int MaxTilesPerFrame { get; set; } = 2;
+    /// <summary>
+    /// Draw every world material once at start (tiny, in front of the camera, for 24 frames) so the engine compiles the 14 permutations the tiles use,
+    /// including the dithering ones of the LOD fades, during loading and not on the first fade (10 to 25 ms). Needs <see cref="WorldView.Camera"/>; skipped headless.
+    /// </summary>
+    [Export] public bool PrewarmMaterials { get; set; } = true;
     /// <summary>Tile node sets created at start to avoid first-use hitches.</summary>
     [Export] public int PrewarmTiles { get; set; } = 24;
-    /// <summary>Seconds between cover consistency checks (0 = never).</summary>
+    /// <summary>
+    /// Microseconds per frame spent freeing the meshes and sprite buffers of released tiles (a released tile is hidden at once, its node set is cleared and reused
+    /// within this budget; at least one set per frame whatever the budget, so a long queue still drains).
+    /// </summary>
+    [Export] public long ReleaseBudgetUs { get; set; } = 1000;
+    /// <summary>
+    /// Debug checks that cost frame time: the periodic cover verification (<see cref="VerifyIntervalS"/>, about a thousand dictionaries through
+    /// <c>debug_tiles</c>) and the one-time <c>debug_stats</c> print at the first tile (7 to 21 ms). Off by default; a host turns it on for self-tests and smoke runs.
+    /// </summary>
+    [Export] public bool DebugChecks { get; set; }
+    /// <summary>Seconds between cover consistency checks while <see cref="DebugChecks"/> is on (0 = never).</summary>
     [Export] public double VerifyIntervalS { get; set; } = 5.0;
 
     // ---- memory -------------------------------------------------------------------------------

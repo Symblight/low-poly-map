@@ -28,6 +28,12 @@ public enum PerfCat
     Overlay,
     /// <summary><c>debug_stats</c> reads, by whoever makes them (the view's 4 Hz LOD read, the overlays, the 1 Hz sampler).</summary>
     DebugStats,
+    /// <summary>Host work for the poll_unload batch: cover removal, hiding and retiring the node sets (the call itself is <see cref="Unload"/>).</summary>
+    UnloadApply,
+    /// <summary>Host work for the poll_fades dictionary: parsing the keys and switching the tiles' materials (the call itself is <see cref="Fades"/>).</summary>
+    FadeApply,
+    /// <summary>The deferred release of retired node sets (clearing meshes and sprite buffers), time-sliced per frame.</summary>
+    ReleaseDrain,
 }
 
 /// <summary>A running <see cref="PerfMarker"/> timer; a struct, so <c>using</c> it allocates nothing.</summary>
@@ -56,13 +62,13 @@ public readonly struct PerfScope : IDisposable
 /// </summary>
 public static class PerfMarker
 {
-    public const int Count = 10;
+    public const int Count = 13;
     const string MonitorPrefix = "SimWorld/";
 
     static readonly string[] Names =
     {
         "update_camera", "poll_ready", "upload_vector", "upload_terrain", "upload_landmarks",
-        "fades", "unload", "origin_shift", "overlay", "debug_stats",
+        "fades", "unload", "origin_shift", "overlay", "debug_stats", "unload_apply", "fade_apply", "release_drain",
     };
 
     static readonly double MsPerTick = 1000.0 / Stopwatch.Frequency;

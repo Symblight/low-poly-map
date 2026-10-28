@@ -284,7 +284,7 @@ public partial class DebugOverlay : Control
             sb.Append("this second: ready ").Append(Bridge.ReadyLastSecond)
               .Append("  unloaded ").Append(Bridge.UnloadedLastSecond)
               .Append("  replaced ").Append(Bridge.ReplacedTotal)
-              .Append("  cover check ").Append(Bridge.ConsistencyErrors == 0 ? "ok" : "ERRORS " + Bridge.ConsistencyErrors).Append('\n');
+              .Append("  cover check ").Append(Bridge.ConsistencyErrors == 0 ? "ok" : "ERRORS " + Bridge.ConsistencyErrors).Append(Bridge.UploadProblems.Count == 0 ? "" : "  UPLOAD PROBLEMS " + Bridge.UploadProblems.Count + " (see log)").Append('\n');
             sb.Append("upload ms: frame ").Append((Bridge.UploadUsLastFrame / 1000.0).ToString("0.00"))
               .Append("  max/1s ").Append((Bridge.UploadUsMaxLastSecond / 1000.0).ToString("0.00"))
               .Append("  (budget 2.00)  frames over: ").Append(Bridge.UploadFramesOverBudget).Append('/').Append(Bridge.UploadFrames).Append('\n');

@@ -20,6 +20,7 @@
 //! P3 (Config): every tuning value lives in the world [`profile`] (JSON, compiled-in defaults
 //! equal to the spike's constants), resolved by [`World::configure_world`].
 
+pub mod budget;
 pub mod diag;
 pub mod fetch;
 pub mod geo;

@@ -1019,3 +1019,62 @@ fn job_pool_measure() {
         println!("{}", l.report());
     }
 }
+
+/// Memory budget (Terrain v2 step M1): owned by the world, sized from `memory.budget_mb` on
+/// every configure, visible in `stats().memory`, cleared by `shutdown`. Fake items stand in for
+/// the decoded data tiles and HeightTiles that will register later.
+#[test]
+fn memory_budget_follows_the_profile_and_evicts_fake_items() {
+    use crate::budget::{ItemKey, Pool, MIB};
+    let mib = MIB as u64;
+    let mut w = world();
+    assert_eq!(w.stats().memory.budget_bytes, 512 * mib, "default budget before configure");
+    let mut o = synthetic(VILNIUS.0, VILNIUS.1);
+    o.profile_overrides = Some(serde_json::json!({ "memory": { "budget_mb": 64 } }));
+    assert!(w.configure_world(o).ok);
+    assert_eq!(w.stats().memory.budget_bytes, 64 * mib);
+
+    // 20 data tiles of 2 MiB (priority = -distance) and 30 height tiles of 1 MiB: 70 MiB.
+    let m = w.memory_mut();
+    for i in 0..20u64 {
+        m.insert(ItemKey::new(Pool::DataTiles, i), 2 * mib, -(i as f64) * 100.0);
+    }
+    m.pin(ItemKey::new(Pool::DataTiles, 19)); // the farthest, but a job needs it
+    for i in 0..30u64 {
+        m.insert(ItemKey::new(Pool::HeightTiles, i), mib, -(i as f64) * 50.0 - 25.0);
+    }
+    let mut gone = Vec::new();
+    m.take_evicted(Pool::DataTiles, &mut gone);
+    // Each overflow evicts the lowest priority across both pools: D18 (-1800) at H24, D17 at
+    // H26, D16 at H28; every height tile ranks higher than those.
+    assert_eq!(gone, vec![18, 17, 16], "farthest unpinned data tiles first");
+    gone.clear();
+    m.take_evicted(Pool::HeightTiles, &mut gone);
+    assert!(gone.is_empty());
+    let s = w.stats().memory;
+    assert_eq!(s.total_bytes, 64 * mib);
+    assert_eq!((s.pool(Pool::DataTiles).items, s.pool(Pool::HeightTiles).items), (17, 30));
+    assert_eq!(s.pool(Pool::DataTiles).pinned_items, 1);
+
+    // A reconfigure with a smaller budget evicts at once; the pinned tile stays.
+    let mut o = synthetic(VILNIUS.0, VILNIUS.1);
+    o.profile_overrides = Some(serde_json::json!({ "memory": { "budget_mb": 32 } }));
+    assert!(w.configure_world(o).ok);
+    let s = w.stats().memory;
+    assert_eq!((s.budget_bytes, s.over_budget_bytes), (32 * mib, 0));
+    assert!(s.total_bytes <= 32 * mib && s.total_bytes >= 31 * mib, "{}", s.total_bytes);
+    assert!(w.memory().contains(ItemKey::new(Pool::DataTiles, 19)));
+    // The nearest of each pool survive.
+    assert!(w.memory().contains(ItemKey::new(Pool::DataTiles, 0)) && w.memory().contains(ItemKey::new(Pool::HeightTiles, 0)));
+    assert!(!w.memory().contains(ItemKey::new(Pool::DataTiles, 15)) && !w.memory().contains(ItemKey::new(Pool::HeightTiles, 29)));
+
+    // A rejected profile changes nothing.
+    let mut o = synthetic(VILNIUS.0, VILNIUS.1);
+    o.profile_overrides = Some(serde_json::json!({ "memory": { "budget_mb": 1 } }));
+    assert!(!w.configure_world(o).ok);
+    assert_eq!(w.stats().memory.budget_bytes, 32 * mib);
+
+    assert!(w.shutdown());
+    let s = w.stats().memory;
+    assert_eq!((s.total_bytes, s.pool(Pool::DataTiles).items), (0, 0));
+}

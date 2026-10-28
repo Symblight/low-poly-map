@@ -38,7 +38,7 @@ use crate::rings::{BandParams, RING_COUNT};
 
 /// Profile schema version this library reads. Bump when keys are added (and update
 /// `default.json`, the JSON Schema and `CHANGELOG.md`).
-pub const PROFILE_VERSION: u32 = 6;
+pub const PROFILE_VERSION: u32 = 7;
 
 // ---------------------------------------------------------------------------------------------
 // Data tree
@@ -57,6 +57,8 @@ pub struct WorldProfile {
     pub fades: Fades,
     pub origin: Origin,
     pub cache: Cache,
+    /// Memory budget of the core's CPU-side pools (profile_version 7, Terrain v2 section 6).
+    pub memory: Memory,
     /// Procedural terrain (profile_version 5, docs/spec-terrain.md). Off by default; takes effect
     /// only when the host also requests the layer `"terrain"` (`configure_world` option `layers`).
     pub terrain: TerrainProfile,
@@ -472,6 +474,16 @@ pub struct Cache {
     pub validate_retry_s: f64,
 }
 
+/// One byte budget for the core's CPU-side pools (decoded data tiles, HeightTiles, collision
+/// patches; `budget::MemoryBudget`). GPU memory is not part of it. One number for every
+/// platform: an iOS host passes `memory.budget_mb` = 256 as a profile override.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Memory {
+    /// Budget (MiB).
+    pub budget_mb: f64,
+}
+
 /// Procedural terrain (profile_version 5). Heights come from a seeded function
 /// (`terrain::field_height`), no data. The `bands` table, `skirt_m`, `shading`, `horizon_*` and
 /// `max_fetch` / `max_mesh` belong to the terrain-mesh layer (api 1.5, `terrain::tin`, the
@@ -774,6 +786,7 @@ impl Default for WorldProfile {
             fades: Fades::default(),
             origin: Origin::default(),
             cache: Cache::default(),
+            memory: Memory::default(),
             terrain: TerrainProfile::default(),
             seed: SeedProfile::default(),
         }
@@ -1158,6 +1171,12 @@ impl Default for Cache {
     }
 }
 
+impl Default for Memory {
+    fn default() -> Self {
+        Self { budget_mb: 512.0 }
+    }
+}
+
 impl Default for TerrainProfile {
     fn default() -> Self {
         let band = |edge_m, max_error_m, max_edge_m, max_triangles| TerrainBand { edge_m, max_error_m, max_edge_m, max_triangles };
@@ -1277,6 +1296,7 @@ pub const RANGES: &[(&str, f64, f64)] = &[
     ("cache.request_timeout_s", 0.1, 3600.0),
     ("cache.open_retry_s", 0.0, 3600.0),
     ("cache.validate_retry_s", 1.0, 86_400.0),
+    ("memory.budget_mb", 32.0, 65_536.0),
     ("terrain.seed", 0.0, 4_294_967_295.0),
     ("terrain.amplitude_m", 0.0, 3000.0),
     ("terrain.feature_size_m", 200.0, 200_000.0),
@@ -2452,7 +2472,7 @@ mod tests {
     /// strictly and keeps the defaults.
     #[test]
     fn version_1_files_load_with_the_version_2_defaults() {
-        assert_eq!(PROFILE_VERSION, 6);
+        assert_eq!(PROFILE_VERSION, 7);
         let v1 = r#"{ "profile_version": 1, "buildings": { "r1": { "dp_m": 3.0, "min_area_m2": 25.0 } } }"#;
         let p = resolve(Some(("v1", v1)), None, &NullLog).unwrap();
         assert_eq!(p.profile_version, PROFILE_VERSION);
@@ -2472,6 +2492,20 @@ mod tests {
         assert!(e.contains("buildings.r0.min_height_m"), "{e}");
         // Fade safety cap default (profile_version 2 era).
         assert_eq!(Profile::default().fades.cap_s, 0.75);
+    }
+
+    /// profile_version 7 adds `memory.budget_mb` (default 512 MiB, one number for every
+    /// platform); a version 6 file still loads strictly with the default.
+    #[test]
+    fn version_7_adds_the_memory_budget() {
+        let v6 = r#"{ "profile_version": 6, "fades": { "max_active": 2 } }"#;
+        let p = resolve(Some(("v6", v6)), None, &NullLog).unwrap();
+        assert_eq!(p.memory.budget_mb, 512.0);
+        assert!(resolve(Some(("v6", r#"{ "profile_version": 6, "memory": { "budget_gb": 1 } }"#)), None, &NullLog).is_err());
+        let p = resolve(None, Some(&serde_json::json!({ "memory": { "budget_mb": 256 } })), &NullLog).unwrap();
+        assert_eq!(p.memory.budget_mb, 256.0);
+        let e = resolve(None, Some(&serde_json::json!({ "memory": { "budget_mb": 8 } })), &NullLog).unwrap_err();
+        assert!(e.contains("memory.budget_mb"), "{e}");
     }
 
     #[test]

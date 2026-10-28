@@ -6,7 +6,7 @@
   "type": "object",
   "properties": {
     "profile_version": {
-      "description": "Profile schema version (integer). A file with the library's version or older is strict (an unknown key is an error); a newer file loads and unknown keys are ignored with a warning. The library reads version 6 (version 2 added buildings.r0..r2.min_height_m, version 3 added lights.min_ring, version 4 added the landmark and dark light profiles, lights.profiles.*.windows / floodlight, buildings.overrides, dark_states, slender_tower, min_window_wall_m, lights.street and lights.beacons, version 5 added the terrain section, version 6 added the seed section; an older file loads with their defaults).",
+      "description": "Profile schema version (integer). A file with the library's version or older is strict (an unknown key is an error); a newer file loads and unknown keys are ignored with a warning. The library reads version 7 (version 2 added buildings.r0..r2.min_height_m, version 3 added lights.min_ring, version 4 added the landmark and dark light profiles, lights.profiles.*.windows / floodlight, buildings.overrides, dark_states, slender_tower, min_window_wall_m, lights.street and lights.beacons, version 5 added the terrain section, version 6 added the seed section and fades.max_active, version 7 added memory.budget_mb; an older file loads with their defaults).",
       "type": "integer",
       "minimum": 1,
       "maximum": 1000000
@@ -1260,6 +1260,19 @@
           "type": "number",
           "minimum": 1,
           "maximum": 86400
+        }
+      },
+      "additionalProperties": false
+    },
+    "memory": {
+      "description": "Memory budget of the library's CPU-side pools (profile_version 7; Terrain v2 spec section 6): decoded data tiles, terrain height tiles and collision patches share one byte budget; when it is exceeded the lowest-priority items (farthest / least screen error) are evicted first across pools, never items a running job depends on. GPU memory (meshes, textures the host uploads) is not part of it. debug_stats()[\"memory_mb\"] shows the use per pool.",
+      "type": "object",
+      "properties": {
+        "budget_mb": {
+          "description": "The budget, MiB. Default 512 (desktop). One value for every platform: an iOS host passes 256 as a profile override.",
+          "type": "number",
+          "minimum": 32,
+          "maximum": 65536
         }
       },
       "additionalProperties": false

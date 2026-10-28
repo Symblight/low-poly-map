@@ -1,5 +1,5 @@
 {
-  "profile_version": 6,
+  "profile_version": 7,
   "bands": {
     "r0_edge_m": 600.0,
     "r1_edge_m": 2500.0,
@@ -236,6 +236,9 @@
     "request_timeout_s": 20.0,
     "open_retry_s": 1.5,
     "validate_retry_s": 30.0
+  },
+  "memory": {
+    "budget_mb": 512.0
   },
   "terrain": {
     "enabled": false,

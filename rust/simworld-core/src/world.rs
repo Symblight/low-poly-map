@@ -29,6 +29,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::budget::{mb_to_bytes, MemoryBudget, MemoryStats};
 use crate::diag::{thread_cpu_us, Diagnostics, Log, WarnLimiter};
 use crate::fetch::{DiskCache, FetchParams};
 use crate::geo::{Frame, LocalSpace, TileKey, MERCATOR_MAX_LAT};
@@ -286,6 +287,8 @@ pub struct WorldStats {
     /// Shared CPU job pool (both layers): jobs queued (ready or waiting on dependencies),
     /// running, and cancelled since the world was configured. Zero when not running.
     pub jobs: JobStats,
+    /// The memory budget of the core's CPU-side pools (`World::memory`).
+    pub memory: MemoryStats,
 }
 
 fn first4(a: [i32; MAX_RINGS]) -> [i32; RING_COUNT] {
@@ -345,6 +348,10 @@ pub struct World {
     /// The last loaded seed world, kept across configures (and a failed or seed-less one): a
     /// reconfigure with the same files and profile keys reuses it instead of rebuilding.
     seed_cache: Option<Arc<crate::seed::SeedWorld>>,
+    /// One byte budget for the core's CPU-side pools (profile `memory.budget_mb`; Terrain v2
+    /// section 6). Kept across configures (the budget follows the new profile; owners clear
+    /// their own pool when their data becomes stale); cleared by `shutdown`.
+    memory: MemoryBudget,
 }
 
 /// With `diagnostics.profile` on, the streaming latency table is logged this often.
@@ -384,6 +391,7 @@ impl World {
             latency_logged: Instant::now(),
             seed: None,
             seed_cache: None,
+            memory: MemoryBudget::new(mb_to_bytes(crate::profile::Memory::default().budget_mb)),
         }
     }
 
@@ -655,6 +663,7 @@ impl World {
         };
         let custom = profile != Profile::default();
         self.profile = Arc::new(profile);
+        self.memory.set_budget_bytes(mb_to_bytes(self.profile.memory.budget_mb));
         if let Some(d) = o.diagnostics.clone() {
             self.diag = d;
         }
@@ -853,6 +862,7 @@ impl World {
         self.terrain = Terrain::flat();
         self.seed = None;
         self.seed_cache = None;
+        self.memory.clear();
         self.local = LocalSpace::default();
         self.origin_lat = 0.0;
         self.origin_lon = 0.0;
@@ -1112,7 +1122,18 @@ impl World {
             terrain_loaded: tst.loaded,
             terrain_tris: tst.tris,
             jobs: self.worker.as_ref().map(|w| w.job_stats()).unwrap_or_default(),
+            memory: self.memory.stats(),
         }
+    }
+
+    /// The memory budget (Terrain v2 section 6): pool owners register their items with a byte
+    /// size and priority, pin them while a job depends on them, and drain what was evicted.
+    pub fn memory(&self) -> &MemoryBudget {
+        &self.memory
+    }
+
+    pub fn memory_mut(&mut self) -> &mut MemoryBudget {
+        &mut self.memory
     }
 
     fn clamp_detail(&self, scale: f64) -> f64 {

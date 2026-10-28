@@ -24,6 +24,7 @@ use godot::classes::mesh::ArrayType;
 use godot::classes::INode;
 use godot::prelude::*;
 
+use simworld_core::budget::{Pool, MIB};
 use simworld_core::latency::{Latency, STAGES};
 use simworld_core::mesher::MeshData;
 use simworld_core::rings::{LayerKey, LayerKind, MAX_RINGS, RING_COUNT};
@@ -442,6 +443,17 @@ impl WorldStreamer {
         d.set("jobs_queued", st.jobs.queued as i64);
         d.set("jobs_running", st.jobs.running as i64);
         d.set("jobs_cancelled", st.jobs.cancelled.min(i64::MAX as u64) as i64);
+        // Memory budget of the core's CPU-side pools (Terrain v2 step M1), MiB.
+        let mem = &st.memory;
+        let mut m = VarDictionary::new();
+        for p in Pool::ALL {
+            m.set(p.name(), mem.pool(p).bytes as f64 / MIB);
+        }
+        m.set("free_buffers", mem.free_buffer_bytes() as f64 / MIB);
+        m.set("total", mem.total_bytes as f64 / MIB);
+        m.set("budget", mem.budget_bytes as f64 / MIB);
+        m.set("over_budget", mem.over_budget_bytes as f64 / MIB);
+        d.set("memory_mb", &m);
         if let Some(l) = self.world.latency() {
             d.set("latency", &latency_dict(l));
         }

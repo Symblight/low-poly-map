@@ -24,6 +24,7 @@ pub mod budget;
 pub mod data;
 pub mod diag;
 pub mod fetch;
+pub mod gen_cache;
 pub mod geo;
 pub mod jobs;
 pub mod ground;
@@ -57,6 +58,8 @@ mod height_golden_tests;
 mod integration_tests;
 #[cfg(test)]
 mod lifecycle_tests;
+#[cfg(test)]
+mod perf_tests;
 
 pub use diag::{Diagnostics, Log, NullLog};
 pub use profile::{Profile, WorldProfile, PROFILE_VERSION};

@@ -1,10 +1,11 @@
 //! The terrain layer's split plan (Terrain v2 G2): SSE splits under the tile budget
 //! `terrain.max_tiles` (review M1), then the 2:1 balance. Pure in camera, view, scale, profile
-//! and the hysteresis state.
+//! and the hysteresis state; reused across frames while provably unchanged (`plan_memo`).
 
+use super::plan_memo::PlanInputs;
 use super::Scheduler;
 use crate::geo::TileKey;
-use crate::rings::{children, ViewPoint, MAX_RINGS};
+use crate::rings::{above_horizon, children, horizon_line_m, ViewPoint, MAX_RINGS};
 
 /// A terrain split candidate of the plan (`plan_terrain_splits`): max-heap order = guard splits
 /// first, then the largest `refine / distance`, then the key (deterministic).
@@ -57,7 +58,29 @@ impl Scheduler {
     ///    differ by at most one zoom, as with the 1.7 distance bands: the skirts (sized for the
     ///    next coarser band, contract 9a) close every seam. Neighbours whose root is outside the
     ///    cover are skipped.
+    ///
+    /// A frame whose inputs provably give the last plan again reuses it (`plan_memo`).
     pub(super) fn plan_terrain_splits(&mut self, views: &[ViewPoint; MAX_RINGS], grounds: &[f64; MAX_RINGS]) {
+        let inputs = PlanInputs { roots: self.stack.iter().map(|s| s.0).collect(), sse_m_per_m: self.sse_m_per_m, guard_m: self.guard_m };
+        let entries = &self.entries;
+        let split = |k: TileKey| entries.get(&k).is_some_and(|e| e.split);
+        if self.plan_memo.still_valid(&inputs, views, grounds, self.layer.hysteresis, split) {
+            self.plan_memo.reused += 1;
+            (self.balance_forced, self.budget_skipped) = self.plan_memo.counters;
+            #[cfg(test)]
+            if self.verify_plan_reuse {
+                let kept = self.t_split.clone();
+                self.plan_fresh(inputs, views, grounds);
+                assert_eq!(kept, self.t_split, "a reused terrain plan differs from a fresh one");
+            }
+            return;
+        }
+        self.plan_fresh(inputs, views, grounds);
+    }
+
+    /// [`Scheduler::plan_terrain_splits`] from scratch, recording the plan's slack.
+    fn plan_fresh(&mut self, inputs: PlanInputs, views: &[ViewPoint; MAX_RINGS], grounds: &[f64; MAX_RINGS]) {
+        self.plan_memo.begin(inputs, views, grounds);
         let l = self.layer;
         let mut split = std::mem::take(&mut self.t_split);
         let mut roots = std::mem::take(&mut self.t_roots);
@@ -126,6 +149,10 @@ impl Scheduler {
         }
         self.balance_forced = split.len() - planned;
         self.budget_skipped = skipped;
+        // Without the budget binding the plan is the unordered set (no decision but the
+        // recorded ones changes it): reusable.
+        let reusable = budget == 0 || (limit == budget && roots.len() + 3 * planned <= budget);
+        self.plan_memo.finish(reusable, (self.balance_forced, skipped));
         self.t_split = split;
         self.t_roots = roots;
         self.t_work = work;
@@ -133,7 +160,8 @@ impl Scheduler {
     }
 
     /// Terrain layer: `k` as a split candidate of the plan (`None` = it does not want to split:
-    /// ring 0, no child above the horizon, or outside its refine distance).
+    /// ring 0, outside its refine distance, or no child above the horizon). Records the slack
+    /// of each decision in the plan memo.
     fn split_candidate(&mut self, k: TileKey, views: &[ViewPoint; MAX_RINGS], grounds: &[f64; MAX_RINGS]) -> Option<SplitCandidate> {
         let l = self.layer;
         let ring = l.ring_for_zoom(k.z)?;
@@ -141,28 +169,40 @@ impl Scheduler {
             return None;
         }
         let current = self.entries.get(&k).is_some_and(|e| e.split);
-        let group_visible = l.horizon_margin_m.is_none() || {
+        let g = self.terrain_box_of(k);
+        let d = views[ring - 1].slant_box_m(k, g[0], g[1]);
+        let refine = self.terrain_refine_m(k, ring);
+        self.plan_memo.distance(ring - 1, k, d, refine, l.hysteresis, current);
+        if !l.inside(d, refine, current) {
+            return None;
+        }
+        if let Some(margin) = l.horizon_margin_m {
+            // Whole sibling groups: split while one of the 4 children is above the horizon.
+            let (view, ground) = (&views[ring - 1], grounds[ring - 1]);
             let mut any = false;
             for c in children(k) {
-                let g = self.terrain_box_of(c);
-                if self.horizon_ok(&views[ring - 1], grounds[ring - 1], c, g, current) {
+                let cg = self.terrain_box_of(c);
+                let hi = cg[1] + l.default_tile_height_m;
+                let line = horizon_line_m(view.alt, ground, cg[0], hi, margin);
+                let h = view.horizontal_m(c);
+                let h_ref = ground.min(cg[0]);
+                self.plan_memo.horizon(ring - 1, k, h, line, l.hysteresis, current, (view.alt - h_ref).max(0.0), (hi - h_ref).max(0.0));
+                if above_horizon(h, line, l.hysteresis, current) {
                     any = true;
                     break;
                 }
             }
-            any
-        };
-        if !group_visible {
-            return None;
-        }
-        let g = self.terrain_box_of(k);
-        let d = views[ring - 1].slant_box_m(k, g[0], g[1]);
-        let refine = self.terrain_refine_m(k, ring);
-        if !l.inside(d, refine, current) {
-            return None;
+            if !any {
+                return None;
+            }
         }
         let guarded = l.inside(d, self.guard_m[ring], current);
         Some(SplitCandidate { prio: refine / d.max(1e-3), guarded, key: k })
+    }
+
+    /// Terrain layer: plans reused and plans computed since the scheduler started.
+    pub fn plan_reuse(&self) -> (u64, u64) {
+        (self.plan_memo.reused, self.plan_memo.planned)
     }
 
     /// Terrain layer: SSE splits left out of the last plan by `terrain.max_tiles`.

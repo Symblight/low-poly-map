@@ -308,7 +308,7 @@ impl Harness {
         self.fades.iter().rev().find(|f| f.0 == k).map(|f| f.1)
     }
 
-    fn frame(&mut self, cam: [f64; 3], vel: [f64; 3]) -> (Vec<TileKey>, Vec<TileKey>) {
+    pub(super) fn frame(&mut self, cam: [f64; 3], vel: [f64; 3]) -> (Vec<TileKey>, Vec<TileKey>) {
         self.now += Duration::from_secs_f64(DT);
         self.prev_fades = self.g.fades.clone();
         self.prev_active = self.s.fades().flat_map(|(k, _)| std::iter::once(k).chain(children(k))).collect();
@@ -415,7 +415,7 @@ impl Harness {
     }
 
     /// Contract checks that must hold on every frame.
-    fn check_frame(&mut self, un: &[TileKey], ctx: &str) {
+    pub(super) fn check_frame(&mut self, un: &[TileKey], ctx: &str) {
         let errs = self.g.check();
         assert!(errs.is_empty(), "{ctx}: {:?}", &errs[..errs.len().min(5)]);
         // (1) Sibling groups: every tracked non-root tile has its 3 siblings tracked.
@@ -1816,7 +1816,7 @@ fn horizon_cull_roots_groups_and_hysteresis() {
     let (r_on, r_off) = (roots(&on), roots(&off));
     assert!(r_on.len() < r_off.len() && r_on.is_subset(&r_off), "cull {} vs no cull {}", r_on.len(), r_off.len());
     let check_above = |h: &Harness, cam: [f64; 3]| {
-        let (views, ground) = h.s.views_ground(cam, [0.0; 3]);
+        let (views, ground, _) = h.s.views_ground(cam, [0.0; 3]);
         let top = h.l.rings() - 1;
         for e in h.s.entries().filter(|e| e.key.z == h.l.root_zoom) {
             assert!(h.s.horizon_ok(&views[top], ground[top], e.key, e.terrain_box, true), "{} below the horizon", e.key);
@@ -1850,7 +1850,7 @@ fn horizon_cull_roots_groups_and_hysteresis() {
     let mut on = terrain_harness(p_low, t.clone());
     let cam = [0.0, 0.0, 20.0];
     on.settle(cam, 20_000);
-    let (views, ground) = on.s.views_ground(cam, [0.0; 3]);
+    let (views, ground, _) = on.s.views_ground(cam, [0.0; 3]);
     let mut mixed = 0usize;
     for e in on.s.entries().filter(|e| e.split) {
         let kids = children(e.key);
@@ -2159,7 +2159,7 @@ fn terrain_cover_counts() {
 
 // ---- Terrain SSE cover (Terrain v2 G2) ------------------------------------------------------
 
-fn seed_terrain_harness(lat: f64, lon: f64, f: impl FnOnce(&mut crate::profile::WorldProfile)) -> Harness {
+pub(super) fn seed_terrain_harness(lat: f64, lon: f64, f: impl FnOnce(&mut crate::profile::WorldProfile)) -> Harness {
     let (p, t, _) = crate::seed::world::test_world();
     let mut w = p.world().clone();
     f(&mut w);

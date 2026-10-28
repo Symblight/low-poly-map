@@ -60,6 +60,8 @@ mod integration_tests;
 mod lifecycle_tests;
 #[cfg(test)]
 mod perf_tests;
+#[cfg(test)]
+mod perf_stream_tests;
 
 pub use diag::{Diagnostics, Log, NullLog};
 pub use profile::{Profile, WorldProfile, PROFILE_VERSION};

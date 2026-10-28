@@ -19,7 +19,7 @@ use crossbeam_channel::{Receiver, Sender};
 use tokio::task::AbortHandle;
 
 use crate::data::{build_chunk_with, build_landmark_tile, decode_level, synthetic_data_tile, DataLevel, DataLevels, DataTile};
-use crate::jobs::{default_threads, JobEnd, JobPool, JobSpec, JobStats, Output, PoolConfig, Priority};
+use crate::jobs::{worker_threads, JobEnd, JobPool, JobSpec, JobStats, Output, PoolConfig, Priority};
 use crate::rings::LayerKind;
 use crate::fetch::{DiskCache, FetchError, FetchErrorKind, FetchParams, Fetcher, Note, Source};
 use crate::geo::{Frame, TileKey};
@@ -28,12 +28,13 @@ use crate::mesher::{mesh_tile, MeshData};
 use crate::ground::mesh_ground;
 use crate::mvt::{decode_tile_on, Building, DecodedTile, GroundFeatures, TileProjector};
 use crate::seed::SeedWorld;
-use crate::terrain::tin::{build_terrain_tile_colored, TerrainTile};
+use crate::terrain::tin::{build_terrain_tile_until, TerrainTile};
 use crate::terrain::Terrain;
 use crate::profile::Profile;
 use crate::synthetic;
 
 mod levels_probe;
+mod probe;
 mod release;
 
 /// Decoded tile, ready for conversion on the main thread. Only flat arrays cross the channel:
@@ -46,18 +47,19 @@ pub struct TileData {
     /// R2/R3: light points (single and clustered), Godot axes relative to the tile origin
     /// (tile center). Empty for R0/R1, which get windows instead.
     pub lights: Arc<LightSet>,
-    /// Merged building mesh (tile-root relative), clipped to the tile. Empty for R3.
-    pub mesh: MeshData,
+    /// Merged building mesh (tile-root relative), clipped to the tile. Empty for R3. Shared with
+    /// the recent-tile cache (`scheduler::recent`).
+    pub mesh: Arc<MeshData>,
     /// Merged ground mesh (areas + road strips, tile-root relative, no UV), clipped to the
     /// tile. Empty for tiles without ground features (every band has ground since api 1.3).
-    pub ground: MeshData,
+    pub ground: Arc<MeshData>,
     /// Highest roof top (m above ground) of any building decoded in the tile, including
     /// buffer copies owned by neighbours; 0 for an empty tile. Height of the slant-distance box.
     pub max_height: f32,
     /// Worker-side CPU time (decode + mesh + lights), microseconds.
     pub cpu_us: u64,
     /// Terrain layer only (api 1.5): the terrain mesh of the tile (`None` for vector tiles).
-    pub terrain: Option<Box<TerrainTile>>,
+    pub terrain: Option<Arc<TerrainTile>>,
 }
 
 impl TileData {
@@ -506,8 +508,8 @@ fn finish_tile(
     Some(TileData {
         building_count,
         lights: Arc::new(lights),
-        mesh,
-        ground,
+        mesh: Arc::new(mesh),
+        ground: Arc::new(ground),
         max_height,
         cpu_us: t0.elapsed().as_micros() as u64,
         terrain: None,
@@ -525,6 +527,21 @@ pub fn build_terrain_data(
     detail: f64,
     seed: Option<&SeedWorld>,
 ) -> Result<TileData, String> {
+    build_terrain_data_until(key, ring, frame, terrain, profile, detail, seed, &|| false).map(|d| d.expect("never stopped"))
+}
+
+/// [`build_terrain_data`] that stops at the TIN build's safe points when `stop()` (`Ok(None)`).
+#[allow(clippy::too_many_arguments)]
+pub fn build_terrain_data_until(
+    key: TileKey,
+    ring: usize,
+    frame: Frame,
+    terrain: &Terrain,
+    profile: &Profile,
+    detail: f64,
+    seed: Option<&SeedWorld>,
+    stop: &dyn Fn() -> bool,
+) -> Result<Option<TileData>, String> {
     let t0 = std::time::Instant::now();
     // A seed world's terrain carries COLOR: r = ground class / 8, g = tint / 8 (api 1.7).
     let color = seed.map(|s| {
@@ -533,8 +550,9 @@ pub fn build_terrain_data(
             [class as f32 / 8.0, tint as f32 / 8.0, 0.0, 1.0]
         }
     });
-    let tile = build_terrain_tile_colored(key, ring, frame, terrain, profile, detail, color.as_ref().map(|c| c as &dyn Fn(f64, f64) -> [f32; 4]))?;
-    Ok(TileData { terrain: Some(Box::new(tile)), cpu_us: t0.elapsed().as_micros() as u64, ..TileData::default() })
+    let color = color.as_ref().map(|c| c as &dyn Fn(f64, f64) -> [f32; 4]);
+    let Some(tile) = build_terrain_tile_until(key, ring, frame, terrain, profile, detail, color, stop)? else { return Ok(None) };
+    Ok(Some(TileData { terrain: Some(Arc::new(tile)), cpu_us: t0.elapsed().as_micros() as u64, ..TileData::default() }))
 }
 
 fn panic_text(p: Box<dyn std::any::Any + Send>) -> String {
@@ -613,9 +631,9 @@ impl Worker {
         reuse: Option<Arc<DiskCache>>,
     ) -> Result<Self, String> {
         let (tx, rx) = crossbeam_channel::unbounded();
-        // Desktop: cores - 2, clamped to 2..=4 (as the rayon pool before). iOS will set a QoS
-        // class per thread through `PoolConfig::on_thread_start` (not built).
-        let pool = JobPool::new(PoolConfig::new(default_threads(), "simplane-cpu"))?;
+        // Profile `streaming.worker_threads` (0 = cores - 2, clamped to 2..=8). iOS will set a
+        // QoS class per thread through `PoolConfig::on_thread_start` (not built).
+        let pool = JobPool::new(PoolConfig::new(worker_threads(profile.streaming.worker_threads), "simplane-cpu"))?;
         let cache_cap = FetchParams::from_profile(&profile).cache_cap_bytes;
         let cache_bytes = reuse.as_ref().map_or_else(|| Arc::new(AtomicU64::new(0)), |c| c.bytes_counter());
         let (rt, fetcher) = if url.is_empty() {
@@ -979,18 +997,18 @@ impl Worker {
                 self.pool.submit(
                     spec,
                     move |ctx| {
-                        // The TIN build has no inner safe points yet (terrain::tin): checked
-                        // before and after.
-                        if ctx.is_cancelled() {
-                            return JobEnd::Cancelled;
-                        }
+                        // The TIN build stops at its safe points (`build_terrain_tile_until`).
+                        let stop = || ctx.is_cancelled();
                         let result = catch_unwind(AssertUnwindSafe(|| {
-                            build_terrain_data(key, ring, frame, &terrain, &profile, detail, seed.as_deref())
+                            build_terrain_data_until(key, ring, frame, &terrain, &profile, detail, seed.as_deref(), &stop)
                         }))
                         .unwrap_or_else(|p| Err(format!("terrain panic: {}", panic_text(p))));
-                        if result.is_ok() && ctx.is_cancelled() {
-                            return JobEnd::Cancelled;
-                        }
+                        let result = match result {
+                            Ok(None) => return JobEnd::Cancelled,
+                            Ok(Some(_)) if ctx.is_cancelled() => return JobEnd::Cancelled,
+                            Ok(Some(d)) => Ok(d),
+                            Err(e) => Err(e),
+                        };
                         let failed = result.is_err();
                         let _ = tx.send(WorkerMsg::TerrainBuilt { key, ring, job, result });
                         if failed {

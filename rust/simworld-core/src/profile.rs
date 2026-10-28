@@ -486,6 +486,10 @@ pub struct Streaming {
     pub max_mesh_per_band: u32,
     /// Light-mode re-deliveries per frame.
     pub redeliveries_per_frame: u32,
+    /// Worker threads of the CPU job pool (decode, mesh, terrain); 0 = automatic: cores - 2,
+    /// at least 2, at most 8 (perf review 2; was fixed at cores - 2 clamped to 2..=4). A mobile
+    /// host sets its own count. Read at configure.
+    pub worker_threads: u32,
     /// Retry backoff after a failed fetch/decode: base (s), doubled per attempt ...
     pub retry_base_s: f64,
     /// ... up to this (s).
@@ -534,6 +538,12 @@ pub struct Memory {
     /// A decoded data tile no tile of the cover maps to is dropped after this long (s; review
     /// M3). 0 = at once. The budget still evicts by priority on top.
     pub data_idle_s: f64,
+    /// Recently delivered tiles kept in memory so a key that comes back (a coarsening parent
+    /// after the camera passed) is delivered without a rebuild (MiB per layer, 0 = off; perf
+    /// review 2 item 6, `scheduler::recent`). Separate from `budget_mb`.
+    pub recent_tiles_mb: f64,
+    /// How long a kept tile stays after it left the host (s).
+    pub recent_tiles_s: f64,
 }
 
 /// Procedural terrain (profile_version 5). Heights come from a seeded function
@@ -623,6 +633,11 @@ pub struct TerrainBand {
     pub max_edge_m: f64,
     /// Hard triangle cap per tile.
     pub max_triangles: u32,
+    /// Cells per tile side of the height patch the TIN is built from (a power of two, 16..512);
+    /// 0 = by zoom (z14 64, z13 128, coarser 256: about 22 m at z12..z14). Since perf review 2
+    /// the coarse bands default to 128 (z12 44 m, z11 88 m, z10 176 m at 55 N): a quarter of the
+    /// height evaluations, the drawn surface still within the vector drape lift above it there.
+    pub patch_cells: u32,
 }
 
 /// World seed (profile_version 6, `docs/spec-world-seed.md` section 9.2). Only the keys phase S1
@@ -828,7 +843,7 @@ pub enum TerrainShading {
 
 impl Default for TerrainBand {
     fn default() -> Self {
-        Self { edge_m: 2500.0, max_error_m: 0.5, max_edge_m: 0.0, max_triangles: 4096 }
+        Self { edge_m: 2500.0, max_error_m: 0.5, max_edge_m: 0.0, max_triangles: 4096, patch_cells: 0 }
     }
 }
 
@@ -1235,7 +1250,14 @@ impl Default for LanduseFallback {
 
 impl Default for Streaming {
     fn default() -> Self {
-        Self { max_fetch_per_band: 4, max_mesh_per_band: 8, redeliveries_per_frame: 1, retry_base_s: 0.5, retry_max_s: 30.0 }
+        Self {
+            max_fetch_per_band: 4,
+            max_mesh_per_band: 8,
+            redeliveries_per_frame: 1,
+            worker_threads: 0,
+            retry_base_s: 0.5,
+            retry_max_s: 30.0,
+        }
     }
 }
 
@@ -1259,13 +1281,13 @@ impl Default for Cache {
 
 impl Default for Memory {
     fn default() -> Self {
-        Self { budget_mb: 512.0, data_idle_s: 20.0 }
+        Self { budget_mb: 512.0, data_idle_s: 20.0, recent_tiles_mb: 32.0, recent_tiles_s: 15.0 }
     }
 }
 
 impl Default for TerrainProfile {
     fn default() -> Self {
-        let band = |edge_m, max_error_m, max_edge_m, max_triangles| TerrainBand { edge_m, max_error_m, max_edge_m, max_triangles };
+        let band = |edge_m, max_error_m, max_edge_m, max_triangles, patch_cells| TerrainBand { edge_m, max_error_m, max_edge_m, max_triangles, patch_cells };
         Self {
             enabled: false,
             seed: 1,
@@ -1295,11 +1317,11 @@ impl Default for TerrainProfile {
             far_zoom: 10,
             // docs/spec-terrain.md 5.2: T0 z14 .. T4 z10.
             bands: vec![
-                band(2500.0, 0.5, 0.0, 4096),
-                band(7000.0, 1.5, 0.0, 4096),
-                band(25_000.0, 4.0, 2000.0, 8192),
-                band(60_000.0, 10.0, 3000.0, 8192),
-                band(130_000.0, 25.0, 5000.0, 8192),
+                band(2500.0, 0.5, 0.0, 4096, 0),
+                band(7000.0, 1.5, 0.0, 4096, 0),
+                band(25_000.0, 4.0, 2000.0, 8192, 128),
+                band(60_000.0, 10.0, 3000.0, 8192, 128),
+                band(130_000.0, 25.0, 5000.0, 8192, 128),
             ],
         }
     }
@@ -1379,6 +1401,7 @@ pub const RANGES: &[(&str, f64, f64)] = &[
     ("streaming.max_fetch_per_band", 1.0, 64.0),
     ("streaming.max_mesh_per_band", 1.0, 64.0),
     ("streaming.redeliveries_per_frame", 1.0, 64.0),
+    ("streaming.worker_threads", 0.0, 64.0),
     ("streaming.retry_base_s", 0.05, 60.0),
     ("streaming.retry_max_s", 0.05, 3600.0),
     ("fades.cap_s", 0.1, 60.0),
@@ -1391,6 +1414,8 @@ pub const RANGES: &[(&str, f64, f64)] = &[
     ("cache.validate_retry_s", 1.0, 86_400.0),
     ("memory.budget_mb", 32.0, 65_536.0),
     ("memory.data_idle_s", 0.0, 3600.0),
+    ("memory.recent_tiles_mb", 0.0, 65_536.0),
+    ("memory.recent_tiles_s", 0.0, 600.0),
     ("terrain.seed", 0.0, 4_294_967_295.0),
     ("terrain.amplitude_m", 0.0, 3000.0),
     ("terrain.feature_size_m", 200.0, 200_000.0),
@@ -1418,6 +1443,7 @@ pub const RANGES: &[(&str, f64, f64)] = &[
     ("terrain.bands[].max_error_m", 0.05, 200.0),
     ("terrain.bands[].max_edge_m", 0.0, 50_000.0),
     ("terrain.bands[].max_triangles", 2.0, 65_000.0),
+    ("terrain.bands[].patch_cells", 0.0, 512.0),
     ("seed.aeroway_class", 6.0, 7.0),
     ("seed.water.blend_m", 50.0, 5000.0),
     ("seed.water.raster_n", 8.0, 256.0),
@@ -1718,6 +1744,9 @@ impl Profile {
                     i - 1,
                     fmt_num(t.bands[i - 1].edge_m)
                 ));
+            }
+            if tb.patch_cells != 0 && (tb.patch_cells < 16 || !tb.patch_cells.is_power_of_two()) {
+                errs.push(format!("terrain.bands[{i}].patch_cells = {} must be 0 (by zoom) or a power of two from 16 to 512", tb.patch_cells));
             }
             if tb.max_edge_m != 0.0 && tb.max_edge_m < 500.0 {
                 errs.push(format!(

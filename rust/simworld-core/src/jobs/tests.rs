@@ -47,8 +47,10 @@ fn record(p: &JobPool, spec: JobSpec, tx: &crossbeam_channel::Sender<(JobId, &'s
 fn pool_size_is_the_configured_thread_count() {
     assert_eq!(pool(3).threads(), 3);
     assert_eq!(JobPool::new(PoolConfig::new(0, "z")).unwrap().threads(), 1);
-    let d = default_threads();
-    assert!((2..=4).contains(&d), "cores - 2 clamped to 2..=4: {d}");
+    let d = worker_threads(0);
+    assert!((2..=AUTO_THREADS_MAX).contains(&d), "cores - 2 clamped to 2..=8: {d}");
+    assert_eq!([1, 4, 6, 10, 12, 64].map(auto_threads), [2, 2, 4, 8, 8, 8]);
+    assert_eq!(worker_threads(3), 3);
     // The thread start hook runs once per thread.
     let n = Arc::new(AtomicU64::new(0));
     let n2 = n.clone();

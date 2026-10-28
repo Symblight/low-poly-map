@@ -81,6 +81,7 @@ impl Scheduler {
     /// [`Scheduler::plan_terrain_splits`] from scratch, recording the plan's slack.
     fn plan_fresh(&mut self, inputs: PlanInputs, views: &[ViewPoint; MAX_RINGS], grounds: &[f64; MAX_RINGS]) {
         self.plan_memo.begin(inputs, views, grounds);
+        self.plan_incomplete = false;
         let l = self.layer;
         let mut split = std::mem::take(&mut self.t_split);
         let mut roots = std::mem::take(&mut self.t_roots);
@@ -151,7 +152,8 @@ impl Scheduler {
         self.budget_skipped = skipped;
         // Without the budget binding the plan is the unordered set (no decision but the
         // recorded ones changes it): reusable.
-        let reusable = budget == 0 || (limit == budget && roots.len() + 3 * planned <= budget);
+        // A plan that met a value still on the way (async boxes) is recomputed next frame.
+        let reusable = !self.plan_incomplete && (budget == 0 || (limit == budget && roots.len() + 3 * planned <= budget));
         self.plan_memo.finish(reusable, (self.balance_forced, skipped));
         self.t_split = split;
         self.t_roots = roots;
@@ -169,9 +171,18 @@ impl Scheduler {
             return None;
         }
         let current = self.entries.get(&k).is_some_and(|e| e.split);
-        let g = self.terrain_box_of(k);
+        // Async boxes: a value on the way holds a new split back (a split node has its values:
+        // its box and its children's in their entries; its proxy is recomputed if evicted).
+        let Some(g) = self.box_known(k) else { return self.plan_waits() };
         let d = views[ring - 1].slant_box_m(k, g[0], g[1]);
-        let refine = self.terrain_refine_m(k, ring);
+        let refine = match self.error_known(k) {
+            Some(e) => (e * self.sse_m_per_m).max(self.guard_m[ring]),
+            None if current => self.terrain_refine_m(k, ring),
+            None => return self.plan_waits(),
+        };
+        if !current && !self.children_boxes_known(k, self.near_split(d, refine)) && l.inside(d, refine, current) {
+            return self.plan_waits();
+        }
         self.plan_memo.distance(ring - 1, k, d, refine, l.hysteresis, current);
         if !l.inside(d, refine, current) {
             return None;
@@ -181,7 +192,7 @@ impl Scheduler {
             let (view, ground) = (&views[ring - 1], grounds[ring - 1]);
             let mut any = false;
             for c in children(k) {
-                let cg = self.terrain_box_of(c);
+                let Some(cg) = self.box_known(c) else { return self.plan_waits() };
                 let hi = cg[1] + l.default_tile_height_m;
                 let line = horizon_line_m(view.alt, ground, cg[0], hi, margin);
                 let h = view.horizontal_m(c);
@@ -198,6 +209,12 @@ impl Scheduler {
         }
         let guarded = l.inside(d, self.guard_m[ring], current);
         Some(SplitCandidate { prio: refine / d.max(1e-3), guarded, key: k })
+    }
+
+    /// A plan decision waits for a probe (async boxes): no split now, plan not reusable.
+    fn plan_waits(&mut self) -> Option<SplitCandidate> {
+        self.plan_incomplete = true;
+        None
     }
 
     /// Terrain layer: plans reused and plans computed since the scheduler started.

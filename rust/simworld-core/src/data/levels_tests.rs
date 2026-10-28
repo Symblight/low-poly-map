@@ -246,3 +246,25 @@ fn synthetic_r0_r1_chunks_match_the_per_tile_path() {
         assert!((ga / gb - 1.0).abs() < 0.03, "{k}: ground {ga:.0} vs {gb:.0} m²");
     }
 }
+
+/// Overview block bases with the terrain on (perf review 2 item 7): the decode leaves them open
+/// and the R2 chunk resolves them. The fixture's R2 chunk on a hilly relief (no flat zone) keeps
+/// the bits of the eager decode: the hashes below were printed by the code before the change.
+#[test]
+fn overview_block_bases_on_terrain_match_the_eager_decode() {
+    let mut w = crate::profile::WorldProfile::default();
+    w.terrain.enabled = true;
+    w.terrain.flat_radius_m = 0.0;
+    w.terrain.flat_blend_m = 0.0;
+    let prof = crate::profile::Profile::new(w).unwrap();
+    let t = Terrain::from_profile(&prof, VILNIUS.0, VILNIUS.1);
+    let dt = decode_overview_tile(key11(), frame(), &t, &overview_bytes(), &prof).unwrap();
+    let d = build_chunk_with(&dt, Some(&dt), key14(), 2, &prof, &never).unwrap().expect("not stopped");
+    let got = (crate::data_world_tests::mesh_hash(&d.mesh), crate::data_world_tests::mesh_hash(&d.ground), d.max_height.to_bits());
+    eprintln!("OVERVIEW TERRAIN CHUNK {got:x?}");
+    assert!(dt.buildings.iter().any(|b| b.polygons.len() == 1), "the fixture has blocks");
+    assert_eq!(got, PINNED_EAGER);
+}
+
+/// Printed by the eager decode (commit ed04907) for the test above.
+const PINNED_EAGER: (u64, u64, u32) = (0xd4c60ca7838c76e1, 0xe231304024d6b071, 0x42be0000);

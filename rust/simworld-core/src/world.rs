@@ -45,6 +45,7 @@ use crate::status::{Health, Status, StatusState, MSG_NOT_CONFIGURED, MSG_SHUT_DO
 use crate::worker::{Job, Worker, WorkerMsg};
 
 pub mod lod;
+mod poll_profile;
 
 /// Bounded wait of `shutdown` and of a re-configure that replaces a worker using a disk cache
 /// (until the old cache thread has flushed and closed its file).
@@ -296,6 +297,10 @@ pub struct WorldStats {
     /// Shared CPU job pool (both layers): jobs queued (ready or waiting on dependencies),
     /// running, and cancelled since the world was configured. Zero when not running.
     pub jobs: JobStats,
+    /// Tile-box probes requested and not answered yet, both layers (`scheduler::boxes`).
+    pub probes_pending: usize,
+    /// Recent-tile cache of both layers (`scheduler::recent`): hits, entries, bytes.
+    pub recent: crate::scheduler::RecentStats,
     /// The memory budget of the core's CPU-side pools (`World::memory`).
     pub memory: MemoryStats,
     /// Tiles v2 data tiles (vector layer, archive sources): decoded tiles resident now, and
@@ -372,6 +377,8 @@ pub struct World {
     reported: (StatusState, String),
     /// Last streaming latency report in the profile log (every [`LATENCY_LOG_EVERY`]).
     latency_logged: Instant,
+    /// `diagnostics.profile`: per-tile host conversion time of `poll_ready`.
+    poll_profile: poll_profile::PollProfile,
     /// Terrain of the current configuration (flat unless the host requested the layer and the
     /// profile enables it). `ground_height_at`, geodetic AGL, the cover and every job use it.
     terrain: Terrain,
@@ -425,6 +432,7 @@ impl World {
             health: Health::idle(MSG_NOT_CONFIGURED),
             reported: (StatusState::Ok, MSG_NOT_CONFIGURED.to_string()),
             latency_logged: Instant::now(),
+            poll_profile: Default::default(),
             seed: None,
             seed_cache: None,
             memory: MemoryBudget::new(mb_to_bytes(crate::profile::Memory::default().budget_mb)),
@@ -579,16 +587,28 @@ impl World {
         let mut ids = std::mem::take(&mut self.cancel_buf);
         if let Some(s) = &mut self.scheduler {
             w.release(s.take_released_data()); // decoded data tiles are freed off the main thread
+            w.release(s.take_released_tiles());
             s.drain_cancelled(&mut ids);
             w.cancel(LayerKind::World, &ids);
             ids.clear();
         }
         if let Some(t) = &mut self.terrain_sched {
+            w.release(t.take_released_tiles());
             t.drain_cancelled(&mut ids);
             w.cancel(LayerKind::Terrain, &ids);
             ids.clear();
         }
         self.cancel_buf = ids;
+    }
+
+    /// Hand both layers' cold tile-box probes to the CPU pool (`scheduler::boxes`).
+    fn submit_probes(&mut self) {
+        let Some(w) = &self.worker else { return };
+        for s in [self.scheduler.as_mut(), self.terrain_sched.as_mut()].into_iter().flatten() {
+            if let Some(b) = s.take_probe_batch() {
+                w.probe(b);
+            }
+        }
     }
 
     /// Hand the new jobs to the worker; CPU jobs queue by [`Scheduler::job_priority`] (fresh
@@ -785,7 +805,8 @@ impl World {
             Ok(mut w) => {
                 w.set_terrain(self.terrain.clone());
                 w.set_seed(self.seed.clone());
-                let mut s = Scheduler::new(frame, w.is_synthetic(), self.profile.clone()).with_terrain(self.terrain.clone());
+                let mut s =
+                    Scheduler::new(frame, w.is_synthetic(), self.profile.clone()).with_terrain(self.terrain.clone()).with_async_boxes();
                 s.set_lod_view(&self.lod_view, self.cover_quality());
                 // Tiles v2: chunks are cut from data tiles. An archive's levels are known once it
                 // opened (`WorkerMsg::Levels`: two-level, or the compatibility levels of an archive
@@ -804,7 +825,7 @@ impl World {
                 self.scheduler = Some(s);
                 if self.terrain.is_active() {
                     self.terrain_detail = self.clamp_detail(self.terrain_detail);
-                    let mut t = Scheduler::new_terrain(frame, self.profile.clone(), self.terrain.clone());
+                    let mut t = Scheduler::new_terrain(frame, self.profile.clone(), self.terrain.clone()).with_async_boxes();
                     t.set_detail(self.terrain_detail);
                     t.set_lod_view(&self.lod_view, self.cover_quality());
                     self.terrain_sched = Some(t);
@@ -1061,6 +1082,7 @@ impl World {
         self.cancel_orphans();
         self.order_jobs();
         self.submit_jobs();
+        self.submit_probes();
         if profile {
             let us = |a: Instant, b: Instant| b.duration_since(a).as_micros();
             let end = Instant::now();
@@ -1078,6 +1100,9 @@ impl World {
                 self.latency_logged = end;
                 if let Some(l) = self.latency() {
                     self.log.info(&format!("WorldStreamer profile: {}", l.report()));
+                }
+                if let Some(p) = self.poll_profile.take_summary() {
+                    self.log.info(&format!("WorldStreamer profile: {p}"));
                 }
                 if let Some(t) = &self.terrain_sched {
                     self.log.info(&format!("WorldStreamer profile: {}", t.cpu_stats().report("terrain", t.layer().rings())));
@@ -1125,9 +1150,14 @@ impl World {
             if t.redelivery {
                 self.redelivered_this_frame += 1;
             }
-            tris += t.mesh.triangle_count() + t.ground.triangle_count() + t.terrain.as_ref().map_or(0, |x| x.triangle_count());
+            let tile_tris = t.mesh.triangle_count() + t.ground.triangle_count() + t.terrain.as_ref().map_or(0, |x| x.triangle_count());
+            tris += tile_tris;
+            let cpu0 = if self.diag.profile { thread_cpu_us() } else { 0 };
             f(view_of(&t, local));
-            // The tile's flat buffers (a handful of Vecs) are freed here; cheap.
+            drop(t); // shared with the recent-tile cache: usually a reference count
+            if self.diag.profile {
+                self.poll_profile.record(thread_cpu_us().saturating_sub(cpu0), tile_tris);
+            }
         }
         if self.diag.profile {
             let end = Instant::now();
@@ -1229,6 +1259,11 @@ impl World {
             terrain_budget_skipped: self.terrain_sched.as_ref().map_or(0, |t| t.budget_skipped()),
             terrain_tris: tst.tris,
             jobs: self.worker.as_ref().map(|w| w.job_stats()).unwrap_or_default(),
+            probes_pending: [self.scheduler.as_ref(), self.terrain_sched.as_ref()].into_iter().flatten().map(|s| s.probes_pending()).sum(),
+            recent: [self.scheduler.as_ref(), self.terrain_sched.as_ref()].into_iter().flatten().map(|s| s.recent_stats()).fold(
+                crate::scheduler::RecentStats::default(),
+                |a, b| crate::scheduler::RecentStats { hits: a.hits + b.hits, entries: a.entries + b.entries, bytes: a.bytes + b.bytes },
+            ),
             memory: self.memory.stats(),
             data_tiles_loaded: data.loaded,
             data_tiles_decoded: data.decoded,

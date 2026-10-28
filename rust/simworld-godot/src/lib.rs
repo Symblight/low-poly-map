@@ -8,6 +8,8 @@ use godot::prelude::*;
 
 mod convert;
 mod host;
+mod ready;
+mod seed;
 mod streamer;
 
 pub use streamer::WorldStreamer;

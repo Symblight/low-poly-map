@@ -97,12 +97,15 @@
 //! cull (roots and whole sibling groups, with the band hysteresis) and detail re-deliveries
 //! (`set_terrain_detail`: held tiles are re-meshed and handed out again under the same key).
 
+mod boxes;
 mod data;
 mod data_mem;
 mod data_needs;
 mod fade;
 mod landmarks;
 mod plan_memo;
+mod presence;
+mod recent;
 pub mod sim;
 mod state;
 mod terrain_plan;
@@ -114,6 +117,8 @@ mod budget_tests;
 #[cfg(test)]
 mod plan_memo_tests;
 
+pub use boxes::{ProbeBatch, ProbeResult};
+pub use recent::{Kept, RecentStats};
 pub use data::{DataStats, DataStore};
 pub use landmarks::LandmarkStats;
 use landmarks::{LandmarkLayer, LmState};
@@ -132,7 +137,6 @@ use ahash::AHashMap;
 use crate::fetch::FetchErrorKind;
 use crate::geo::{Frame, RectEn, TileKey};
 use crate::latency::{Latency, Stage, TileTimes};
-use crate::mesher::MeshData;
 use crate::profile::Profile;
 use crate::rings::{children, Layer, LayerKind, ViewPoint, MAX_BOX_HEIGHT_M, MAX_RINGS, RING_COUNT};
 use crate::gen_cache::GenCache;
@@ -203,6 +207,14 @@ pub struct Scheduler {
     detail_gen: u32,
     /// Terrain layer (G2): the pure per-key error proxy the cover refines by.
     proxy: Option<ErrorProxy>,
+    /// Recently delivered outputs, served again without a rebuild (`recent`).
+    recent: recent::RecentTiles,
+    /// Reused presence memo (`presence`; valid within one pass only).
+    presence: presence::Presence,
+    /// Async probes of cold boxes / error proxies (`boxes`; `None` = probed inline).
+    box_requests: Option<boxes::BoxRequests>,
+    /// Terrain layer: the last plan met a value still on the way (not reusable).
+    plan_incomplete: bool,
     /// Terrain layer: the host's view (`set_view`) and the refine distance per meter of error,
     /// `H / (2 tan(fov_y / 2) tau_eff)` with tau_eff = `terrain.tau_px` x `detail`.
     terrain_view: crate::rings::LodView,
@@ -313,6 +325,7 @@ impl Scheduler {
             terrain_cache: GenCache::new(TERRAIN_CACHE_CAP),
             layer,
             fade_cap: Duration::from_secs_f64(profile.fades.cap_s),
+            recent: recent::RecentTiles::new(profile.memory.recent_tiles_mb, profile.memory.recent_tiles_s),
             max_fades: profile.fades.max_active as usize,
             fades_elsewhere: 0,
             capped: Vec::new(),
@@ -339,6 +352,9 @@ impl Scheduler {
             detail: 1.0,
             detail_gen: 0,
             proxy: None,
+            box_requests: None,
+            plan_incomplete: false,
+            presence: Default::default(),
             terrain_view: crate::rings::LodView::default(),
             sse_m_per_m: 0.0,
             guard_m: [0.0; MAX_RINGS],
@@ -568,6 +584,8 @@ impl Scheduler {
     pub fn update(&mut self, cam: [f64; 3], vel: [f64; 3], now: Instant, jobs: &mut Vec<Job>) {
         self.epoch += 1;
         self.now = now;
+        self.absorb_probes();
+        self.recent.expire(now);
         let l = self.layer;
         let kind = l.kind;
         let top = l.rings() - 1;
@@ -592,7 +610,8 @@ impl Scheduler {
                 Some(e) => (true, e.height.map_or(default_h, |h| h as f64)),
                 None => (false, default_h),
             };
-            let g = self.terrain_box_of(k);
+            // A cold root candidate waits for its box (async boxes; an entry always has one).
+            let Some(g) = self.box_known(k) else { continue };
             let d = views[top].slant_box_m(k, g[0], g[1] + h);
             if l.inside(d, l.edge_m[top], existing) && self.horizon_ok(&views[top], grounds[top], k, g, existing) {
                 self.stack.push((k, default_h, false));
@@ -601,6 +620,9 @@ impl Scheduler {
         if kind == LayerKind::Terrain {
             self.plan_terrain_splits(&views, &grounds);
         }
+        // No `held` flag changes during the walk: one presence memo for all of it.
+        let mut presence = std::mem::take(&mut self.presence);
+        presence.clear();
         while let Some((k, inherited_h, frozen)) = self.stack.pop() {
             let Some(ring) = l.ring_for_zoom(k.z) else { continue };
             if frozen {
@@ -615,7 +637,7 @@ impl Scheduler {
                 }
                 continue;
             }
-            let present = self.present(k);
+            let present = self.present_in(k, &mut presence);
             let clustered = self.clustered;
             let min_lit_ring = self.profile.lit_min_ring();
             let fading = self.fades.contains_key(&k);
@@ -641,15 +663,20 @@ impl Scheduler {
             let mut cancel: Option<u64> = None;
             let mut retarget: Option<bool> = None;
             // Refine distance: the band edge (vector layer) or the tile's SSE distance (terrain).
+            // (Terrain: NaN = its error proxy is on the way, the entry keeps the last value.)
             let refine_m = match (ring, kind) {
                 (0, _) => 0.0,
                 (_, LayerKind::World | LayerKind::Landmarks) => l.edge_m[ring - 1],
-                (_, LayerKind::Terrain) => self.terrain_refine_m(k, ring),
+                (_, LayerKind::Terrain) => self.error_known(k).map_or(f64::NAN, |e| (e * self.sse_m_per_m).max(self.guard_m[ring])),
             };
             let planned = kind == LayerKind::Terrain && ring > 0 && self.t_split.contains(&k);
+            // Vector layer: a new split waits for its children's boxes (async boxes).
+            let kids_known = kind == LayerKind::Terrain || ring == 0 || self.split_boxes_known(k, &views[ring - 1], inherited_h, refine_m);
             let (split, freeze, h) = {
                 let e = self.touch(k, ring);
-                e.refine_m = refine_m;
+                if !refine_m.is_nan() {
+                    e.refine_m = refine_m;
+                }
                 e.frozen = false;
                 let h = e.height.map_or(inherited_h, |h| h as f64);
                 e.box_h = h;
@@ -658,7 +685,9 @@ impl Scheduler {
                 e.cam_d = cam_view.slant_box_m(k, lo, hi);
                 e.split_d = if ring > 0 { views[ring - 1].slant_box_m(k, lo, hi) } else { 0.0 };
                 let want = match kind {
-                    LayerKind::World | LayerKind::Landmarks => ring > 0 && group_visible && l.inside(e.split_d, refine_m, e.split),
+                    LayerKind::World | LayerKind::Landmarks => {
+                        ring > 0 && group_visible && (e.split || kids_known) && l.inside(e.split_d, refine_m, e.split)
+                    }
                     LayerKind::Terrain => planned,
                 };
                 let mut freeze = false;
@@ -737,17 +766,20 @@ impl Scheduler {
             }
         }
 
+        self.presence = presence;
         // 2. Everything not visited left the cover: subtrees go in one unload batch.
         let epoch = self.epoch;
         let unloading = &mut self.unloading;
         let ready = &mut self.ready;
         let cancelled = &mut self.cancelled;
+        let recent = &mut self.recent;
         self.entries.retain(|_, e| {
             if e.mark == epoch {
                 return true;
             }
             orphan_job(cancelled, e);
             if e.held {
+                recent.left(e.key, now);
                 let mut blank = Entry::blank(e.key, e.ring, e.rect, e.center, default_h);
                 blank.terrain_box = e.terrain_box;
                 let mut u = std::mem::replace(e, blank);
@@ -906,6 +938,9 @@ impl Scheduler {
             .sort_unstable_by(|a, b| a.1.cmp(&b.1).then(a.2.total_cmp(&b.2)).then(a.0.cmp(&b.0)).then(a.3.cmp(&b.3)));
         for i in 0..self.cand.len() {
             let (ring, _, _, key) = self.cand[i];
+            if self.serve_recent(key) {
+                continue;
+            }
             if self.data_key(key).is_some() {
                 self.dispatch_chunk(key, ring, max_decode, jobs);
                 continue;
@@ -1023,7 +1058,14 @@ impl Scheduler {
         let mut cand = Vec::new();
         cam.root_candidates_at(reach * self.layer.hysteresis, levels.overview, max_top, &mut cand);
         for k in cand {
-            let g = self.terrain_box_of(k);
+            let Some(g) = self.box_known(k) else {
+                // Cold box (async): a landmark tile in range stays, a new one waits for it.
+                if self.landmarks.entries.contains_key(&k) {
+                    let frame = self.frame;
+                    self.landmarks.touch(k, &frame, default_h);
+                }
+                continue;
+            };
             let (existing, h) = self.landmarks.entries.get(&k).map_or((false, default_h), |e| (true, e.height));
             let d = cam.slant_box_m(k, g[0], g[1] + h);
             if self.layer.inside(d, reach, existing) {
@@ -1252,27 +1294,6 @@ impl Scheduler {
         self.entries.get(&k).is_some_and(|e| e.held)
     }
 
-    /// Contract "present": uploaded, or all 4 children present.
-    pub fn present(&self, k: TileKey) -> bool {
-        self.held(k) || (k.z < self.layer.leaf_zoom && children(k).iter().all(|&c| self.present(c)))
-    }
-
-    /// Present, and its sibling group present all the way up to the root: children
-    /// delivered under it can never overlap a coarser visible tile.
-    fn effective(&self, k: TileKey) -> bool {
-        let mut k = k;
-        loop {
-            if !self.present(k) {
-                return false;
-            }
-            let Some(p) = self.layer.parent(k) else { return true };
-            if !self.layer.siblings(k).iter().all(|&s| self.present(s)) {
-                return false;
-            }
-            k = p;
-        }
-    }
-
     /// All 4 children are uploaded (held directly, not merely present).
     fn children_held(&self, k: TileKey) -> bool {
         k.z < self.layer.leaf_zoom && children(k).iter().all(|&c| self.held(c))
@@ -1404,6 +1425,7 @@ impl Scheduler {
             }
             // A key in `dropped` is still held by the host and stays there for `drain_unload`.
             if e.held {
+                self.recent.left(c, self.now);
                 e.state = TileState::Idle;
                 e.split = false;
                 e.relight = false;
@@ -1455,12 +1477,8 @@ impl Scheduler {
                 self.next_job += 1;
             }
             self.dropped.push(k);
+            self.recent.left(k, self.now);
         }
-    }
-
-    /// Root, or the parent is effective and not part of a fade (no tile in two fades).
-    fn deliverable(&self, k: TileKey) -> bool {
-        k.z == self.layer.root_zoom || self.layer.parent(k).is_some_and(|p| self.effective(p) && !self.in_fade(p))
     }
 
     /// Best tile to hand to Godot: fresh tiles whose parent is effective, nearest to the
@@ -1483,9 +1501,12 @@ impl Scheduler {
             a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)).then(a.2.cmp(&b.2)).then(a.3.cmp(&b.3))
         };
         let mut best: Option<(f64, f64, usize, TileKey)> = None;
+        // Nothing is taken or dropped during this call: one presence memo for every tile.
+        let mut memo = std::mem::take(&mut self.presence);
+        memo.clear();
         for &k in &self.ready {
             let e = &self.entries[&k];
-            if e.held || e.frozen || !self.deliverable(k) {
+            if e.held || e.frozen || !self.deliverable_in(k, &mut memo) {
                 continue;
             }
             let o = self.order_key(e);
@@ -1494,6 +1515,7 @@ impl Scheduler {
             }
         }
         // Landmark tiles (api 1.11): fresh deliveries by their own distance, no parent rule.
+        self.presence = memo;
         for e in self.landmarks.entries.values() {
             if matches!(e.state, LmState::Ready(_)) {
                 let o = (e.cam_d, e.cam_d, 0, e.key);
@@ -1591,11 +1613,15 @@ impl Scheduler {
         let (mesh, ground, lights, terrain) = match std::mem::replace(&mut e.state, TileState::Idle) {
             TileState::Ready(data) => {
                 let d = *data;
-                (d.mesh, Arc::new(d.ground), d.lights, d.terrain)
+                if kind != LayerKind::Landmarks {
+                    let kept = Kept::of(&d);
+                    self.recent.keep(k, kept, self.now);
+                }
+                (d.mesh, d.ground, d.lights, d.terrain)
             }
             other => {
                 e.state = other;
-                (MeshData::default(), e.ground.clone().unwrap_or_default(), e.lights.clone()?, None)
+                (Arc::default(), e.ground.clone().unwrap_or_default(), e.lights.clone()?, None)
             }
         };
         if !redelivery {
@@ -1633,7 +1659,7 @@ impl Scheduler {
             ring: 0,
             center: e.center,
             mesh: d.mesh,
-            ground: Arc::new(d.ground),
+            ground: d.ground,
             lights: d.lights,
             clustered,
             redelivery: false,
@@ -1693,7 +1719,8 @@ impl Scheduler {
 
     /// Nothing in flight or waiting: every tracked tile is delivered with the current lights.
     pub fn settled(&self) -> bool {
-        self.landmarks.unloading.is_empty()
+        self.probes_idle()
+            && self.landmarks.unloading.is_empty()
             && self.landmarks.entries.values().all(|e| matches!(e.state, LmState::Idle | LmState::Empty | LmState::Broken))
             && self.unloading.is_empty()
             && self.dropped.is_empty()

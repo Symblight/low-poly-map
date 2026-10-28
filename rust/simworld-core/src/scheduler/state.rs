@@ -167,7 +167,7 @@ pub struct ReadyTile {
     pub key: TileKey,
     pub ring: usize,
     pub center: [f64; 2],
-    pub mesh: MeshData,
+    pub mesh: Arc<MeshData>,
     /// Ground mesh (empty for tiles without ground features). R3 light re-deliveries resend
     /// the kept one.
     pub ground: Arc<MeshData>,
@@ -176,7 +176,7 @@ pub struct ReadyTile {
     /// Already uploaded once (light mode change, terrain detail change).
     pub redelivery: bool,
     /// Terrain layer: the terrain mesh (`None` for vector tiles).
-    pub terrain: Option<Box<TerrainTile>>,
+    pub terrain: Option<Arc<TerrainTile>>,
 }
 
 impl ReadyTile {

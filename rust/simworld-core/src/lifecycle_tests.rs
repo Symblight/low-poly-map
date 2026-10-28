@@ -929,7 +929,7 @@ fn orphaned_mesh_jobs_are_cancelled_and_nothing_stale_is_delivered() {
         for (k, ring, mesh) in fresh {
             if checked < 40 {
                 let want = crate::data::synthetic_chunk(k, ring, frame, &crate::terrain::Terrain::flat(), &profile, false).unwrap();
-                assert_eq!(mesh, want.mesh, "{k}: delivered mesh differs from a fresh build");
+                assert_eq!(mesh, *want.mesh, "{k}: delivered mesh differs from a fresh build");
                 checked += 1;
             }
         }

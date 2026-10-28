@@ -7,8 +7,8 @@
 //!   the settle, then a level flight at 250 m/s, 300 m (60 Hz real time): p50 / max of
 //!   `update_camera` and of `pop_ready` per delivered tile, frames over 3 ms, and keys delivered
 //!   again within 10 s of their unload (churn).
-//! - `perf_stream_cold_fill`: cold fill at the origin, then the same flight: first tile per band,
-//!   the settle time and the latency table (first deliveries: `mesh_wait` per band).
+//! - `perf_stream_cold_fill`: 8 s at the origin after `configure_world`: first and last delivery
+//!   per band and the latency table of the fill (`mesh_wait` per band).
 //!
 //! `SIMWORLD_PERF_SECONDS` = flight seconds (default 30); `SIMWORLD_PERF_SET` = JSON profile
 //! overrides merged in (e.g. `{"streaming":{"worker_threads":8}}`).
@@ -75,7 +75,8 @@ fn p50_max(v: &mut [f64]) -> (f64, f64) {
 
 fn busy(w: &World) -> i32 {
     let s = w.stats();
-    s.queued.iter().chain(&s.fetching).chain(&s.meshing).chain(&s.terrain_queued).chain(&s.terrain_fetching).chain(&s.terrain_meshing).sum()
+    let tiles: i32 = s.queued.iter().chain(&s.fetching).chain(&s.meshing).chain(&s.terrain_queued).chain(&s.terrain_fetching).chain(&s.terrain_meshing).sum();
+    tiles + s.probes_pending as i32
 }
 
 /// Per-frame measurements of a run.
@@ -139,6 +140,8 @@ fn perf_stream_main_thread() {
         let first = (r.update_ms[0], r.update_cpu_ms[0]);
         let settle_max = r.update_cpu_ms[1..].iter().cloned().fold(0.0, f64::max);
         let settle_s = t0.elapsed().as_secs_f64();
+        let settle_upd: f64 = r.update_cpu_ms.iter().sum();
+        let (sp50, spmax) = p50_max(&mut r.pop_ms_per_tile);
         // Level flight north.
         let mut f = Run::default();
         let (speed, mut z) = (250.0, 0.0f64);
@@ -155,7 +158,7 @@ fn perf_stream_main_thread() {
         let (c50, cmax) = p50_max(&mut f.update_cpu_ms);
         let (p50, pmax) = p50_max(&mut f.pop_ms_per_tile);
         eprintln!(
-            "[{name} run {run}] first update_camera {:.2} ms wall / {:.2} ms CPU, settle max {settle_max:.2} ms CPU ({settle_s:.1} s); flight {:.0} s: \
+            "[{name} run {run}] first update_camera {:.2} ms wall / {:.2} ms CPU, settle max {settle_max:.2} ms CPU, all frames {settle_upd:.1} ms CPU, pop_ready per tile p50 {sp50:.3} / max {spmax:.2} ms ({settle_s:.1} s); flight {:.0} s: \
              update_camera wall p50 {u50:.3} / max {umax:.2} ms, CPU p50 {c50:.3} / max {cmax:.2} ms ({over3} frames > 3 ms CPU), pop_ready per tile p50 {p50:.3} / max {pmax:.2} ms, \
              delivered {}, re-delivered within 10 s of unload {} ({:.1} / min)",
             first.0,
@@ -176,39 +179,34 @@ fn perf_stream_cold_fill() {
     let mut w = World::new(Arc::new(crate::NullLog), crate::Diagnostics::default(), "perf");
     assert!(w.configure_world(options(&url)).ok);
     let threads = w.worker().map_or(0, |x| x.cpu_threads());
+    // A fixed 8 s at 60 Hz (an idle check misses data tiles in flight): first and last delivery
+    // per band (vector R0..R3, then terrain), tiles held at the end.
     let t0 = Instant::now();
-    let mut first_at = [None::<f64>; 4];
-    let mut r = Run::default();
-    loop {
+    let (mut first, mut last) = ([f64::NAN; 5], [f64::NAN; 5]);
+    while t0.elapsed() < Duration::from_secs(8) {
         let ft = Instant::now();
-        r.frame(&mut w, [0.0, 300.0, 0.0], [0.0; 3]);
+        let mut got = Vec::new();
+        w.update_camera([0.0, 300.0, 0.0], [0.0; 3], 300.0);
+        w.pop_ready(2, |v| got.push((v.layer, v.ring)));
+        let _ = w.drain_fades();
+        let _ = w.drain_unload();
         let el = ms(t0.elapsed());
-        for (ring, s) in w.stats().loaded.iter().enumerate() {
-            if *s > 0 {
-                first_at[ring].get_or_insert(el);
+        for (layer, ring) in got {
+            let b = if layer == crate::rings::LayerKind::Terrain { 4 } else { ring.min(3) };
+            if first[b].is_nan() {
+                first[b] = el;
             }
-        }
-        if (r.delivered > 0 && busy(&w) == 0) || t0.elapsed() > Duration::from_secs(90) {
-            break;
-        }
-        std::thread::sleep(FRAME.saturating_sub(ft.elapsed()));
-    }
-    let settle = t0.elapsed().as_secs_f64();
-    let (speed, mut z) = (250.0, 0.0f64);
-    for _ in 0..(seconds() * 60.0) as usize {
-        let ft = Instant::now();
-        z -= speed / 60.0;
-        if let Some(s) = r.frame(&mut w, [0.0, 300.0, z], [0.0, 0.0, -speed]) {
-            z -= s[2];
+            last[b] = el;
         }
         std::thread::sleep(FRAME.saturating_sub(ft.elapsed()));
     }
     let terrain_loaded: i32 = w.stats().terrain_loaded.iter().sum();
+    let r = |v: [f64; 5]| v.map(|x| x.round());
     eprintln!(
-        "[{name}, {threads} worker threads] settled in {settle:.2} s; first tile per band (ms) {:?}; terrain tiles held {terrain_loaded}; \
-         flight {:.0} s at 250 m/s\n{}",
-        first_at.map(|v| v.map(|x| x.round())),
-        seconds(),
+        "[{name}, {threads} worker threads] cold fill 8 s: first delivery per band R0..R3, terrain (ms) {:?}; last delivery {:?}; vector tiles held {:?}, terrain tiles held {terrain_loaded}\n{}",
+        r(first),
+        r(last),
+        w.stats().loaded,
         w.latency().map(|l| l.report()).unwrap_or_default()
     );
     assert!(w.shutdown());

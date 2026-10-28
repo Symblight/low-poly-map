@@ -26,7 +26,8 @@
 //!   redone, review L1); any other unknown id cancels the dependant at once.
 //! - **Version:** every job carries `version` (a hash of its inputs), reserved for the marker
 //!   reload (a new version is built beside the old one); the pool only passes it through.
-//! - **Threads:** [`default_threads`] (cores - 2, clamped to 2..=4 as before). `on_thread_start`
+//! - **Threads:** [`worker_threads`] (profile `streaming.worker_threads`; 0 = cores - 2,
+//!   clamped to 2..=8). `on_thread_start`
 //!   is the hook for a platform thread setup (iOS: QoS class of the thread group; not built).
 //!
 //! Pure Rust, no Godot, no global state: every `World` owns its pool. Results do not depend on

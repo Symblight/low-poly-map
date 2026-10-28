@@ -296,6 +296,8 @@ pub struct WorldStats {
     /// Shared CPU job pool (both layers): jobs queued (ready or waiting on dependencies),
     /// running, and cancelled since the world was configured. Zero when not running.
     pub jobs: JobStats,
+    /// Tile-box probes requested and not answered yet, both layers (`scheduler::boxes`).
+    pub probes_pending: usize,
     /// The memory budget of the core's CPU-side pools (`World::memory`).
     pub memory: MemoryStats,
     /// Tiles v2 data tiles (vector layer, archive sources): decoded tiles resident now, and
@@ -1241,6 +1243,7 @@ impl World {
             terrain_budget_skipped: self.terrain_sched.as_ref().map_or(0, |t| t.budget_skipped()),
             terrain_tris: tst.tris,
             jobs: self.worker.as_ref().map(|w| w.job_stats()).unwrap_or_default(),
+            probes_pending: [self.scheduler.as_ref(), self.terrain_sched.as_ref()].into_iter().flatten().map(|s| s.probes_pending()).sum(),
             memory: self.memory.stats(),
             data_tiles_loaded: data.loaded,
             data_tiles_decoded: data.decoded,

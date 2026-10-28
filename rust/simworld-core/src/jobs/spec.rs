@@ -127,10 +127,23 @@ impl PoolConfig {
     }
 }
 
-/// Default worker count: cores - 2, clamped to 2..=4 (desktop; the measured spike setting).
-pub fn default_threads() -> usize {
-    let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    cpus.saturating_sub(2).clamp(2, 4)
+/// Most worker threads the automatic count picks (`streaming.worker_threads` = 0).
+pub const AUTO_THREADS_MAX: usize = 8;
+
+/// Worker count for profile `streaming.worker_threads`: the value itself, or with 0 (auto)
+/// cores - 2, at least 2 and at most [`AUTO_THREADS_MAX`] (desktop; a mobile host passes its
+/// own count). Perf review 2 item 2: the old clamp to 4 left 6 of a 10-core machine idle while
+/// R2 / R3 chunks waited 0.4-1.9 s for a build slot.
+pub fn worker_threads(configured: u32) -> usize {
+    if configured > 0 {
+        return configured as usize;
+    }
+    auto_threads(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
+}
+
+/// The automatic worker count for `cores` logical cores.
+pub fn auto_threads(cores: usize) -> usize {
+    cores.saturating_sub(2).clamp(2, AUTO_THREADS_MAX)
 }
 
 /// Counters for `debug_stats`.

@@ -19,7 +19,7 @@ use crossbeam_channel::{Receiver, Sender};
 use tokio::task::AbortHandle;
 
 use crate::data::{build_chunk_with, build_landmark_tile, decode_level, synthetic_data_tile, DataLevel, DataLevels, DataTile};
-use crate::jobs::{default_threads, JobEnd, JobPool, JobSpec, JobStats, Output, PoolConfig, Priority};
+use crate::jobs::{worker_threads, JobEnd, JobPool, JobSpec, JobStats, Output, PoolConfig, Priority};
 use crate::rings::LayerKind;
 use crate::fetch::{DiskCache, FetchError, FetchErrorKind, FetchParams, Fetcher, Note, Source};
 use crate::geo::{Frame, TileKey};
@@ -614,9 +614,9 @@ impl Worker {
         reuse: Option<Arc<DiskCache>>,
     ) -> Result<Self, String> {
         let (tx, rx) = crossbeam_channel::unbounded();
-        // Desktop: cores - 2, clamped to 2..=4 (as the rayon pool before). iOS will set a QoS
-        // class per thread through `PoolConfig::on_thread_start` (not built).
-        let pool = JobPool::new(PoolConfig::new(default_threads(), "simplane-cpu"))?;
+        // Profile `streaming.worker_threads` (0 = cores - 2, clamped to 2..=8). iOS will set a
+        // QoS class per thread through `PoolConfig::on_thread_start` (not built).
+        let pool = JobPool::new(PoolConfig::new(worker_threads(profile.streaming.worker_threads), "simplane-cpu"))?;
         let cache_cap = FetchParams::from_profile(&profile).cache_cap_bytes;
         let cache_bytes = reuse.as_ref().map_or_else(|| Arc::new(AtomicU64::new(0)), |c| c.bytes_counter());
         let (rt, fetcher) = if url.is_empty() {

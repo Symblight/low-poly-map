@@ -486,6 +486,10 @@ pub struct Streaming {
     pub max_mesh_per_band: u32,
     /// Light-mode re-deliveries per frame.
     pub redeliveries_per_frame: u32,
+    /// Worker threads of the CPU job pool (decode, mesh, terrain); 0 = automatic: cores - 2,
+    /// at least 2, at most 8 (perf review 2; was fixed at cores - 2 clamped to 2..=4). A mobile
+    /// host sets its own count. Read at configure.
+    pub worker_threads: u32,
     /// Retry backoff after a failed fetch/decode: base (s), doubled per attempt ...
     pub retry_base_s: f64,
     /// ... up to this (s).
@@ -1235,7 +1239,14 @@ impl Default for LanduseFallback {
 
 impl Default for Streaming {
     fn default() -> Self {
-        Self { max_fetch_per_band: 4, max_mesh_per_band: 8, redeliveries_per_frame: 1, retry_base_s: 0.5, retry_max_s: 30.0 }
+        Self {
+            max_fetch_per_band: 4,
+            max_mesh_per_band: 8,
+            redeliveries_per_frame: 1,
+            worker_threads: 0,
+            retry_base_s: 0.5,
+            retry_max_s: 30.0,
+        }
     }
 }
 
@@ -1379,6 +1390,7 @@ pub const RANGES: &[(&str, f64, f64)] = &[
     ("streaming.max_fetch_per_band", 1.0, 64.0),
     ("streaming.max_mesh_per_band", 1.0, 64.0),
     ("streaming.redeliveries_per_frame", 1.0, 64.0),
+    ("streaming.worker_threads", 0.0, 64.0),
     ("streaming.retry_base_s", 0.05, 60.0),
     ("streaming.retry_max_s", 0.05, 3600.0),
     ("fades.cap_s", 0.1, 60.0),

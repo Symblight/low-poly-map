@@ -1209,6 +1209,12 @@
           "minimum": 1,
           "maximum": 64
         },
+        "worker_threads": {
+          "description": "Worker threads of the CPU job pool that decodes, meshes and builds terrain tiles for both layers (count). 0 = automatic: logical cores - 2, at least 2, at most 8. A mobile host sets its own (e.g. 2-3 on a phone). Read at configure_world.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 64
+        },
         "retry_base_s": {
           "description": "Retry backoff after a failed fetch or decode: first wait, seconds; doubled per attempt (at most 64x).",
           "type": "number",

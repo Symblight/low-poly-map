@@ -224,6 +224,7 @@
     "max_fetch_per_band": 4,
     "max_mesh_per_band": 8,
     "redeliveries_per_frame": 1,
+    "worker_threads": 0,
     "retry_base_s": 0.5,
     "retry_max_s": 30.0
   },

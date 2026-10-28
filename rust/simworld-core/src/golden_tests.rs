@@ -397,17 +397,20 @@ fn golden_terrain() -> (Profile, Terrain) {
     (p, t)
 }
 
-/// Golden values for `golden_keys()` on the synthetic relief (terrain phase 1, api 1.4): bases on
-/// the lowest footprint corner, foundations, draped and subdivided ground, water snap, lights.
+/// Golden values for `golden_keys()` on the synthetic relief (terrain phase 1, api 1.4; regenerated
+/// 2026-10-28, W0, for the api 1.7 building and drape work of 52105cf that had never been pinned:
+/// bases on the highest ground under the footprint, per-vertex wall bottoms with foundations,
+/// raised parts stacked on the building under them, the band-sized drape tolerance, lights on the
+/// new roofs; the cover table is unchanged): foundations, draped and subdivided ground, lights.
 const GOLDEN_TERRAIN: &[(&str, usize, u64)] = &[
-    ("16/37370/20827", 0, 0x8d9d912b5022a202),
-    ("16/37371/20828", 0, 0xdbfc2afb86562936),
-    ("15/18685/10413", 1, 0x04eb4ef73273d039),
-    ("15/18686/10414", 1, 0x281e68bd411161df),
-    ("14/9342/5206", 2, 0x825083792524cb6f),
-    ("14/9343/5207", 2, 0xd42c3ad0384e08e7),
-    ("13/4671/2603", 3, 0x283bd214eef3e966),
-    ("13/4672/2604", 3, 0x9517814bc4f2694e),
+    ("16/37370/20827", 0, 0x155ac2db53c2d852),
+    ("16/37371/20828", 0, 0x1817e6555a7f7be5),
+    ("15/18685/10413", 1, 0x58c1ba0a83f9984e),
+    ("15/18686/10414", 1, 0xac344ce7b5b058c4),
+    ("14/9342/5206", 2, 0xe150c1114f7c81f7),
+    ("14/9343/5207", 2, 0x96f51734e1402bb1),
+    ("13/4671/2603", 3, 0x60cd6e1fa6ae196c),
+    ("13/4672/2604", 3, 0xe6c37ba8ea77bb5f),
 ];
 
 /// Golden cover on the synthetic relief for `COVER_CAMERAS`.
@@ -499,17 +502,20 @@ pub(crate) fn terrain_cover_signature(s: &mut crate::scheduler::Scheduler, cam: 
 }
 
 /// Golden TIN hashes for `terrain_golden_keys()` on the golden relief (`golden_terrain()`).
+/// Regenerated 2026-10-28 (W0) for the intended change "the TIN is sunk under the height function
+/// at every lattice sample" (api 1.7, contract 9a, `Delatin::vertex_sinks`): same triangles,
+/// lower vertex heights; the layer cover is unchanged.
 const GOLDEN_TERRAIN_MESH: &[(&str, usize, u64)] = &[
-    ("14/9342/5206", 0, 0xac84fa4bbbf88786),
-    ("14/9343/5207", 0, 0x2ad046a2e19e5254),
-    ("13/4671/2603", 1, 0x5ac449bfca8b74a1),
-    ("13/4672/2604", 1, 0x1227579ffd1bbb54),
-    ("12/2335/1301", 2, 0x9b56433baf81222d),
-    ("12/2336/1302", 2, 0x6edb503cd026b134),
-    ("11/1167/650", 3, 0x9b59fab43279d5e2),
-    ("11/1168/651", 3, 0xeca27caf79e2cda6),
-    ("10/583/325", 4, 0x18627aec814d2b08),
-    ("10/584/326", 4, 0xeb6ec0c20ee8c11d),
+    ("14/9342/5206", 0, 0x831052e5382e64f9),
+    ("14/9343/5207", 0, 0x3fca0ce2d2f3c3b7),
+    ("13/4671/2603", 1, 0xf6a4fd69438511a5),
+    ("13/4672/2604", 1, 0xb79cfbdf74e7dafc),
+    ("12/2335/1301", 2, 0x8c619113d321f45c),
+    ("12/2336/1302", 2, 0x0b1a368c9acf8114),
+    ("11/1167/650", 3, 0x0f4205821900a1fd),
+    ("11/1168/651", 3, 0xa7fd20e71317dfb3),
+    ("10/583/325", 4, 0xc1ab9933e9ed03f5),
+    ("10/584/326", 4, 0x0cdbc8bd6429e05e),
 ];
 
 /// Golden terrain-layer cover for `COVER_CAMERAS` on the golden relief, then a tall-peak relief
@@ -619,22 +625,23 @@ fn seed_golden_keys() -> (Vec<(TileKey, usize)>, Vec<(TileKey, usize)>) {
 
 /// Golden values for `seed_golden_keys()` (generator version 2: S1 fixes; regenerated 2026-10-28
 /// for the intended change "no drape lift inside airport fences, fences cut out of countryside and
-/// water, overlapping strips share one plane, coast-resolved terrain COLOR": the four EYVI tiles
-/// and the three terrain tiles changed, the countryside / coast / lake vector tiles did not).
+/// water, overlapping strips share one plane, coast-resolved terrain COLOR"; regenerated again
+/// 2026-10-28, W0: every vector tile for the 52105cf building / drape work (as `GOLDEN_TERRAIN`),
+/// the three terrain tiles for the TIN sink with the sea and lake vertices pinned at their level).
 const GOLDEN_SEED: &[(&str, usize, u64)] = &[
-    ("16/37371/20844", 0, 0x38889b25a698a53b),
-    ("15/18685/10422", 1, 0x4291a9e4083f68e7),
-    ("14/9342/5211", 2, 0x11efed254d499019),
-    ("13/4671/2605", 3, 0x29b16f5dc3b2580c),
-    ("15/18595/10324", 1, 0xd77cc16cf9dcee0a),
-    ("13/4648/2581", 3, 0x45efcb5ba8e96834),
-    ("14/9152/5124", 2, 0x22824c070adbf70e),
-    ("15/18573/10386", 1, 0xd203841e628c3c28),
+    ("16/37371/20844", 0, 0x3cf706f5b2f2b688),
+    ("15/18685/10422", 1, 0x99c3583cb3b78c18),
+    ("14/9342/5211", 2, 0xc937de90c6feb02d),
+    ("13/4671/2605", 3, 0xf1dca27a4e703c5f),
+    ("15/18595/10324", 1, 0x2f8342746dbc499f),
+    ("13/4648/2581", 3, 0x456d6ea0837839a3),
+    ("14/9152/5124", 2, 0xa057805df42b8677),
+    ("15/18573/10386", 1, 0x0ec008066bc95dc3),
 ];
 const GOLDEN_SEED_TERRAIN: &[(&str, usize, u64)] = &[
-    ("14/9342/5211", 0, 0x5413431b13f7e700),
-    ("12/2288/1283", 2, 0xa08e6737c1a5295c),
-    ("10/577/322", 4, 0x0c06200414397eff),
+    ("14/9342/5211", 0, 0x29aab6a9ec11be0c),
+    ("12/2288/1283", 2, 0x5c30c2a36b2c07bd),
+    ("10/577/322", 4, 0xb3df9045bf89b761),
 ];
 
 #[test]

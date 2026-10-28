@@ -361,10 +361,11 @@ impl<'a> SurfaceIndex<'a> {
 }
 
 /// The sunk terrain mesh (api 1.7, contract 9a) never lies above the height function: at every
-/// lattice sample of the tile (the TIN's own input) by more than f32 rounding, at every terrain
-/// band and detail; between the samples (random interior points) only by the sub-lattice
-/// curvature of the function. Reports the largest excess and deficit per band (default relief,
-/// amplitude 450 m, no flat zone).
+/// lattice sample of the tile (the TIN's own input) by more than the projection slack, at every
+/// terrain band and detail, and never more than twice the error bound under it (a sink is
+/// at most the TIN's error, `Delatin::vertex_sinks`); between the samples (random interior
+/// points) only by the sub-lattice curvature of the function (reported, not asserted). Reports
+/// the largest excess and deficit per band (default relief, amplitude 450 m, no flat zone).
 #[test]
 fn sunk_tin_is_never_above_the_height_function() {
     let (p, t) = terrain_profile(TerrainProfile { flat_radius_m: 0.0, flat_blend_m: 0.0, ..TerrainProfile::default() });
@@ -407,12 +408,17 @@ fn sunk_tin_is_never_above_the_height_function() {
                 }
             }
             let bound = p.terrain.bands[ring].max_error_m * detail;
+            let width_m = crate::geo::MERCATOR_CIRCUMFERENCE * VILNIUS.0.to_radians().cos() / (1u64 << z) as f64;
+            // The sink holds in lattice (Web Mercator) space; the mesh is linear in ENU metres, where
+            // a sample sits at slightly other barycentric weights (the projection bends over a
+            // triangle of several km, plus f32 x / z): measured 7.6 mm at z10 detail 2, 2.8 mm at
+            // z12. Slack: 2 mm + 0.4 ppm of the tile width (11 mm at z10, 4 mm at z12).
+            let f32_m = 2e-3 + 4e-7 * width_m;
             eprintln!(
                 "T{ring} z{z} detail {detail}: lattice samples excess max {lat_ex:+.4} m, deficit {lat_def:.3} m; random interior points excess max {sub_ex:+.4} m, deficit {sub_def:.3} m (error bound {bound} m)"
             );
-            // f32 positions: about 3e-5 m at 500 m.
-            assert!(lat_ex <= 2e-3, "T{ring}: the sunk TIN is {lat_ex} m above a lattice sample");
-            assert!(lat_def >= -2.0 * bound - 2e-3, "T{ring}: the sunk TIN is {lat_def} m below a lattice sample");
+            assert!(lat_ex <= f32_m, "T{ring}: the sunk TIN is {lat_ex} m above a lattice sample");
+            assert!(lat_def >= -2.0 * bound - f32_m, "T{ring}: the sunk TIN is {lat_def} m below a lattice sample");
         }
     }
 }

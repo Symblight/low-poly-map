@@ -35,6 +35,16 @@ impl SeedTerrain {
         }
     }
 
+    /// The water level where the height function is a sea or lake level (the water rule
+    /// applies and no airport strip or shoulder touches the point), else `None`. The terrain
+    /// mesh never sinks such a vertex (contract section 9a).
+    pub fn water_level(&self, lat: f64, lon: f64) -> Option<f64> {
+        if self.strips.at(lat, lon).is_some() {
+            return None;
+        }
+        self.water.rule_level_at(lat, lon)
+    }
+
     /// The height before any strip (field + water rule): what the strips level to.
     pub fn height_before_strips(&self, lat: f64, lon: f64, field: impl FnOnce() -> f64) -> f64 {
         self.water.apply_with(lat, lon, field)

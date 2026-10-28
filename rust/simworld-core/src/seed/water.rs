@@ -336,6 +336,12 @@ impl WaterIndex {
         }
     }
 
+    /// Level of the sea or lake the terrain rule puts the point in (the height there is exactly
+    /// this level), `None` = land for the rule (rivers too, unless `rivers_flat`).
+    pub fn rule_level_at(&self, lat: f64, lon: f64) -> Option<f64> {
+        self.rule_level(self.cell_of(lat, lon), lat, lon)
+    }
+
     /// [`WaterIndex::apply`] with the field evaluated only when needed (not in water): the
     /// terrain's water-first order (section 10a budget).
     pub fn apply_with(&self, lat: f64, lon: f64, field: impl FnOnce() -> f64) -> f64 {

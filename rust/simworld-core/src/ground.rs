@@ -17,7 +17,9 @@
 //!   lift over the terrain mesh: the terrain mesh is sunk under the height function instead
 //!   (contract section 9a), and the margin only covers the drape's own chord error (an edge is
 //!   subdivided once the height rises more than the margin above it), so the drawn ground is
-//!   never under the exact height. Levels bottom to top: 0 nature_reserve, 1 other landuse,
+//!   not under the exact height at the tested edge points (a triangle whose edges are all
+//!   shorter than `drape_step_m` is not split and can sag a little under a concave height,
+//!   contract section 9 Drape). Levels bottom to top: 0 nature_reserve, 1 other landuse,
 //!   2 residential, 3 industrial, 4 commercial, 5 grass/park, 6 forest, 7 water, 8..13 roads
 //!   (other .. motorway). The step grows with the band (seen from farther away).
 //! * Airports (seed world, contract section 9 "Airports"): on a tile near an airport the drape

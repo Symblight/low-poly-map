@@ -82,6 +82,13 @@ impl DataEntry {
     }
 }
 
+/// Set `state` to Absent; a resident tile goes to `released` (freed on a worker thread).
+pub(super) fn retire(state: &mut DataState, released: &mut Vec<Arc<DataTile>>) {
+    if let DataState::Resident(d) = std::mem::replace(state, DataState::Absent) {
+        released.push(d);
+    }
+}
+
 /// Priority of a tile a waiting chunk needs: above every unneeded tile, nearest first.
 fn needed_priority(order: f64) -> f64 {
     1.0e9 - order.min(1.0e8)
@@ -132,6 +139,9 @@ pub struct DataStore {
     redecoded: u64,
     /// Keys evicted and not decoded again since (bounded: cleared past [`EVICTED_MEMORY`]).
     evicted_keys: AHashSet<TileKey>,
+    /// Resident tiles dropped since the last [`DataStore::take_released`]: freed on a worker
+    /// thread (`Worker::release`), not inside `update_camera`.
+    pub(super) released: Vec<Arc<DataTile>>,
 }
 
 /// Most evicted keys remembered for the `redecoded` counter.
@@ -156,7 +166,13 @@ impl DataStore {
             evicted_budget: 0,
             redecoded: 0,
             evicted_keys: AHashSet::new(),
+            released: Vec::new(),
         }
+    }
+
+    /// The resident tiles dropped since the last call (to free off the main thread).
+    pub(super) fn take_released(&mut self) -> Vec<Arc<DataTile>> {
+        std::mem::take(&mut self.released)
     }
 
     pub(super) fn remember_evicted(&mut self, k: TileKey) {
@@ -229,6 +245,7 @@ impl DataStore {
     /// data tile, for the priority of tiles kept without a need.
     pub(super) fn end_needs(&mut self, now: Instant, cancelled: &mut Vec<u64>, dist: impl Fn(TileKey) -> f64) {
         let ops = &mut self.ops;
+        let released = &mut self.released;
         let idle = self.idle;
         let mut dropped: Vec<TileKey> = Vec::new();
         self.tiles.retain(|&k, e| {
@@ -244,7 +261,7 @@ impl DataStore {
                         e.idle_since = None;
                     } else if now.saturating_duration_since(*e.idle_since.get_or_insert(now)) >= idle {
                         ops.push(MemOp::Remove { id: item_id(k) });
-                        e.state = DataState::Absent;
+                        retire(&mut e.state, released);
                         e.idle_since = None;
                         dropped.push(k);
                     }

@@ -578,6 +578,7 @@ impl World {
         let Some(w) = &self.worker else { return };
         let mut ids = std::mem::take(&mut self.cancel_buf);
         if let Some(s) = &mut self.scheduler {
+            w.release(s.take_released_data()); // decoded data tiles are freed off the main thread
             s.drain_cancelled(&mut ids);
             w.cancel(LayerKind::World, &ids);
             ids.clear();

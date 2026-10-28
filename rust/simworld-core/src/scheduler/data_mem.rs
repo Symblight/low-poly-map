@@ -5,7 +5,7 @@
 use crate::budget::{ItemKey, MemoryBudget, Pool};
 use crate::geo::TileKey;
 
-use super::data::{DataState, DataStore};
+use super::data::{retire, DataState, DataStore};
 
 /// A queued change to the memory budget (applied by [`DataStore::sync`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -55,7 +55,7 @@ impl DataStore {
             let k = unpack(id);
             if let Some(e) = self.tiles.get_mut(&k) {
                 if matches!(e.state, DataState::Resident(_)) {
-                    e.state = DataState::Absent;
+                    retire(&mut e.state, &mut self.released);
                     e.idle_since = None;
                     self.evicted_budget += 1;
                     self.remember_evicted(k);

@@ -439,6 +439,12 @@ impl Scheduler {
         }
     }
 
+    /// Decoded data tiles dropped since the last call, for the caller to free off the main
+    /// thread (`Worker::release`).
+    pub fn take_released_data(&mut self) -> Vec<Arc<crate::data::DataTile>> {
+        self.data.as_mut().map(|d| d.take_released()).unwrap_or_default()
+    }
+
     /// Unregister the data tiles from the budget (before the scheduler is dropped).
     pub fn release_memory(&mut self, mem: &mut crate::budget::MemoryBudget) {
         if let Some(d) = &mut self.data {

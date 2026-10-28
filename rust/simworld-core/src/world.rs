@@ -45,6 +45,7 @@ use crate::status::{Health, Status, StatusState, MSG_NOT_CONFIGURED, MSG_SHUT_DO
 use crate::worker::{Job, Worker, WorkerMsg};
 
 pub mod lod;
+mod poll_profile;
 
 /// Bounded wait of `shutdown` and of a re-configure that replaces a worker using a disk cache
 /// (until the old cache thread has flushed and closed its file).
@@ -376,6 +377,8 @@ pub struct World {
     reported: (StatusState, String),
     /// Last streaming latency report in the profile log (every [`LATENCY_LOG_EVERY`]).
     latency_logged: Instant,
+    /// `diagnostics.profile`: per-tile host conversion time of `poll_ready`.
+    poll_profile: poll_profile::PollProfile,
     /// Terrain of the current configuration (flat unless the host requested the layer and the
     /// profile enables it). `ground_height_at`, geodetic AGL, the cover and every job use it.
     terrain: Terrain,
@@ -429,6 +432,7 @@ impl World {
             health: Health::idle(MSG_NOT_CONFIGURED),
             reported: (StatusState::Ok, MSG_NOT_CONFIGURED.to_string()),
             latency_logged: Instant::now(),
+            poll_profile: Default::default(),
             seed: None,
             seed_cache: None,
             memory: MemoryBudget::new(mb_to_bytes(crate::profile::Memory::default().budget_mb)),
@@ -1097,6 +1101,9 @@ impl World {
                 if let Some(l) = self.latency() {
                     self.log.info(&format!("WorldStreamer profile: {}", l.report()));
                 }
+                if let Some(p) = self.poll_profile.take_summary() {
+                    self.log.info(&format!("WorldStreamer profile: {p}"));
+                }
                 if let Some(t) = &self.terrain_sched {
                     self.log.info(&format!("WorldStreamer profile: {}", t.cpu_stats().report("terrain", t.layer().rings())));
                 }
@@ -1143,9 +1150,14 @@ impl World {
             if t.redelivery {
                 self.redelivered_this_frame += 1;
             }
-            tris += t.mesh.triangle_count() + t.ground.triangle_count() + t.terrain.as_ref().map_or(0, |x| x.triangle_count());
+            let tile_tris = t.mesh.triangle_count() + t.ground.triangle_count() + t.terrain.as_ref().map_or(0, |x| x.triangle_count());
+            tris += tile_tris;
+            let cpu0 = if self.diag.profile { thread_cpu_us() } else { 0 };
             f(view_of(&t, local));
-            // The tile's flat buffers (a handful of Vecs) are freed here; cheap.
+            drop(t); // shared with the recent-tile cache: usually a reference count
+            if self.diag.profile {
+                self.poll_profile.record(thread_cpu_us().saturating_sub(cpu0), tile_tris);
+            }
         }
         if self.diag.profile {
             let end = Instant::now();

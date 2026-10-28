@@ -20,17 +20,17 @@
 
 use std::sync::Arc;
 
-use godot::classes::mesh::ArrayType;
 use godot::classes::INode;
 use godot::prelude::*;
 
 use simworld_core::budget::{Pool, MIB};
 use simworld_core::latency::{Windows, STAGES};
-use simworld_core::mesher::MeshData;
-use simworld_core::rings::{LayerKey, LayerKind, MAX_RINGS, RING_COUNT};
-use simworld_core::{AirportInfo, ConfigureResult, Log, RunwayEndInfo, SeedInfo, Status, World, API_MAJOR, API_MINOR};
+use simworld_core::rings::{MAX_RINGS, RING_COUNT};
+use simworld_core::{ConfigureResult, Log, Status, World, API_MAJOR, API_MINOR};
 
 use crate::convert::{json_to_variant, lod_state_dict, options_from_dict, vector_lod_into};
+use crate::ready::{key_string, ready_dict, v3};
+use crate::seed::{airport_dict, seed_info_dict};
 use crate::host::{diagnostics_from_env, GodotLog};
 use crate::version_string;
 
@@ -46,65 +46,6 @@ impl INode for WorldStreamer {
     fn init(base: Base<Node>) -> Self {
         Self { world: World::new(Arc::new(GodotLog), diagnostics_from_env(), version_string()), base }
     }
-}
-
-// Plain `[f32; N]` buffers from the workers are bulk-copied into Packed arrays. The Godot
-// vector/color types are `#[repr(C)]` structs of f32 (no `double-precision` feature), so the
-// slices can be reinterpreted without a per-element loop.
-const _: () = assert!(std::mem::size_of::<Vector3>() == 12 && std::mem::align_of::<Vector3>() == 4);
-const _: () = assert!(std::mem::size_of::<Vector2>() == 8 && std::mem::align_of::<Vector2>() == 4);
-const _: () = assert!(std::mem::size_of::<Color>() == 16 && std::mem::align_of::<Color>() == 4);
-
-fn as_v3(s: &[[f32; 3]]) -> &[Vector3] {
-    // SAFETY: Vector3 is repr(C) { x, y, z: f32 } (size/align asserted above).
-    unsafe { std::slice::from_raw_parts(s.as_ptr().cast::<Vector3>(), s.len()) }
-}
-fn as_v2(s: &[[f32; 2]]) -> &[Vector2] {
-    // SAFETY: Vector2 is repr(C) { x, y: f32 } (size/align asserted above).
-    unsafe { std::slice::from_raw_parts(s.as_ptr().cast::<Vector2>(), s.len()) }
-}
-fn as_col(s: &[[f32; 4]]) -> &[Color] {
-    // SAFETY: Color is repr(C) { r, g, b, a: f32 } (size/align asserted above).
-    unsafe { std::slice::from_raw_parts(s.as_ptr().cast::<Color>(), s.len()) }
-}
-
-/// `Mesh.ARRAY_MAX`-length Array (VERTEX, NORMAL, COLOR, TEX_UV, INDEX; other slots nil), or
-/// an empty Array when there is no geometry. TEX_UV stays nil when the mesh has no UVs (ground).
-fn mesh_array(m: &MeshData) -> VarArray {
-    let mut a = VarArray::new();
-    if m.is_empty() {
-        return a;
-    }
-    a.resize(ArrayType::MAX.ord() as usize, &Variant::nil());
-    a.set(ArrayType::VERTEX.ord() as usize, &PackedVector3Array::from(as_v3(&m.positions)).to_variant());
-    a.set(ArrayType::NORMAL.ord() as usize, &PackedVector3Array::from(as_v3(&m.normals)).to_variant());
-    a.set(ArrayType::COLOR.ord() as usize, &PackedColorArray::from(as_col(&m.colors)).to_variant());
-    if !m.uvs.is_empty() {
-        a.set(ArrayType::TEX_UV.ord() as usize, &PackedVector2Array::from(as_v2(&m.uvs)).to_variant());
-    }
-    a.set(ArrayType::INDEX.ord() as usize, &PackedInt32Array::from(&m.indices[..]).to_variant());
-    a
-}
-
-/// Terrain mesh (api 1.5): `Mesh.ARRAY_MAX`-length Array with VERTEX and INDEX, plus NORMAL
-/// when the mesh has normals (`terrain.shading = "smooth"`) and COLOR in a seed world (api 1.7:
-/// r = ground class / 8, g = tint / 8); every other slot nil. Empty Array when there is no
-/// terrain mesh (vector tiles).
-fn terrain_array(m: &MeshData) -> VarArray {
-    let mut a = VarArray::new();
-    if m.is_empty() {
-        return a;
-    }
-    a.resize(ArrayType::MAX.ord() as usize, &Variant::nil());
-    a.set(ArrayType::VERTEX.ord() as usize, &PackedVector3Array::from(as_v3(&m.positions)).to_variant());
-    if !m.normals.is_empty() {
-        a.set(ArrayType::NORMAL.ord() as usize, &PackedVector3Array::from(as_v3(&m.normals)).to_variant());
-    }
-    if !m.colors.is_empty() {
-        a.set(ArrayType::COLOR.ord() as usize, &PackedColorArray::from(as_col(&m.colors)).to_variant());
-    }
-    a.set(ArrayType::INDEX.ord() as usize, &PackedInt32Array::from(&m.indices[..]).to_variant());
-    a
 }
 
 fn per_ring(v: [i32; RING_COUNT]) -> PackedInt32Array {
@@ -130,102 +71,7 @@ fn latency_dict(l: &Windows) -> VarDictionary {
     out
 }
 
-/// `"z/x/y"` (world) or `"t/z/x/y"` (terrain).
-fn key_string(k: LayerKey) -> GString {
-    GString::from(k.to_string().as_str())
-}
 
-fn v3(p: [f64; 3]) -> Vector3 {
-    Vector3::new(p[0] as f32, p[1] as f32, p[2] as f32)
-}
-
-fn end_dict(e: &RunwayEndInfo) -> VarDictionary {
-    let mut d = VarDictionary::new();
-    d.set("ident", &GString::from(e.ident.as_str()));
-    d.set("lat", e.lat);
-    d.set("lon", e.lon);
-    d.set("position", v3(e.position));
-    d.set("threshold_lat", e.threshold_lat);
-    d.set("threshold_lon", e.threshold_lon);
-    d.set("threshold_position", v3(e.threshold_position));
-    d.set("displaced_threshold_m", e.displaced_threshold_m);
-    d.set("touchdown_position", v3(e.touchdown_position));
-    d.set("heading_deg", e.heading_deg);
-    d
-}
-
-/// `airports()` entry (api 1.7).
-fn airport_dict(a: &AirportInfo) -> VarDictionary {
-    let mut d = VarDictionary::new();
-    d.set("ident", &GString::from(a.ident.as_str()));
-    d.set("name", &GString::from(a.name.as_str()));
-    d.set("type", &GString::from(a.kind.as_str()));
-    d.set("lat", a.lat);
-    d.set("lon", a.lon);
-    d.set("position", v3(a.position));
-    match a.elevation_ft {
-        Some(e) => d.set("elevation_ft", e),
-        None => d.set("elevation_ft", &Variant::nil()),
-    }
-    let mut runways: Array<VarDictionary> = Array::new();
-    for r in &a.runways {
-        let mut rd = VarDictionary::new();
-        rd.set("designator", &GString::from(r.designator.as_str()));
-        rd.set("le", &end_dict(&r.le));
-        rd.set("he", &end_dict(&r.he));
-        rd.set("length_m", r.length_m);
-        rd.set("width_m", r.width_m);
-        rd.set("surface", &GString::from(r.surface.as_str()));
-        rd.set("paved", r.paved);
-        rd.set("lighted", r.lighted);
-        rd.set("approximate", r.approximate);
-        let lights: Vec<Vector3> = r.lights.iter().map(|p| v3(*p)).collect();
-        rd.set("lights", &PackedVector3Array::from(&lights[..]));
-        rd.set("light_colors", &PackedColorArray::from(as_col(&r.light_colors)));
-        runways.push(&rd);
-    }
-    d.set("runways", &runways);
-    d
-}
-
-/// `seed_world_info()` (api 1.7).
-fn seed_info_dict(i: &SeedInfo) -> VarDictionary {
-    let mut d = VarDictionary::new();
-    d.set("manifest", &GString::from(i.manifest.as_str()));
-    d.set("generator_version", i.generator_version as i64);
-    let phases: PackedStringArray = i.phases.iter().map(|s| GString::from(s.as_str())).collect();
-    d.set("phases", &phases);
-    d.set("world_version", i.world_version);
-    d.set("world_seed", &GString::from(i.world_seed.as_str()));
-    let mut cities: Array<VarDictionary> = Array::new();
-    for c in &i.cities {
-        let mut cd = VarDictionary::new();
-        cd.set("id", &GString::from(c.id.as_str()));
-        cd.set("name", &GString::from(c.name.as_str()));
-        cd.set("lat", c.lat);
-        cd.set("lon", c.lon);
-        cd.set("radius_km", c.radius_km);
-        cd.set("version", c.version);
-        cd.set("source", &GString::from(c.source.as_str()));
-        let ap: PackedStringArray = c.airports.iter().map(|s| GString::from(s.as_str())).collect();
-        cd.set("airports", &ap);
-        cities.push(&cd);
-    }
-    d.set("cities", &cities);
-    d.set("airports", i.airports as i64);
-    d.set("water_polygons", i.water_polygons as i64);
-    let warnings: PackedStringArray = i.warnings.iter().map(|s| GString::from(s.as_str())).collect();
-    d.set("warnings", &warnings);
-    let mb = |b: usize| b as f64 / 1_048_576.0;
-    let mut m = VarDictionary::new();
-    m.set("water_index_mb", mb(i.stats.water_index_bytes));
-    m.set("water_raster_mb", mb(i.stats.water_raster_bytes));
-    m.set("strip_index_kb", i.stats.strip_index_bytes as f64 / 1024.0);
-    m.set("airports_kb", i.stats.airport_bytes as f64 / 1024.0);
-    m.set("load_ms", i.stats.build_ms);
-    d.set("memory", &m);
-    d
-}
 
 fn status_dict(s: &Status) -> VarDictionary {
     let mut d = VarDictionary::new();
@@ -367,32 +213,7 @@ impl WorldStreamer {
     #[func]
     fn poll_ready(&mut self, max: i32) -> Array<VarDictionary> {
         let mut out = Array::new();
-        self.world.pop_ready(max.max(0) as usize, |t| {
-            let mut d = VarDictionary::new();
-            d.set("key", &key_string(t.layer_key()));
-            d.set("layer", &GString::from(t.layer.name()));
-            d.set("ring", t.ring as i64);
-            d.set("origin", Vector3::new(t.origin[0] as f32, t.origin[1] as f32, t.origin[2] as f32));
-            d.set("mesh", &mesh_array(t.mesh));
-            // Always present (empty Array for R3 / no ground): Godot replaces the tile's ground.
-            d.set("ground", &mesh_array(t.ground));
-            d.set("lights", &PackedVector3Array::from(as_v3(t.lights)));
-            d.set("light_colors", &PackedColorArray::from(as_col(t.light_colors)));
-            d.set("street_lights", &PackedVector3Array::from(as_v3(t.street_lights)));
-            d.set("street_light_colors", &PackedColorArray::from(as_col(t.street_light_colors)));
-            d.set("beacon_lights", &PackedVector3Array::from(as_v3(t.beacon_lights)));
-            d.set("beacon_light_colors", &PackedColorArray::from(as_col(t.beacon_light_colors)));
-            // api 1.7: airport lights of a seed world (empty elsewhere).
-            d.set("airport_lights", &PackedVector3Array::from(as_v3(t.airport_lights)));
-            d.set("airport_light_colors", &PackedColorArray::from(as_col(t.airport_light_colors)));
-            // api 1.5: the terrain mesh (empty Array on vector tiles), its height range.
-            d.set("terrain", &terrain_array(t.terrain));
-            if t.layer == LayerKind::Terrain {
-                d.set("h_min", t.h_min);
-                d.set("h_max", t.h_max);
-            }
-            out.push(&d);
-        });
+        self.world.pop_ready(max.max(0) as usize, |t| out.push(&ready_dict(&t)));
         self.emit_status_change();
         out
     }

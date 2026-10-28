@@ -30,6 +30,18 @@ public partial class BenchArgs : Node
     private MeshInstance3D? _fallback;
     private double _terrainDetail = double.NaN;
 
+    /// <summary>"1,1,1,2" as an Array of floats (two or more numbers); false for anything else.</summary>
+    private static bool TryNumberList(string text, out Godot.Collections.Array list)
+    {
+        list = new Godot.Collections.Array();
+        foreach (var part in text.Split(','))
+        {
+            if (!TryNumber(part.Trim(), out var n)) return false;
+            list.Add(n);
+        }
+        return list.Count > 1;
+    }
+
     private static bool TryNumber(string text, out double v) =>
         double.TryParse(text, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out v);
 
@@ -48,6 +60,7 @@ public partial class BenchArgs : Node
             else if (arg == "--no-landmarks") view.LandmarksEnabled = false; // api 1.11: do not opt in to the landmark layer; the landmarks stay folded into the vector tiles
             else if (arg.StartsWith("--curvature=", System.StringComparison.Ordinal) && TryNumber(arg.Substring(12), out var cv)) view.Curvature = Mathf.Max((float)cv, 0f);
             else if (arg.StartsWith("--light-alpha=", System.StringComparison.Ordinal) && TryNumber(arg.Substring(14), out var la)) settings.DebugLightAlpha = (float)la;
+            else if (arg == "--no-engine-surfaces") settings.EngineSurfaces = false; // api 1.11: Godot packs the mesh Arrays on the main thread (A/B of the library's engine surfaces)
             else if (arg == "--no-building-lights") settings.BuildingLightSprites = false;
             else if (arg == "--no-upload-burst") settings.UploadBudgetBurstUs = 0;
             else if (arg.StartsWith("--pool-max-ring=", System.StringComparison.Ordinal) && TryNumber(arg.Substring(16), out var pmr)) settings.StreetPoolMaxRing = (int)pmr;
@@ -317,6 +330,7 @@ public partial class BenchArgs : Node
                 var text = kv.Substring(eq + 1).Trim();
                 // Numbers always go as float (like Godot's JSON parser): Rust accepts integral floats for integer keys.
                 if (TryNumber(text, out var num)) sets.Add((key, num));
+                else if (TryNumberList(text, out var list)) sets.Add((key, list)); // --set=lights.street.spacing_scale=1,1,1,1
                 else if (text == "true" || text == "false") sets.Add((key, text == "true"));
                 else sets.Add((key, text));
             }

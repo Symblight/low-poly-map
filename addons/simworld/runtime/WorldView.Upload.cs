@@ -1,4 +1,3 @@
-using System.Text;
 using Godot;
 
 namespace SimWorld;
@@ -6,22 +5,6 @@ namespace SimWorld;
 /// <summary>Ready tiles into pooled node sets, one method per layer (vector, terrain, landmarks).</summary>
 public partial class WorldView
 {
-    private static string Describe(Godot.Collections.Array? a)
-    {
-        if (a == null) return "no mesh";
-        var sb = new StringBuilder();
-        for (int i = 0; i < a.Count; i++)
-        {
-            var v = a[i];
-            if (v.VariantType == Variant.Type.Nil) continue;
-            sb.Append(i).Append(':').Append(v.VariantType);
-            if (v.VariantType == Variant.Type.PackedVector3Array) sb.Append('[').Append(v.AsVector3Array().Length).Append(']');
-            else if (v.VariantType == Variant.Type.PackedInt32Array) sb.Append('[').Append(v.AsInt32Array().Length).Append(']');
-            sb.Append(' ');
-        }
-        return sb.ToString();
-    }
-
     /// <summary>Delivered entries the host could not draw (no usable key, a malformed or rejected mesh, an unparsable tile key): logged once per key, counted here (overlay), together with the pool's own (a short light colour array). The library holds such a tile, so each one is a hole.</summary>
     public OnceLog UploadProblems => _pool?.Problems ?? NoProblems;
     private static readonly OnceLog NoProblems = new();
@@ -33,8 +16,8 @@ public partial class WorldView
     }
 
     /// <summary>Marks a mesh Godot refused (its own error names no tile) so the log says which one.</summary>
-    private void ReportRejectedMesh(in ReadyTile tile, string what, Godot.Collections.Array? arrays) =>
-        UploadProblems.Error(tile.Key + "#" + what, $"[WorldView] tile {tile.Key}: Godot rejected the {what} mesh ({Describe(arrays)}); the tile is drawn without it");
+    private void ReportRejectedMesh(in ReadyTile tile, string what, Godot.Collections.Array? arrays, Godot.Collections.Dictionary? surface) =>
+        UploadProblems.Error(tile.Key + "#" + what, $"[WorldView] tile {tile.Key}: Godot rejected the {what} mesh ({MeshSurfaces.Describe(arrays, surface)}); the tile is drawn without it");
 
     private void UploadTile(in ReadyTile tile)
     {
@@ -63,13 +46,13 @@ public partial class WorldView
         nodes.Root.Position = tile.Origin;
 
         long tm0 = (long)Time.GetTicksUsec();
-        if (!pool.SetMesh(nodes, tile.Mesh)) ReportRejectedMesh(in tile, "building", tile.Mesh);
+        if (!pool.SetMesh(nodes, tile.Mesh, tile.MeshSurface)) ReportRejectedMesh(in tile, "building", tile.Mesh, tile.MeshSurface);
         long tm1 = (long)Time.GetTicksUsec();
         // Ground (every band; R3 since api 1.3): same root, so it is shown / hidden with the buildings. A delivery without
         // a "ground" key (older Rust build) leaves an existing ground mesh alone; an empty Array clears it.
         if (tile.HasGroundKey)
         {
-            if (!pool.SetGround(nodes, tile.Ground)) ReportRejectedMesh(in tile, "ground", tile.Ground);
+            if (!pool.SetGround(nodes, tile.Ground, tile.GroundSurface)) ReportRejectedMesh(in tile, "ground", tile.Ground, tile.GroundSurface);
             long gus = (long)Time.GetTicksUsec() - tm1;
             GroundUploadUsLast = gus;
             if (gus > GroundUploadUsMax) GroundUploadUsMax = gus;
@@ -118,7 +101,7 @@ public partial class WorldView
         if (us > 2000 && _slowLogs < 40)
         {
             _slowLogs++;
-            GD.Print($"[WorldView] slow upload {tile.Key} ring={tile.Ring} tris={nodes.Tris} groundTris={nodes.GroundTris} lights={tile.Lights.Length} {us / 1000.0:0.00} ms (mesh {(tm1 - tm0) / 1000.0:0.00}, ground {(tm1b - tm1) / 1000.0:0.00}, lights {(tm2 - tm1b) / 1000.0:0.00}) {Describe(tile.Mesh)}");
+            GD.Print($"[WorldView] slow upload {tile.Key} ring={tile.Ring} tris={nodes.Tris} groundTris={nodes.GroundTris} lights={tile.Lights.Length} {us / 1000.0:0.00} ms (mesh {(tm1 - tm0) / 1000.0:0.00}, ground {(tm1b - tm1) / 1000.0:0.00}, lights {(tm2 - tm1b) / 1000.0:0.00}) {MeshSurfaces.Describe(tile.Mesh, tile.MeshSurface)}");
         }
     }
 
@@ -149,7 +132,7 @@ public partial class WorldView
             ChurnDeliver("terrain", tile.Key);
         }
         nodes.Root.Position = tile.Origin;
-        if (!pool.SetMesh(nodes, tile.Terrain, tile.HMin, tile.HMax)) ReportRejectedMesh(in tile, "terrain", tile.Terrain);
+        if (!pool.SetMesh(nodes, tile.Terrain, tile.TerrainSurface, tile.HMin, tile.HMax)) ReportRejectedMesh(in tile, "terrain", tile.Terrain, tile.TerrainSurface);
         InitCullMargin(nodes);
         if (replace)
         {
@@ -203,7 +186,7 @@ public partial class WorldView
             ChurnDeliver("landmarks", tile.Key);
         }
         nodes.Root.Position = tile.Origin;
-        if (!pool.SetMesh(nodes, tile.Mesh)) ReportRejectedMesh(in tile, "landmark", tile.Mesh);
+        if (!pool.SetMesh(nodes, tile.Mesh, tile.MeshSurface)) ReportRejectedMesh(in tile, "landmark", tile.Mesh, tile.MeshSurface);
         // Lights like R1 (the shared sprite material cross-fades them with the building windows) and the beacons; a landmark tile has no ground
         // and no street or airport lights (empty in the entry), so its sprite MultiMesh holds lights and beacons only.
         pool.SetSprites(nodes, in tile);

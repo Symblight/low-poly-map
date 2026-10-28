@@ -465,8 +465,7 @@ public partial class WorldView : Node3D
         }
 
         var options = WorldStreamerFacade.MakeWorldOptions(OriginLat, OriginLon, url, cacheDir);
-        AddTerrainLayerOption(options);
-        AddSeedWorldOption(options);
+        AddHostOptions(options);
         if (profilePath.Length > 0) options["profile_path"] = profilePath;
         if (overrides.Count > 0) options["profile_overrides"] = overrides;
         var result = Streamer.ConfigureWorld(options);
@@ -523,37 +522,6 @@ public partial class WorldView : Node3D
         }
         if (panel != null) MergeInto(merged, panel);
         return merged;
-    }
-
-    /// <summary>Adds the <c>seed_world</c> option (api 1.7) for a seed world host. OS paths are made absolute (relative to the cwd); <c>res://</c> and <c>user://</c> go as they are.</summary>
-    private void AddSeedWorldOption(Godot.Collections.Dictionary options)
-    {
-        if (!SeedWorldActive) { WorldStreamerFacade.AddSeedWorld(options, ""); return; }
-        var path = SeedWorld.Trim();
-        if (!path.Contains("://")) path = System.IO.Path.GetFullPath(path);
-        WorldStreamerFacade.AddSeedWorld(options, path);
-    }
-
-    /// <summary>Adds the <c>layers</c> opt-in: <c>terrain</c> when the host wants it and the library has it (api 1.5; warns once when it has not) and <c>landmarks</c> when <see cref="LandmarksEnabled"/> and the library has the layer (api 1.11).</summary>
-    private void AddTerrainLayerOption(Godot.Collections.Dictionary options)
-    {
-        bool want = EnableTerrain;
-        if (want && !Streamer.HasTerrainLayer)
-        {
-            if (!_warnedNoTerrainLayer) GD.PushWarning($"[WorldView] EnableTerrain ignored: library api {Streamer.ApiVersionText} has no terrain layer (needs 1.5); the world stays flat");
-            _warnedNoTerrainLayer = true;
-            want = false;
-        }
-        bool landmarks = LandmarksEnabled && Streamer.HasLandmarkLayer;
-        if (LandmarksEnabled && !landmarks && !_loggedNoLandmarks)
-        {
-            _loggedNoLandmarks = true;
-            GD.Print($"[WorldView] landmark layer off: library api {Streamer.ApiVersionText} has none (needs 1.{WorldStreamerFacade.LandmarksMinApiMinor}); landmarks stay inside the vector tiles");
-        }
-        LandmarksActive = landmarks;
-        WorldStreamerFacade.AddLayers(options, want, landmarks);
-        // Keep the flat zone (and so the relief) where the first configure put it: a reconfigure may move the origin (api 1.6).
-        WorldStreamerFacade.AddTerrainCenter(options, want && Streamer.HasTerrainActiveFlag, OriginLat, OriginLon);
     }
 
     /// <summary>After a configure: reads the profile's terrain section, resets the terrain tile map to its zoom range and the pool to its shading.</summary>
@@ -903,8 +871,7 @@ public partial class WorldView : Node3D
 
         var merged = ComposeOverrides(panel);
         var options = WorldStreamerFacade.MakeWorldOptions(lat, lon, _tileUrl, _cacheDir);
-        AddTerrainLayerOption(options);
-        AddSeedWorldOption(options);
+        AddHostOptions(options);
         var profilePath = ProfilePath.Length == 0 ? "" : ProfilePath.Contains("://") ? ProjectSettings.GlobalizePath(ProfilePath) : System.IO.Path.GetFullPath(ProfilePath);
         if (profilePath.Length > 0) options["profile_path"] = profilePath;
         if (merged.Count > 0) options["profile_overrides"] = merged;

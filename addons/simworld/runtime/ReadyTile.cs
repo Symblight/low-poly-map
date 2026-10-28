@@ -33,6 +33,8 @@ public struct ReadyTile
     public Vector3[] AirportLights;
     public Color[] AirportLightColors;
     public Godot.Collections.Array? Mesh;
+    /// <summary>Engine surfaces (api 1.11, contract 4a; only with <see cref="WorldRenderSettings.EngineSurfaces"/>): when set, the matching Array above is null and this is the mesh. Null = no such mesh.</summary>
+    public Godot.Collections.Dictionary? MeshSurface, GroundSurface, TerrainSurface;
     /// <summary>
     /// True when the dictionary carried a "ground" key at all (an empty Array still counts). Lets the uploader tell
     /// "no ground for this tile" (R3, or an empty tile) from "this delivery does not speak about ground" (older Rust build).

@@ -184,19 +184,18 @@ public sealed class TerrainPool
     }
 
     /// <summary>
-    /// Uploads the terrain mesh (VERTEX + INDEX, NORMAL with smooth shading) into the tile's reused ArrayMesh, replacing the previous
-    /// surface (a re-delivery under the same key is not expected since api 1.10, handled anyway). Null = nothing usable: the instance is hidden.
+    /// Puts the terrain mesh (VERTEX + INDEX, NORMAL with smooth shading; an engine surface when given, api 1.11, else an Array) into the tile's reused
+    /// ArrayMesh, replacing the previous surface (a re-delivery under the same key is not expected since api 1.10, handled anyway). Both null = nothing
+    /// usable: the instance is hidden. Uncompressed either way (positions stay 32-bit).
     /// </summary>
-    public bool SetMesh(TerrainNodes t, Godot.Collections.Array? arrays, float hMin, float hMax)
+    public bool SetMesh(TerrainNodes t, Godot.Collections.Array? arrays, Godot.Collections.Dictionary? surface, float hMin, float hMax)
     {
         ClearMesh(t);
         t.HMin = hMin;
         t.HMax = hMax;
-        if (arrays == null) return true;
-        t.Mesh.AddSurfaceFromArrays(Mesh.PrimitiveType.Triangles, arrays); // no compress flags: uncompressed positions
-        if (t.Mesh.GetSurfaceCount() == 0) return false; // rejected by Godot
-        int idx = t.Mesh.SurfaceGetArrayIndexLen(0);
-        t.Tris = (idx > 0 ? idx : t.Mesh.SurfaceGetArrayLen(0)) / 3;
+        if (arrays == null && surface == null) return true;
+        if (!MeshSurfaces.Fill(t.Mesh, arrays, surface)) return false; // rejected by Godot
+        t.Tris = MeshSurfaces.Triangles(t.Mesh);
         t.HasMesh = true;
         t.MeshInstance.Visible = true;
         return true;

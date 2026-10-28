@@ -339,35 +339,31 @@ public sealed partial class TilePool
     }
 
     /// <summary>
-    /// Uploads <paramref name="arrays"/> (Mesh.ARRAY_MAX layout) into the tile's reused ArrayMesh on the
-    /// calling (main) thread. Null = empty tile (no surface, instance hidden). Returns false when Godot rejected the arrays.
+    /// Puts the building mesh into the tile's reused ArrayMesh on the calling (main) thread: <paramref name="surface"/> (an engine surface, api 1.11) when
+    /// given, else <paramref name="arrays"/> (Mesh.ARRAY_MAX layout). Both null = empty tile (no surface, instance hidden). Returns false when Godot rejected it.
     /// </summary>
-    public bool SetMesh(TileNodes t, Godot.Collections.Array? arrays)
+    public bool SetMesh(TileNodes t, Godot.Collections.Array? arrays, Godot.Collections.Dictionary? surface = null)
     {
         ClearMesh(t);
-        if (arrays == null) return true;
-        t.Mesh.AddSurfaceFromArrays(Godot.Mesh.PrimitiveType.Triangles, arrays);
-        if (t.Mesh.GetSurfaceCount() == 0) return false; // Godot rejected the arrays (it printed its own error, without the tile)
-        int idx = t.Mesh.SurfaceGetArrayIndexLen(0);
-        t.Tris = (idx > 0 ? idx : t.Mesh.SurfaceGetArrayLen(0)) / 3;
+        if (arrays == null && surface == null) return true;
+        if (!MeshSurfaces.Fill(t.Mesh, arrays, surface)) return false;
+        t.Tris = MeshSurfaces.Triangles(t.Mesh);
         t.HasMesh = true;
         t.MeshInstance.Visible = true;
         return true;
     }
 
     /// <summary>
-    /// Uploads the ground mesh (Mesh.ARRAY_MAX layout: VERTEX, NORMAL, COLOR, INDEX) into the tile's reused ground
-    /// ArrayMesh. Null = no ground (empty tile; R3 before api 1.3): the instance is hidden. Visibility of the whole tile is the
+    /// Puts the ground mesh (VERTEX, NORMAL, COLOR, INDEX; Array or engine surface as in <see cref="SetMesh"/>) into the tile's reused ground
+    /// ArrayMesh. Both null = no ground (empty tile; R3 before api 1.3): the instance is hidden. Visibility of the whole tile is the
     /// root's, so ground swaps exactly with the buildings.
     /// </summary>
-    public bool SetGround(TileNodes t, Godot.Collections.Array? arrays)
+    public bool SetGround(TileNodes t, Godot.Collections.Array? arrays, Godot.Collections.Dictionary? surface = null)
     {
         ClearGround(t);
-        if (arrays == null) return true;
-        t.GroundMesh.AddSurfaceFromArrays(Godot.Mesh.PrimitiveType.Triangles, arrays);
-        if (t.GroundMesh.GetSurfaceCount() == 0) return false;
-        int idx = t.GroundMesh.SurfaceGetArrayIndexLen(0);
-        t.GroundTris = (idx > 0 ? idx : t.GroundMesh.SurfaceGetArrayLen(0)) / 3;
+        if (arrays == null && surface == null) return true;
+        if (!MeshSurfaces.Fill(t.GroundMesh, arrays, surface)) return false;
+        t.GroundTris = MeshSurfaces.Triangles(t.GroundMesh);
         t.HasGround = true;
         t.GroundInstance.Visible = true;
         return true;

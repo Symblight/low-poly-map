@@ -12,6 +12,9 @@ shader_type spatial;
 //
 // COLOR (8 bits per channel): rgb = light colour, a = intensity weight from Rust for the three light kinds, clamp(sqrt(count) / 8, 0.125, 1)
 // (a single light is 0.125, clusters, 100 m cells above ~3 km AGL, are higher); for a beacon a = blink phase 0..1.
+// A street point stands for count = (8 a)^2 lamps (api 1.11: an R3 lamp stands for lights.street.spacing_scale lamps, a cluster for the sum of its lamps) and is drawn
+// count times as bright as one lamp, so thinning the far lamps leaves the energy of the carpet as it was. That holds for lamps drawn one by one; the 100 m cells of
+// the light carpet (camera high above the lamps) keep the cluster brightness model of the building lights below, as before 1.11 (street_cluster_agl_m).
 render_mode unshaded, blend_add, depth_draw_never, cull_disabled, fog_disabled, skip_vertex_transform;
 
 #include "earth_curve.gdshaderinc"
@@ -20,6 +23,8 @@ const int KIND_LIGHT = 0;
 const int KIND_STREET = 1;
 const int KIND_AIRPORT = 2;
 const int KIND_BEACON = 3;
+// Street points of a count up to 2 stay where their lamp is (spacing_scale default 2); a bigger count is a cluster cell and gets the jitter below.
+const float STREET_JITTER_MIN_W = 0.08;
 
 uniform sampler2D dot_tex : source_color, filter_linear, repeat_disable;
 
@@ -73,6 +78,9 @@ uniform float blur_px = 7.0;
 uniform float alt_thin_start_m = 800.0;
 uniform float alt_thin_end_m = 3300.0;
 uniform float alt_keep_min = 1.0; // 1 = off (dense far carpet, like aerial photos); e.g. 0.55 thins it
+// Camera height above a street lamp over which the library's light carpet takes over (profile lights.cluster_off_agl_m / cluster_on_agl_m, default 2700 / 3300 m):
+// there a street point is a 100 m cell, drawn with the cluster brightness model; below it, one lamp (count 1) or a thinned far lamp (count = spacing_scale).
+uniform vec2 street_cluster_agl_m = vec2(2700.0, 3300.0);
 // Grazing-angle thinning: elevation = (camera height - light height) / distance. Below graze_max (kind_gate.w) lights start to drop out,
 // each at its own fixed random threshold (with a thin_soft cross-fade, no popping), and below graze_min (kind_gate.z) none are left. From
 // low altitude this ends the carpet kilometres before the 25 km band edge, where it would only stack into the horizon line;
@@ -169,13 +177,17 @@ void vertex() {
 		// Window cross-fade: invisible (collapsed, no fill cost) while the windows carry the building.
 		float blend = smoothstep(gate.x, max(gate.y, gate.x + 1.0), depth);
 		size_px *= step(0.002, blend);
-		jit = vec2(pick * 2.0 - 1.0, jitter) * cluster_jitter_m * step(0.001, w);
+		bool street = kind == KIND_STREET;
+		float count = street ? max(floor(64.0 * COLOR.a * COLOR.a + 0.5), 1.0) : 1.0; // lamps a street point stands for
+		jit = vec2(pick * 2.0 - 1.0, jitter) * cluster_jitter_m * step(street ? STREET_JITTER_MIN_W : 0.001, w);
 
+		float gain = 1.0 + cluster_bright_gain * w;
+		if (street) gain = mix(count, gain, smoothstep(street_cluster_agl_m.x, street_cluster_agl_m.y, CAMERA_POSITION_WORLD.y - light_world.y));
 		float falloff = falloff_ref_m * falloff_ref_m / (falloff_ref_m * falloff_ref_m + d * d);
 		vec3 tint = pick < cool_share ? cool_tint : (pick < cool_share + amber_share ? amber_tint : COLOR.rgb);
 		v_col = mix(COLOR.rgb, tint, look.w) * (1.0 + brightness_jitter * look.w * jitter);
 		float fade = (1.0 - smoothstep(fade_start_m, far_end_m, d)) * blend * keep * falloff * blur_energy * inversesqrt(max(alt_share, 0.05)) * mix(1.0, fog_light_keep, fog);
-		v_bright = look.z * simworld_night_factor * fade * (1.0 + cluster_bright_gain * w) * (CUSTOM0.r * 255.0 / 32.0);
+		v_bright = look.z * simworld_night_factor * fade * gain * (CUSTOM0.r * 255.0 / 32.0);
 		v_pow = mix(1.35, 0.75, blur);
 	}
 

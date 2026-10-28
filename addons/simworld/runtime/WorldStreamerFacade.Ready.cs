@@ -40,6 +40,7 @@ public sealed partial class WorldStreamerFacade
             if (d.TryGetValue(KRing, out var tr)) tile.Ring = (int)tr.AsInt64();
             if (d.TryGetValue(KOrigin, out var to)) tile.Origin = to.AsVector3();
             tile.Terrain = d.TryGetValue(KTerrain, out var tm) ? AsMeshArrays(tm, KTerrain, ref tile.Problem) : null;
+            tile.TerrainSurface = Surface(d, KTerrainSurface, ref tile.Problem);
             if (d.TryGetValue(KHMin, out var h0)) tile.HMin = (float)h0.AsDouble();
             if (d.TryGetValue(KHMax, out var h1)) tile.HMax = (float)h1.AsDouble();
             tile.Lights = System.Array.Empty<Vector3>();
@@ -62,6 +63,8 @@ public sealed partial class WorldStreamerFacade
         tile.Mesh = d.TryGetValue(KMesh, out var m) ? AsMeshArrays(m, KMesh, ref tile.Problem) : null;
         tile.HasGroundKey = d.TryGetValue(KGround, out var g);
         tile.Ground = tile.HasGroundKey ? AsMeshArrays(g, KGround, ref tile.Problem) : null;
+        tile.MeshSurface = Surface(d, KMeshSurface, ref tile.Problem);
+        tile.GroundSurface = Surface(d, KGroundSurface, ref tile.Problem);
         return true;
     }
 

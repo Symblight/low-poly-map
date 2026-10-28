@@ -48,6 +48,12 @@ public partial class WorldRenderSettings : Resource
     /// </summary>
     [Export] public bool BuildingLightSprites { get; set; } = true;
     /// <summary>
+    /// Ask the library for engine surfaces (api 1.11, contract 4a): it packs every building, ground and terrain mesh into Godot's vertex layout on its worker
+    /// threads and the main thread only hands the bytes over. Off, or with an older library, Godot packs the Arrays on the main thread (about 1 ms per 20 000 vertices).
+    /// Read at every configure.
+    /// </summary>
+    [Export] public bool EngineSurfaces { get; set; } = true;
+    /// <summary>
     /// Dither material clones made up front for the fade bursts (during <see cref="PrewarmMaterials"/>): fading tiles at once = <c>fades.max_active</c>
     /// swaps x this many tiles per swap (the coarse tile and its four children). Without the reserve the clones are made when the first swaps start.
     /// </summary>

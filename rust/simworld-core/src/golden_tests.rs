@@ -537,18 +537,20 @@ pub(crate) fn terrain_cover_signature(s: &mut crate::scheduler::Scheduler, cam: 
 /// Golden TIN hashes for `terrain_golden_keys()` on the golden relief (`golden_terrain()`).
 /// Regenerated 2026-10-28 (W0) for the intended change "the TIN is sunk under the height function
 /// at every lattice sample" (api 1.7, contract 9a, `Delatin::vertex_sinks`): same triangles,
-/// lower vertex heights; the layer cover is unchanged.
+/// lower vertex heights; the layer cover is unchanged. Regenerated again (perf review 2 item 3)
+/// for "bands T2..T4 build their TIN from a 128-cell height patch" (`terrain.bands[].patch_cells`):
+/// the T2..T4 rows changed, T0 / T1 and the layer cover did not.
 const GOLDEN_TERRAIN_MESH: &[(&str, usize, u64)] = &[
     ("14/9342/5206", 0, 0x831052e5382e64f9),
     ("14/9343/5207", 0, 0x3fca0ce2d2f3c3b7),
     ("13/4671/2603", 1, 0xf6a4fd69438511a5),
     ("13/4672/2604", 1, 0xb79cfbdf74e7dafc),
-    ("12/2335/1301", 2, 0x8c619113d321f45c),
-    ("12/2336/1302", 2, 0x0b1a368c9acf8114),
-    ("11/1167/650", 3, 0x0f4205821900a1fd),
-    ("11/1168/651", 3, 0xa7fd20e71317dfb3),
-    ("10/583/325", 4, 0xc1ab9933e9ed03f5),
-    ("10/584/326", 4, 0x0cdbc8bd6429e05e),
+    ("12/2335/1301", 2, 0xc9aece0b8b22073a),
+    ("12/2336/1302", 2, 0xcacdf9a99a0ae78e),
+    ("11/1167/650", 3, 0x33b4632322acd229),
+    ("11/1168/651", 3, 0xb1767289cc53351c),
+    ("10/583/325", 4, 0x72c8ba309806ce72),
+    ("10/584/326", 4, 0xc0baa5bdbc4259b0),
 ];
 
 /// Golden terrain-layer cover for `COVER_CAMERAS` on the golden relief, then a tall-peak relief
@@ -684,10 +686,12 @@ const GOLDEN_SEED: &[(&str, usize, u64)] = &[
     ("14/9152/5124", 2, 0xa057805df42b8677),
     ("15/18573/10386", 1, 0x0ec008066bc95dc3),
 ];
+/// Seed terrain tiles; the T2 and T4 rows regenerated for perf review 2 item 3 (128-cell height
+/// patch on coarse bands; neither tile touches an airport, which keeps the zoom's lattice).
 const GOLDEN_SEED_TERRAIN: &[(&str, usize, u64)] = &[
     ("14/9342/5211", 0, 0x29aab6a9ec11be0c),
-    ("12/2288/1283", 2, 0x5c30c2a36b2c07bd),
-    ("10/577/322", 4, 0xb3df9045bf89b761),
+    ("12/2288/1283", 2, 0xc7e6da76e1921356),
+    ("10/577/322", 4, 0xca25f5228e785486),
 ];
 
 #[test]

@@ -274,11 +274,11 @@
     "near_zoom": 14,
     "far_zoom": 10,
     "bands": [
-      { "edge_m": 2500.0, "max_error_m": 0.5, "max_edge_m": 0.0, "max_triangles": 4096 },
-      { "edge_m": 7000.0, "max_error_m": 1.5, "max_edge_m": 0.0, "max_triangles": 4096 },
-      { "edge_m": 25000.0, "max_error_m": 4.0, "max_edge_m": 2000.0, "max_triangles": 8192 },
-      { "edge_m": 60000.0, "max_error_m": 10.0, "max_edge_m": 3000.0, "max_triangles": 8192 },
-      { "edge_m": 130000.0, "max_error_m": 25.0, "max_edge_m": 5000.0, "max_triangles": 8192 }
+      { "edge_m": 2500.0, "max_error_m": 0.5, "max_edge_m": 0.0, "max_triangles": 4096, "patch_cells": 0 },
+      { "edge_m": 7000.0, "max_error_m": 1.5, "max_edge_m": 0.0, "max_triangles": 4096, "patch_cells": 0 },
+      { "edge_m": 25000.0, "max_error_m": 4.0, "max_edge_m": 2000.0, "max_triangles": 8192, "patch_cells": 128 },
+      { "edge_m": 60000.0, "max_error_m": 10.0, "max_edge_m": 3000.0, "max_triangles": 8192, "patch_cells": 128 },
+      { "edge_m": 130000.0, "max_error_m": 25.0, "max_edge_m": 5000.0, "max_triangles": 8192, "patch_cells": 128 }
     ]
   },
   "seed": {

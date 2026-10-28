@@ -627,6 +627,11 @@ pub struct TerrainBand {
     pub max_edge_m: f64,
     /// Hard triangle cap per tile.
     pub max_triangles: u32,
+    /// Cells per tile side of the height patch the TIN is built from (a power of two, 16..512);
+    /// 0 = by zoom (z14 64, z13 128, coarser 256: about 22 m at z12..z14). Since perf review 2
+    /// the coarse bands default to 128 (z12 44 m, z11 88 m, z10 176 m at 55 N): a quarter of the
+    /// height evaluations, the drawn surface still within the vector drape lift above it there.
+    pub patch_cells: u32,
 }
 
 /// World seed (profile_version 6, `docs/spec-world-seed.md` section 9.2). Only the keys phase S1
@@ -832,7 +837,7 @@ pub enum TerrainShading {
 
 impl Default for TerrainBand {
     fn default() -> Self {
-        Self { edge_m: 2500.0, max_error_m: 0.5, max_edge_m: 0.0, max_triangles: 4096 }
+        Self { edge_m: 2500.0, max_error_m: 0.5, max_edge_m: 0.0, max_triangles: 4096, patch_cells: 0 }
     }
 }
 
@@ -1276,7 +1281,7 @@ impl Default for Memory {
 
 impl Default for TerrainProfile {
     fn default() -> Self {
-        let band = |edge_m, max_error_m, max_edge_m, max_triangles| TerrainBand { edge_m, max_error_m, max_edge_m, max_triangles };
+        let band = |edge_m, max_error_m, max_edge_m, max_triangles, patch_cells| TerrainBand { edge_m, max_error_m, max_edge_m, max_triangles, patch_cells };
         Self {
             enabled: false,
             seed: 1,
@@ -1306,11 +1311,11 @@ impl Default for TerrainProfile {
             far_zoom: 10,
             // docs/spec-terrain.md 5.2: T0 z14 .. T4 z10.
             bands: vec![
-                band(2500.0, 0.5, 0.0, 4096),
-                band(7000.0, 1.5, 0.0, 4096),
-                band(25_000.0, 4.0, 2000.0, 8192),
-                band(60_000.0, 10.0, 3000.0, 8192),
-                band(130_000.0, 25.0, 5000.0, 8192),
+                band(2500.0, 0.5, 0.0, 4096, 0),
+                band(7000.0, 1.5, 0.0, 4096, 0),
+                band(25_000.0, 4.0, 2000.0, 8192, 128),
+                band(60_000.0, 10.0, 3000.0, 8192, 128),
+                band(130_000.0, 25.0, 5000.0, 8192, 128),
             ],
         }
     }
@@ -1430,6 +1435,7 @@ pub const RANGES: &[(&str, f64, f64)] = &[
     ("terrain.bands[].max_error_m", 0.05, 200.0),
     ("terrain.bands[].max_edge_m", 0.0, 50_000.0),
     ("terrain.bands[].max_triangles", 2.0, 65_000.0),
+    ("terrain.bands[].patch_cells", 0.0, 512.0),
     ("seed.aeroway_class", 6.0, 7.0),
     ("seed.water.blend_m", 50.0, 5000.0),
     ("seed.water.raster_n", 8.0, 256.0),
@@ -1730,6 +1736,9 @@ impl Profile {
                     i - 1,
                     fmt_num(t.bands[i - 1].edge_m)
                 ));
+            }
+            if tb.patch_cells != 0 && (tb.patch_cells < 16 || !tb.patch_cells.is_power_of_two()) {
+                errs.push(format!("terrain.bands[{i}].patch_cells = {} must be 0 (by zoom) or a power of two from 16 to 512", tb.patch_cells));
             }
             if tb.max_edge_m != 0.0 && tb.max_edge_m < 500.0 {
                 errs.push(format!(

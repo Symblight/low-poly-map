@@ -3,7 +3,11 @@
 
 use super::*;
 use crate::geo::{tile_for, Frame, TileKey};
+use crate::geo::MERCATOR_CIRCUMFERENCE;
+use crate::mesher::MeshData;
 use crate::profile::{Profile, TerrainProfile};
+use crate::terrain::sample::lattice_lat_lon;
+use crate::terrain::Terrain;
 
 const VILNIUS: (f64, f64) = (54.6872, 25.2797);
 
@@ -260,7 +264,7 @@ fn flat_land_is_corners_or_the_seed_grid() {
         let band = &p.terrain.bands[ring];
         let (lat, _) = k.center_lat_lon();
         let w = MERCATOR_CIRCUMFERENCE * lat.to_radians().cos() / (1u64 << k.z) as f64;
-        let s = seed_count(w, band.max_edge_m, patch_cells(k.z), band.max_triangles as usize);
+        let s = seed_count(w, band.max_edge_m, band_cells(k.z, band), band.max_triangles as usize);
         assert_eq!(tile.surface_triangles as usize, 2 * (s - 1) * (s - 1), "{k}");
         assert_eq!(tile.h_min, tile.h_max);
     }
@@ -384,7 +388,7 @@ fn sunk_tin_is_never_above_the_height_function() {
                 let tile = build_terrain_tile(key, ring, frame, &t, &p, detail).unwrap();
                 let idx = SurfaceIndex::new(&tile);
                 let ctr = frame.tile_center(key);
-                let cells = patch_cells(z);
+                let cells = band_cells(z, &p.terrain.bands[ring]);
                 let step = (cells / 64).max(1);
                 for j in (0..=cells).step_by(step) {
                     for i in (0..=cells).step_by(step) {
@@ -411,9 +415,10 @@ fn sunk_tin_is_never_above_the_height_function() {
             let width_m = crate::geo::MERCATOR_CIRCUMFERENCE * VILNIUS.0.to_radians().cos() / (1u64 << z) as f64;
             // The sink holds in lattice (Web Mercator) space; the mesh is linear in ENU metres, where
             // a sample sits at slightly other barycentric weights (the projection bends over a
-            // triangle of several km, plus f32 x / z): measured 7.6 mm at z10 detail 2, 2.8 mm at
-            // z12. Slack: 2 mm + 0.4 ppm of the tile width (11 mm at z10, 4 mm at z12).
-            let f32_m = 2e-3 + 4e-7 * width_m;
+            // triangle of several km, plus f32 x / z): measured 20.3 mm at z10 (128 cells, larger
+            // triangles; 7.6 mm with 256), 2.8 mm at z12. Slack: 2 mm + 1.2 ppm of the tile width
+            // (29 mm at z10, 9 mm at z12).
+            let f32_m = 2e-3 + 1.2e-6 * width_m;
             eprintln!(
                 "T{ring} z{z} detail {detail}: lattice samples excess max {lat_ex:+.4} m, deficit {lat_def:.3} m; random interior points excess max {sub_ex:+.4} m, deficit {sub_def:.3} m (error bound {bound} m)"
             );
@@ -422,3 +427,6 @@ fn sunk_tin_is_never_above_the_height_function() {
         }
     }
 }
+
+#[path = "tin_perf_tests.rs"]
+mod perf;

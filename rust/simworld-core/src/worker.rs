@@ -28,7 +28,7 @@ use crate::mesher::{mesh_tile, MeshData};
 use crate::ground::mesh_ground;
 use crate::mvt::{decode_tile_on, Building, DecodedTile, GroundFeatures, TileProjector};
 use crate::seed::SeedWorld;
-use crate::terrain::tin::{build_terrain_tile_colored, TerrainTile};
+use crate::terrain::tin::{build_terrain_tile_until, TerrainTile};
 use crate::terrain::Terrain;
 use crate::profile::Profile;
 use crate::synthetic;
@@ -526,6 +526,21 @@ pub fn build_terrain_data(
     detail: f64,
     seed: Option<&SeedWorld>,
 ) -> Result<TileData, String> {
+    build_terrain_data_until(key, ring, frame, terrain, profile, detail, seed, &|| false).map(|d| d.expect("never stopped"))
+}
+
+/// [`build_terrain_data`] that stops at the TIN build's safe points when `stop()` (`Ok(None)`).
+#[allow(clippy::too_many_arguments)]
+pub fn build_terrain_data_until(
+    key: TileKey,
+    ring: usize,
+    frame: Frame,
+    terrain: &Terrain,
+    profile: &Profile,
+    detail: f64,
+    seed: Option<&SeedWorld>,
+    stop: &dyn Fn() -> bool,
+) -> Result<Option<TileData>, String> {
     let t0 = std::time::Instant::now();
     // A seed world's terrain carries COLOR: r = ground class / 8, g = tint / 8 (api 1.7).
     let color = seed.map(|s| {
@@ -534,8 +549,9 @@ pub fn build_terrain_data(
             [class as f32 / 8.0, tint as f32 / 8.0, 0.0, 1.0]
         }
     });
-    let tile = build_terrain_tile_colored(key, ring, frame, terrain, profile, detail, color.as_ref().map(|c| c as &dyn Fn(f64, f64) -> [f32; 4]))?;
-    Ok(TileData { terrain: Some(Box::new(tile)), cpu_us: t0.elapsed().as_micros() as u64, ..TileData::default() })
+    let color = color.as_ref().map(|c| c as &dyn Fn(f64, f64) -> [f32; 4]);
+    let Some(tile) = build_terrain_tile_until(key, ring, frame, terrain, profile, detail, color, stop)? else { return Ok(None) };
+    Ok(Some(TileData { terrain: Some(Box::new(tile)), cpu_us: t0.elapsed().as_micros() as u64, ..TileData::default() }))
 }
 
 fn panic_text(p: Box<dyn std::any::Any + Send>) -> String {
@@ -980,18 +996,18 @@ impl Worker {
                 self.pool.submit(
                     spec,
                     move |ctx| {
-                        // The TIN build has no inner safe points yet (terrain::tin): checked
-                        // before and after.
-                        if ctx.is_cancelled() {
-                            return JobEnd::Cancelled;
-                        }
+                        // The TIN build stops at its safe points (`build_terrain_tile_until`).
+                        let stop = || ctx.is_cancelled();
                         let result = catch_unwind(AssertUnwindSafe(|| {
-                            build_terrain_data(key, ring, frame, &terrain, &profile, detail, seed.as_deref())
+                            build_terrain_data_until(key, ring, frame, &terrain, &profile, detail, seed.as_deref(), &stop)
                         }))
                         .unwrap_or_else(|p| Err(format!("terrain panic: {}", panic_text(p))));
-                        if result.is_ok() && ctx.is_cancelled() {
-                            return JobEnd::Cancelled;
-                        }
+                        let result = match result {
+                            Ok(None) => return JobEnd::Cancelled,
+                            Ok(Some(_)) if ctx.is_cancelled() => return JobEnd::Cancelled,
+                            Ok(Some(d)) => Ok(d),
+                            Err(e) => Err(e),
+                        };
                         let failed = result.is_err();
                         let _ = tx.send(WorkerMsg::TerrainBuilt { key, ring, job, result });
                         if failed {

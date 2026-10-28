@@ -1506,6 +1506,10 @@
                 "type": "integer",
                 "minimum": 2,
                 "maximum": 65000
+              },
+              "patch_cells": {
+                "description": "Cells per tile side of the height grid the band's TIN is built from and sunk under (a power of two, 16..512). 0 = by zoom: z14 64, z13 128, z12 and coarser 256 (about 22 m at z12-z14 at 55 N). Defaults 0, 0, 128, 128, 128 (z12 44 m, z11 88 m, z10 176 m): fewer height evaluations per coarse tile; the surface between the samples can bend further above the TIN (contract section 9a).",
+                "enum": [0, 16, 32, 64, 128, 256, 512]
               }
             },
             "additionalProperties": false

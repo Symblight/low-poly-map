@@ -7,7 +7,7 @@ use crate::profile::{Profile, TerrainProfile};
 const VILNIUS: (f64, f64) = (54.6872, 25.2797);
 
 fn active(t: TerrainProfile) -> Terrain {
-    Terrain::new(&t, Profile::default().bands(), VILNIUS.0, VILNIUS.1)
+    Terrain::new(&t, VILNIUS.0, VILNIUS.1)
 }
 
 fn default_active() -> Terrain {
@@ -185,28 +185,44 @@ fn tile_range_contains_fine_samples() {
     assert_eq!(checked, 24);
 }
 
-/// The drape rules from the profile bands (spec 6.2, api 1.7): the terrain error visible in each
-/// vector band (the old lift: R0 1 m, R1 3 m, R2 8 m, R3 20 m at detail_scale_max 2) no longer
-/// lifts the ground; it sizes the drape margin (a quarter of it at detail 1: 0.125 / 0.375 / 1 /
-/// 2.5 m) and the foundation (2 x error + 1 m).
+/// The drape table is frozen (Terrain v2 P0, `docs/spec-terrain.md` "Design change: drape
+/// frozen"): [`DRAPE_REFERENCE`] equals what the 1.7 rules derived from the default profile (the
+/// terrain error visible in each vector band, R0 1 m, R1 3 m, R2 8 m, R3 20 m at
+/// detail_scale_max 2: margins a quarter of it at detail 1, foundations 2 x error + 1 m), and a
+/// profile that changes those inputs no longer changes the drape or the foundations.
 #[test]
-fn drape_rules_from_profile() {
+fn drape_table_is_frozen_at_the_default_rules() {
+    use super::reference::{band_error_rule, drape_margin_rule, foundation_rule};
     let p = Profile::default();
     assert_eq!(band_error_rule(&p.terrain.bands, p.terrain.detail_scale_max, p.bands()), [1.0, 3.0, 8.0, 20.0]);
-    assert_eq!(drape_margin_rule(&p.terrain.bands, p.bands()), [0.125, 0.375, 1.0, 2.5]);
+    assert_eq!(drape_margin_rule(&p.terrain.bands, p.bands()), DRAPE_REFERENCE.margin_m);
+    assert_eq!(foundation_rule(&p.terrain.bands, p.terrain.detail_scale_max, p.bands()), DRAPE_REFERENCE.foundation_m);
+    assert_eq!(DRAPE_REFERENCE.margin_m, [0.125, 0.375, 1.0, 2.5]);
+    assert_eq!(DRAPE_REFERENCE.foundation_m, [3.0, 7.0, 17.0, 41.0]);
     let t = default_active();
-    assert_eq!([0, 1, 2, 3].map(|r| t.drape_margin_m(r)), [0.125, 0.375, 1.0, 2.5]);
-    assert_eq!([0, 1, 2, 3].map(|r| t.foundation_m(r)), [3.0, 7.0, 17.0, 41.0]);
-    // detail_scale_max 1 halves the foundations, not the margins; narrower vector bands reach
-    // fewer terrain bands.
+    assert_eq!([0, 1, 2, 3].map(|r| t.drape_margin_m(r)), DRAPE_REFERENCE.margin_m);
+    assert_eq!([0, 1, 2, 3].map(|r| t.foundation_m(r)), DRAPE_REFERENCE.foundation_m);
+    // Live inputs that the 1.7 rules read: detail_scale_max, vector band edges, terrain band
+    // errors and edges. The rules would move; the terrain's drape does not.
     let p2 = crate::profile::resolve(
         None,
-        Some(&serde_json::json!({ "terrain": { "detail_scale_max": 1.0 }, "bands": { "r1_edge_m": 2000.0 } })),
+        Some(&serde_json::json!({
+            "terrain": { "enabled": true, "detail_scale_max": 1.0, "bands": [
+                { "edge_m": 2500.0, "max_error_m": 3.0, "max_edge_m": 0.0, "max_triangles": 4096 },
+                { "edge_m": 7000.0, "max_error_m": 6.0, "max_edge_m": 0.0, "max_triangles": 4096 },
+                { "edge_m": 25000.0, "max_error_m": 12.0, "max_edge_m": 0.0, "max_triangles": 4096 },
+                { "edge_m": 60000.0, "max_error_m": 30.0, "max_edge_m": 0.0, "max_triangles": 4096 },
+                { "edge_m": 130000.0, "max_error_m": 60.0, "max_edge_m": 0.0, "max_triangles": 4096 } ] },
+            "bands": { "r1_edge_m": 2000.0, "r3_edge_m": 40000.0, "hysteresis": 1.3 } })),
         &crate::NullLog,
     )
     .unwrap();
-    assert_eq!(band_error_rule(&p2.terrain.bands, 1.0, p2.bands()), [0.5, 0.5, 4.0, 10.0]);
-    assert_eq!(drape_margin_rule(&p2.terrain.bands, p2.bands()), [0.125, 0.125, 1.0, 2.5]);
+    assert_ne!(drape_margin_rule(&p2.terrain.bands, p2.bands()), DRAPE_REFERENCE.margin_m, "the override reaches the 1.7 rule");
+    assert_ne!(foundation_rule(&p2.terrain.bands, p2.terrain.detail_scale_max, p2.bands()), DRAPE_REFERENCE.foundation_m);
+    let t2 = Terrain::from_profile(&p2, VILNIUS.0, VILNIUS.1);
+    assert!(t2.is_active());
+    assert_eq!([0, 1, 2, 3].map(|r| t2.drape_margin_m(r)), DRAPE_REFERENCE.margin_m);
+    assert_eq!([0, 1, 2, 3].map(|r| t2.foundation_m(r)), DRAPE_REFERENCE.foundation_m);
 }
 
 /// Water snap: a shore vertex takes the lake level (the minimum around it); the same vertex

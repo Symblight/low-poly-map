@@ -148,7 +148,7 @@ fn summary(w: &SeedFiles, params: WaterParams, warnings: &mut Vec<String>) -> St
     ));
     // The index the library builds at load (lake levels from the default procedural terrain).
     let tp = simworld_core::profile::TerrainProfile { enabled: true, flat_radius_m: 0.0, flat_blend_m: 0.0, ..Default::default() };
-    let terrain = simworld_core::Terrain::new(&tp, simworld_core::Profile::default().bands(), 0.0, 0.0);
+    let terrain = simworld_core::Terrain::new(&tp, 0.0, 0.0);
     let field = |lat: f64, lon: f64| terrain.height(lat, lon);
     let t = Instant::now();
     let idx = WaterIndex::build(&w.water, params, &field);

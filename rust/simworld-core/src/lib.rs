@@ -43,6 +43,8 @@ pub mod world;
 #[cfg(test)]
 mod golden_tests;
 #[cfg(test)]
+mod height_golden_tests;
+#[cfg(test)]
 mod integration_tests;
 #[cfg(test)]
 mod lifecycle_tests;

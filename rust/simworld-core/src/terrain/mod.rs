@@ -31,8 +31,8 @@ pub mod tin;
 pub use sample::PatchSampler;
 
 use crate::geo::TileKey;
-use crate::profile::{TerrainBand, TerrainProfile};
-use crate::rings::{BandParams, RING_COUNT};
+use crate::profile::TerrainProfile;
+use crate::rings::RING_COUNT;
 
 /// Sphere radius of the noise domain (mean Earth radius, m). Not a geodesy constant: it only
 /// fixes where the noise lives, so it must never change (it would move every hill).
@@ -181,11 +181,11 @@ pub struct Terrain {
     offset_m: f64,
     water_snap_m: f64,
     drape_step_m: f64,
-    /// Drape margin per vector band (m; [`drape_margin_rule`]): ground vertices sit this much
+    /// Drape margin per vector band (m; [`DRAPE_REFERENCE`]): ground vertices sit this much
     /// above the exact height, so a draped edge that dips under the surface by up to the margin
     /// still stays on or above it.
     margin_m: [f32; RING_COUNT],
-    /// Foundation depth per vector band (m; [`foundation_rule`]).
+    /// Foundation depth per vector band (m; [`DRAPE_REFERENCE`]).
     foundation_m: [f32; RING_COUNT],
     /// [min, max] of [`Terrain::height`] (exaggeration and offset applied).
     bounds: [f64; 2],
@@ -230,9 +230,10 @@ impl Terrain {
         }
     }
 
-    /// Active terrain from the profile section `terrain`, the vector bands (drape margin and foundation rules)
-    /// and the configure origin (center of the flat zone; re-centering does not move it).
-    pub fn new(t: &TerrainProfile, vector_bands: &BandParams, origin_lat: f64, origin_lon: f64) -> Self {
+    /// Active terrain from the profile section `terrain` and the configure origin (center of the
+    /// flat zone; re-centering does not move it). The drape margin and foundation depth come from
+    /// the frozen [`DRAPE_REFERENCE`], not from the profile's bands.
+    pub fn new(t: &TerrainProfile, origin_lat: f64, origin_lon: f64) -> Self {
         let field = FieldParams::from_profile(t);
         let flat_center = sphere_point(origin_lat, origin_lon);
         let flat_height = field_at(&field, flat_center);
@@ -249,8 +250,8 @@ impl Terrain {
             offset_m: off,
             water_snap_m: t.water_snap_m,
             drape_step_m: t.drape_step_m,
-            margin_m: drape_margin_rule(&t.bands, vector_bands),
-            foundation_m: foundation_rule(&t.bands, t.detail_scale_max, vector_bands),
+            margin_m: DRAPE_REFERENCE.margin_m,
+            foundation_m: DRAPE_REFERENCE.foundation_m,
             bounds: [lo * ex + off, hi * ex + off],
             seed: None,
         }
@@ -284,7 +285,7 @@ impl Terrain {
 
     /// [`Terrain::new`] from a resolved profile.
     pub fn from_profile(p: &crate::profile::Profile, origin_lat: f64, origin_lon: f64) -> Self {
-        Self::new(&p.terrain, p.bands(), origin_lat, origin_lon)
+        Self::new(&p.terrain, origin_lat, origin_lon)
     }
 
     pub fn is_active(&self) -> bool {
@@ -350,7 +351,7 @@ impl Terrain {
         self.bounds[1]
     }
 
-    /// Drape margin of the vector band `ring` (0 when off; [`drape_margin_rule`]): ground
+    /// Drape margin of the vector band `ring` (0 when off; [`DRAPE_REFERENCE`]): ground
     /// vertices lie at `height + weight x margin + level x step`. Not a lift over the terrain
     /// mesh: the terrain mesh is sunk under the height function instead (contract section 9a),
     /// so the vector world never depends on the terrain LOD.
@@ -389,7 +390,7 @@ impl Terrain {
         }
     }
 
-    /// Foundation depth of buildings in band `ring` ([`foundation_rule`]): every wall of a part
+    /// Foundation depth of buildings in band `ring` ([`DRAPE_REFERENCE`]): every wall of a part
     /// standing on the ground reaches this far below the exact ground at its vertices (0 when
     /// off: no foundation quads).
     pub fn foundation_m(&self, ring: usize) -> f32 {
@@ -451,44 +452,71 @@ impl Terrain {
     }
 }
 
-/// Worst terrain-mesh error that can be on screen in vector band N (the old "lift rule",
-/// `docs/spec-terrain.md` 6.2): the largest `max_error_m * detail` of every terrain band whose
-/// slant-distance range `[previous edge, edge]` intersects `[0, rN_edge * hysteresis]`.
-pub fn band_error_rule(bands: &[TerrainBand], detail: f64, vector: &BandParams) -> [f32; RING_COUNT] {
-    std::array::from_fn(|ring| {
-        let reach = vector.edge_m[ring] * vector.hysteresis;
-        let mut inner = 0.0;
-        let mut err = 0.0f64;
-        for b in bands {
-            if inner < reach {
-                err = err.max(b.max_error_m * detail);
+/// The drape and foundation table of the vector world (frozen 2026-10-28, Tiles v2 + Terrain v2
+/// step P0; `docs/spec-terrain.md` "Design change: drape frozen"). Until then both rows were
+/// derived at configure time from the terrain bands' `max_error_m`, `terrain.detail_scale_max`
+/// and the vector band edges x hysteresis ([`reference::band_error_rule`]); those inputs are
+/// about to change meaning (screen-space-error bands), so the drape no longer reads them. The
+/// values are exactly what the 1.7 rules gave with the default profile, so default output is
+/// bit for bit unchanged (golden hashes). A profile override of those keys no longer moves the
+/// drawn ground, the lights or the foundations. Index = vector band R0..R3.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DrapeReference {
+    /// Drape margin per vector band (m): a quarter of the 1.7 band error at detail 1, at least
+    /// [`crate::ground::DRAPE_FLAT_TOLERANCE_M`]. Ground vertices sit at
+    /// `height + weight x margin + level x step`; draped edges are subdivided once the height
+    /// along them rises more than the margin above the straight edge (or falls more than twice
+    /// it below), so the drawn ground is never under the exact height function at the tested
+    /// points and at most `3 x margin` above it, plus the stacking level. The terrain mesh is
+    /// sunk under the height function at every detail (contract section 9a), so the margin does
+    /// not have to cover any terrain-mesh error.
+    pub margin_m: [f32; RING_COUNT],
+    /// Foundation depth per vector band (m): `2 x` the 1.7 band error at `detail_scale_max` 2,
+    /// `+ 1 m`: walls of a ground-standing part reach this far under the exact ground, so the
+    /// sunk terrain mesh (error + sink, each at most the band error) does not open a gap under a
+    /// building at the default terrain bands.
+    pub foundation_m: [f32; RING_COUNT],
+}
+
+/// The frozen table (see [`DrapeReference`]): margins R0 0.125, R1 0.375, R2 1, R3 2.5 m;
+/// foundations R0 3, R1 7, R2 17, R3 41 m.
+pub const DRAPE_REFERENCE: DrapeReference =
+    DrapeReference { margin_m: [0.125, 0.375, 1.0, 2.5], foundation_m: [3.0, 7.0, 17.0, 41.0] };
+
+/// The 1.7 derivation of [`DRAPE_REFERENCE`] from live profile data, kept only so a test can show
+/// that the frozen table equals it at the default profile (provenance). Not used by the library.
+#[cfg(test)]
+pub(crate) mod reference {
+    use crate::profile::TerrainBand;
+    use crate::rings::{BandParams, RING_COUNT};
+
+    /// Worst terrain-mesh error that could be on screen in vector band N (the old "lift rule",
+    /// `docs/spec-terrain.md` 6.2): the largest `max_error_m * detail` of every terrain band
+    /// whose slant-distance range `[previous edge, edge]` intersects `[0, rN_edge * hysteresis]`.
+    pub fn band_error_rule(bands: &[TerrainBand], detail: f64, vector: &BandParams) -> [f32; RING_COUNT] {
+        std::array::from_fn(|ring| {
+            let reach = vector.edge_m[ring] * vector.hysteresis;
+            let mut inner = 0.0;
+            let mut err = 0.0f64;
+            for b in bands {
+                if inner < reach {
+                    err = err.max(b.max_error_m * detail);
+                }
+                inner = b.edge_m;
             }
-            inner = b.edge_m;
-        }
-        err as f32
-    })
-}
+            err as f32
+        })
+    }
 
-/// Drape margin of vector band N (`docs/spec-terrain.md` 6.2, the drape rule since api 1.7):
-/// a quarter of [`band_error_rule`] at detail 1, at least 0.1 m (defaults R0 0.125 m,
-/// R1 0.375 m, R2 1 m, R3 2.5 m). Ground vertices sit this much above the exact height, and a draped edge is
-/// subdivided once the height along it rises more than the margin above the straight edge (or
-/// falls more than twice the margin below it), so the drawn ground is never under the exact
-/// height function (at the tested points) and at most `3 x margin` above it, plus the stacking
-/// level. Independent of `detail_scale_max` and of the terrain mesh: the terrain mesh is sunk
-/// under the height function at every detail (contract section 9a).
-pub fn drape_margin_rule(bands: &[TerrainBand], vector: &BandParams) -> [f32; RING_COUNT] {
-    band_error_rule(bands, 1.0, vector).map(|e| (e * 0.25).max(crate::ground::DRAPE_FLAT_TOLERANCE_M as f32))
-}
+    /// 1.7 drape margin: a quarter of [`band_error_rule`] at detail 1, at least 0.1 m.
+    pub fn drape_margin_rule(bands: &[TerrainBand], vector: &BandParams) -> [f32; RING_COUNT] {
+        band_error_rule(bands, 1.0, vector).map(|e| (e * 0.25).max(crate::ground::DRAPE_FLAT_TOLERANCE_M as f32))
+    }
 
-/// Foundation depth of vector band N: the deepest the sunk terrain mesh can lie under the
-/// exact height where a building of that band stands (its error below the height plus its sink,
-/// each at most the error bound), `2 x band_error_rule(detail_scale_max) + 1 m` (defaults R0
-/// 3 m, R1 7 m, R2 17 m). Walls end at the exact ground; the foundation below them is
-/// windowless and hidden by the ground unless the terrain mesh lies lower there, so its depth
-/// costs nothing visible.
-pub fn foundation_rule(bands: &[TerrainBand], detail_scale_max: f64, vector: &BandParams) -> [f32; RING_COUNT] {
-    band_error_rule(bands, detail_scale_max, vector).map(|e| 2.0 * e + 1.0)
+    /// 1.7 foundation depth: `2 x band_error_rule(detail_scale_max) + 1 m`.
+    pub fn foundation_rule(bands: &[TerrainBand], detail_scale_max: f64, vector: &BandParams) -> [f32; RING_COUNT] {
+        band_error_rule(bands, detail_scale_max, vector).map(|e| 2.0 * e + 1.0)
+    }
 }
 
 #[cfg(test)]

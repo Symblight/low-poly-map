@@ -315,7 +315,7 @@ fn measure_water_index() {
         json.len() as f64 / 1e6
     );
     let terrain_profile = crate::profile::TerrainProfile { enabled: true, flat_radius_m: 0.0, flat_blend_m: 0.0, ..Default::default() };
-    let terrain = crate::terrain::Terrain::new(&terrain_profile, crate::profile::Profile::default().bands(), 56.0, 24.0);
+    let terrain = crate::terrain::Terrain::new(&terrain_profile, 56.0, 24.0);
     let fieldf = |lat: f64, lon: f64| terrain.height(lat, lon);
     for n in [64usize, 32] {
         let t = Instant::now();

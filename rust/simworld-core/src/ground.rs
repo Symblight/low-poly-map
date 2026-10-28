@@ -970,7 +970,7 @@ mod tests {
         let key = tile_for(lat0, lon0, 16);
         let (lat, lon) = key.center_lat_lon();
         let frame = Frame::new(lat, lon);
-        let terrain = Terrain::new(&tp, dp().bands(), lat, lon);
+        let terrain = Terrain::new(&tp, lat, lon);
         let p = TileProjector::new(key, frame, 4096.0).with_terrain(terrain.clone());
         let g = GroundFeatures {
             areas: vec![GroundArea { class: GROUND_WATER, level: 7, id: 1, rings: vec![sq(500.0, 500.0, 3000.0)], tint: 0, sub: 0, cut: false }],
@@ -1009,7 +1009,7 @@ mod tests {
         let prof = dp();
         let tp = TerrainProfile { enabled: true, ..TerrainProfile::default() };
         let origin = (VILNIUS.0, VILNIUS.1);
-        let terrain = Terrain::new(&tp, prof.bands(), origin.0, origin.1);
+        let terrain = Terrain::new(&tp, origin.0, origin.1);
         // Same spot (~8 km north-east of the origin) at the zoom of each band.
         let (lat0, lon0) = (origin.0 + 0.05, origin.1 + 0.1);
         let mut counts = Vec::new();

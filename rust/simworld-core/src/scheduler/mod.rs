@@ -104,6 +104,7 @@ mod data_needs;
 mod fade;
 mod landmarks;
 mod plan_memo;
+mod presence;
 pub mod sim;
 mod state;
 mod terrain_plan;
@@ -205,6 +206,8 @@ pub struct Scheduler {
     detail_gen: u32,
     /// Terrain layer (G2): the pure per-key error proxy the cover refines by.
     proxy: Option<ErrorProxy>,
+    /// Reused presence memo (`presence`; valid within one pass only).
+    presence: presence::Presence,
     /// Async probes of cold boxes / error proxies (`boxes`; `None` = probed inline).
     box_requests: Option<boxes::BoxRequests>,
     /// Terrain layer: the last plan met a value still on the way (not reusable).
@@ -347,6 +350,7 @@ impl Scheduler {
             proxy: None,
             box_requests: None,
             plan_incomplete: false,
+            presence: Default::default(),
             terrain_view: crate::rings::LodView::default(),
             sse_m_per_m: 0.0,
             guard_m: [0.0; MAX_RINGS],
@@ -611,6 +615,9 @@ impl Scheduler {
         if kind == LayerKind::Terrain {
             self.plan_terrain_splits(&views, &grounds);
         }
+        // No `held` flag changes during the walk: one presence memo for all of it.
+        let mut presence = std::mem::take(&mut self.presence);
+        presence.clear();
         while let Some((k, inherited_h, frozen)) = self.stack.pop() {
             let Some(ring) = l.ring_for_zoom(k.z) else { continue };
             if frozen {
@@ -625,7 +632,7 @@ impl Scheduler {
                 }
                 continue;
             }
-            let present = self.present(k);
+            let present = self.present_in(k, &mut presence);
             let clustered = self.clustered;
             let min_lit_ring = self.profile.lit_min_ring();
             let fading = self.fades.contains_key(&k);
@@ -754,6 +761,7 @@ impl Scheduler {
             }
         }
 
+        self.presence = presence;
         // 2. Everything not visited left the cover: subtrees go in one unload batch.
         let epoch = self.epoch;
         let unloading = &mut self.unloading;
@@ -1276,27 +1284,6 @@ impl Scheduler {
         self.entries.get(&k).is_some_and(|e| e.held)
     }
 
-    /// Contract "present": uploaded, or all 4 children present.
-    pub fn present(&self, k: TileKey) -> bool {
-        self.held(k) || (k.z < self.layer.leaf_zoom && children(k).iter().all(|&c| self.present(c)))
-    }
-
-    /// Present, and its sibling group present all the way up to the root: children
-    /// delivered under it can never overlap a coarser visible tile.
-    fn effective(&self, k: TileKey) -> bool {
-        let mut k = k;
-        loop {
-            if !self.present(k) {
-                return false;
-            }
-            let Some(p) = self.layer.parent(k) else { return true };
-            if !self.layer.siblings(k).iter().all(|&s| self.present(s)) {
-                return false;
-            }
-            k = p;
-        }
-    }
-
     /// All 4 children are uploaded (held directly, not merely present).
     fn children_held(&self, k: TileKey) -> bool {
         k.z < self.layer.leaf_zoom && children(k).iter().all(|&c| self.held(c))
@@ -1482,11 +1469,6 @@ impl Scheduler {
         }
     }
 
-    /// Root, or the parent is effective and not part of a fade (no tile in two fades).
-    fn deliverable(&self, k: TileKey) -> bool {
-        k.z == self.layer.root_zoom || self.layer.parent(k).is_some_and(|p| self.effective(p) && !self.in_fade(p))
-    }
-
     /// Best tile to hand to Godot: fresh tiles whose parent is effective, nearest to the
     /// camera first (slant distance; ring, key as tie-breakers); with `allow_redelivery` and no
     /// fresh tile, a light-mode / terrain-detail re-delivery.
@@ -1507,9 +1489,12 @@ impl Scheduler {
             a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)).then(a.2.cmp(&b.2)).then(a.3.cmp(&b.3))
         };
         let mut best: Option<(f64, f64, usize, TileKey)> = None;
+        // Nothing is taken or dropped during this call: one presence memo for every tile.
+        let mut memo = std::mem::take(&mut self.presence);
+        memo.clear();
         for &k in &self.ready {
             let e = &self.entries[&k];
-            if e.held || e.frozen || !self.deliverable(k) {
+            if e.held || e.frozen || !self.deliverable_in(k, &mut memo) {
                 continue;
             }
             let o = self.order_key(e);
@@ -1518,6 +1503,7 @@ impl Scheduler {
             }
         }
         // Landmark tiles (api 1.11): fresh deliveries by their own distance, no parent rule.
+        self.presence = memo;
         for e in self.landmarks.entries.values() {
             if matches!(e.state, LmState::Ready(_)) {
                 let o = (e.cam_d, e.cam_d, 0, e.key);

@@ -217,7 +217,7 @@ fn real_overview_chunk_profile() {
     });
     time("street lamps", &mut || {
         let mut l = crate::lights::LightSet::default();
-        l.set_streets(&dt.ground.roads, &proj, profile);
+        l.set_streets(&dt.ground.roads, &proj, ring, profile);
     });
     time("max height over lights", &mut || {
         let _ = dt.lights.iter().filter(|b| proj.place(b).is_some()).map(|b| crate::mesher::resolve(b, profile).height).fold(0.0f32, f32::max);

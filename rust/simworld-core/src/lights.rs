@@ -11,7 +11,8 @@
 //! the points are clustered into 100 m cells; a cluster sits at the mean position of its
 //! lights, at their mean roof height. Output order is deterministic (cells sorted by index).
 //!
-//! Street lamps (`street_lights` / `street_light_colors`, world profile `lights.street`): points every `spacing_m` along the
+//! Street lamps (`street_lights` / `street_light_colors`, world profile `lights.street`; `lights/street.rs`, per-band spacing
+//! since api 1.11): points every `spacing_m` along the
 //! centerline of each lit road (tagged `lit`, or of class `untagged_max_class` or more important), `height_m` above the
 //! ground, in `lights.street.color`, a = `intensity(1)`. Only points inside the tile rectangle are kept, so a road crossing a
 //! seam is lit once. Clustered into the same cells as the building lights, as a separate set (they keep their color).
@@ -26,6 +27,9 @@
 use crate::mesher::{resolve, PROFILE_DARK};
 use crate::mvt::{Building, RoadLine, TileProjector};
 use crate::profile::Profile;
+
+mod street;
+pub use street::{lamp_count, street_points};
 
 /// Intensity weight of a point that stands for `count` lights.
 pub fn intensity(count: u32) -> f32 {
@@ -64,9 +68,9 @@ impl LightSet {
         let (clustered_positions, clustered_colors) = cluster(&positions, &colors, profile.cluster_cell_m());
         Self { positions, colors, clustered_positions, clustered_colors, ..Self::default() }
     }
-    /// Adds the street lamps (and their clusters) of a tile's roads.
-    pub fn set_streets(&mut self, roads: &[RoadLine], proj: &TileProjector, profile: &Profile) {
-        let (p, c) = street_points(roads, proj, profile);
+    /// Adds the street lamps (and their clusters) of a tile's roads in band `ring`.
+    pub fn set_streets(&mut self, roads: &[RoadLine], proj: &TileProjector, ring: usize, profile: &Profile) {
+        let (p, c) = street_points(roads, proj, ring, profile);
         let (cp, cc) = cluster(&p, &c, profile.cluster_cell_m());
         (self.street_positions, self.street_colors, self.clustered_street_positions, self.clustered_street_colors) = (p, c, cp, cc);
     }
@@ -234,56 +238,9 @@ fn beacon_points_placed<'a>(placed: impl Iterator<Item = (&'a Building, [f32; 2]
     (pos, col)
 }
 
-/// Salt of the per-road lamp-type hash (keeps it independent of other uses of the OSM id).
-const STREET_TYPE_SALT: u64 = 0x57EE_71A3_9C2D_4B61;
-
-/// Street lamps every `spacing_m` along each lit road's centerline (the first half a spacing from the line start), inside
-/// the tile rectangle only, `height_m` above the ground. Roads come sorted (`GroundFeatures::sort`), so the order is
-/// deterministic.
-pub fn street_points(roads: &[RoadLine], proj: &TileProjector, profile: &Profile) -> (Vec<[f32; 3]>, Vec<[f32; 4]>) {
-    let s = &profile.lights.street;
-    let spacing = s.spacing_m.max(1.0);
-    // The tile rectangle, or the chunk's (a cut projector): each lamp lands in exactly one.
-    let rect = proj.rect();
-    let main = [s.color[0] as f32, s.color[1] as f32, s.color[2] as f32, intensity(1)];
-    let alt = [s.alt_color[0] as f32, s.alt_color[1] as f32, s.alt_color[2] as f32, intensity(1)];
-    let mut pos = Vec::new();
-    let mut col = Vec::new();
-    let mut proj_pts: Vec<([f64; 2], f64)> = Vec::new();
-    for r in roads.iter().filter(|r| r.lit || (r.class as u32) <= s.untagged_max_class) {
-        // Lamp type per road (OSM id): the same in every tile and band the road crosses.
-        let u = (crate::mvt::splitmix64(r.id ^ STREET_TYPE_SALT) >> 11) as f64 / (1u64 << 53) as f64;
-        let color = if u < s.alt_share { alt } else { main };
-        for line in &r.lines {
-            proj_pts.clear();
-            proj_pts.extend(line.iter().map(|&px| proj.project_h(px)));
-            let mut next = 0.5 * spacing; // arc length of the next lamp
-            let mut walked = 0.0;
-            for i in 1..line.len() {
-                let ((a, _), (b, _)) = (proj_pts[i - 1], proj_pts[i]);
-                let seg = crate::math::hypot(b[0] - a[0], b[1] - a[1]);
-                while next <= walked + seg {
-                    let t = if seg > 0.0 { (next - walked) / seg } else { 0.0 };
-                    let px = [line[i - 1][0] + (line[i][0] - line[i - 1][0]) * t, line[i - 1][1] + (line[i][1] - line[i - 1][1]) * t];
-                    if (rect.x0..rect.x1).contains(&px[0]) && (rect.y0..rect.y1).contains(&px[1]) {
-                        let e = a[0] + (b[0] - a[0]) * t;
-                        let n = a[1] + (b[1] - a[1]) * t;
-                        // The terrain under the lamp, not the chord between the polyline ends.
-                        let h = proj.ground_at(px) + s.height_m;
-                        pos.push([e as f32, h as f32, -n as f32]);
-                        col.push(color);
-                    }
-                    next += spacing;
-                }
-                walked += seg;
-            }
-        }
-    }
-    (pos, col)
-}
-
 /// Cluster single lights into `cell` x `cell` m cells (tile-local grid on x/z). Each cluster:
-/// mean position (x, z), mean roof height (y), average rgb, a = `intensity(count)`.
+/// mean position (x, z), mean roof height (y), average rgb, a = `intensity(count)` with `count` the lamps its points stand
+/// for (`lamp_count` of their alpha: 1 for a single light, more for a far street lamp, api 1.11).
 pub fn cluster(pos: &[[f32; 3]], col: &[[f32; 4]], cell: f32) -> (Vec<[f32; 3]>, Vec<[f32; 4]>) {
     // (cell x, cell z, index): sort for a deterministic order independent of input order.
     let mut idx: Vec<(i32, i32, u32)> = pos
@@ -298,7 +255,7 @@ pub fn cluster(pos: &[[f32; 3]], col: &[[f32; 4]], cell: f32) -> (Vec<[f32; 3]>,
     while i < idx.len() {
         let (cx, cz, _) = idx[i];
         let mut sum = [0.0f64; 6];
-        let mut n = 0u32;
+        let (mut n, mut lamps) = (0u32, 0u32);
         while i < idx.len() && idx[i].0 == cx && idx[i].1 == cz {
             let k = idx[i].2 as usize;
             for a in 0..3 {
@@ -306,11 +263,12 @@ pub fn cluster(pos: &[[f32; 3]], col: &[[f32; 4]], cell: f32) -> (Vec<[f32; 3]>,
                 sum[3 + a] += col[k][a] as f64;
             }
             n += 1;
+            lamps += lamp_count(col[k][3]);
             i += 1;
         }
         let f = 1.0 / n as f64;
         out_p.push([(sum[0] * f) as f32, (sum[1] * f) as f32, (sum[2] * f) as f32]);
-        out_c.push([(sum[3] * f) as f32, (sum[4] * f) as f32, (sum[5] * f) as f32, intensity(n)]);
+        out_c.push([(sum[3] * f) as f32, (sum[4] * f) as f32, (sum[5] * f) as f32, intensity(lamps)]);
     }
     (out_p, out_c)
 }
@@ -320,10 +278,6 @@ mod tests {
     use super::*;
     use crate::mvt::{Landuse, OsmType};
 
-
-    fn road(class: u8, lit: bool, line: Vec<[f64; 2]>) -> RoadLine {
-        RoadLine { class, link: false, minor: false, lit, id: 1, lines: vec![line] }
-    }
 
     /// Beacons from geometry: none below `min_height_m`, the four roof corners (+ intermediate rings every `level_spacing_m`)
     /// on a wide tall building, one centre beacon on a narrow one; one color and one blink phase per building.
@@ -377,48 +331,6 @@ mod tests {
         assert_eq!(beacon_points(std::slice::from_ref(&tall), &proj, &Profile::new(w).unwrap()).0.len(), 4);
         let green = (0..1000u64).filter(|&id| beacon_points(&[mk(id, 70.0, 10.0)], &proj, &p).1[0][1] == 1.0).count();
         assert!(((s.alt_share * 1000.0) as usize).abs_diff(green) < 50, "{green} of 1000 green");
-    }
-
-    /// Lamps every `spacing_m` from half a spacing in, `height_m` up, in the street color; only inside the tile; lit or
-    /// important-enough roads only.
-    #[test]
-    fn street_lamps_spacing_tile_clip_and_lit_rule() {
-        let frame = crate::geo::Frame::new(54.6872, 25.2797);
-        let key = crate::geo::tile_for(54.6872, 25.2797, 16);
-        let proj = TileProjector::new(key, frame, 4096.0);
-        let p = Profile::default();
-        let s = &p.lights.street;
-        // A straight east-west road across the tile and 200 px beyond both edges.
-        let y = 2048.0;
-        let line = vec![[-200.0, y], [4296.0, y]];
-        let (pos, col) = street_points(&[road(crate::mvt::ROAD_RESIDENTIAL, false, line.clone())], &proj, &p);
-        let tile_w = proj.project64([4096.0, y])[0] - proj.project64([0.0, y])[0];
-        let expect = (tile_w / s.spacing_m).round() as usize;
-        assert!((pos.len() as i64 - expect as i64).abs() <= 1, "{} lamps, expected ~{expect}", pos.len());
-        for w in pos.windows(2) {
-            assert!(((w[1][0] - w[0][0]) as f64 - s.spacing_m).abs() < 0.5, "spacing {:?}", w);
-        }
-        let half = 0.5 * tile_w as f32 + 1.0;
-        assert!(pos.iter().all(|q| q[0].abs() <= half && (q[1] as f64 - s.height_m).abs() < 1e-3));
-        // One lamp type per road: every lamp of this road in the main or the alt color, never mixed.
-        assert!(col.iter().all(|c| *c == col[0]));
-        assert!(col[0] == [1.0, 0.42, 0.1, intensity(1)] || col[0] == [0.78, 0.86, 1.0, intensity(1)]);
-        // Over many roads about alt_share of them get the alt color.
-        let alt_roads = (0..1000u64)
-            .filter(|&id| {
-                let mut r = road(crate::mvt::ROAD_RESIDENTIAL, false, vec![[100.0, y], [400.0, y]]);
-                r.id = id;
-                street_points(&[r], &proj, &p).1[0][2] == 1.0
-            })
-            .count();
-        assert!((250..350).contains(&alt_roads), "{alt_roads} of 1000 roads alt-colored");
-        // Untagged "other" roads are dark, tagged ones lit; untagged_max_class 0 = tagged only.
-        assert!(street_points(&[road(crate::mvt::ROAD_OTHER, false, line.clone())], &proj, &p).0.is_empty());
-        assert_eq!(street_points(&[road(crate::mvt::ROAD_OTHER, true, line.clone())], &proj, &p).0.len(), pos.len());
-        let mut w = crate::profile::WorldProfile::default();
-        w.lights.street.untagged_max_class = 0;
-        let tagged_only = Profile::new(w).unwrap();
-        assert!(street_points(&[road(crate::mvt::ROAD_PRIMARY, false, line)], &proj, &tagged_only).0.is_empty());
     }
 
     #[test]

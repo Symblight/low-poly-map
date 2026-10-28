@@ -493,7 +493,7 @@ fn finish_tile(
     }
     let mut lights = if ring >= profile.lights.min_ring as usize { LightSet::from_buildings(&buildings, profile) } else { LightSet::default() };
     if want_streets {
-        lights.set_streets(&gf.roads, proj, profile);
+        lights.set_streets(&gf.roads, proj, ring, profile);
     }
     if ring >= profile.lights.beacons.min_ring as usize {
         lights.set_beacons(&buildings, proj, profile);

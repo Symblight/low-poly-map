@@ -259,3 +259,60 @@ fn perf_stream_overview_decode() {
     }
     eprintln!("overview decode with terrain, 9 tiles around 11/1167/650: total {total:.0} ms CPU, worst {:.0} ms ({}), most blocks in a tile {blocks}", worst.0, worst.1);
 }
+
+/// Street lamps on the R2 / R3 chunks of the real archive (perf review 3 item 3): lamps per
+/// chunk (mean / max) and the lamp count they stand for, with `lights.street.spacing_scale`
+/// all 1 (before) and at the default (after), for the 9 overview tiles around the origin.
+#[test]
+#[ignore]
+fn perf_stream_far_street_lamps() {
+    let Ok(v2) = std::env::var("SIMWORLD_V2_ARCHIVE") else {
+        eprintln!("SIMWORLD_V2_ARCHIVE not set; skipped");
+        return;
+    };
+    let (url, _) = crate::data_world_tests::serve(std::fs::read(v2).expect("v2 archive"));
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let f = crate::fetch::Fetcher::new(&url, "", Arc::new(std::sync::atomic::AtomicU64::new(0)), crate::fetch::FetchParams::default(), Box::new(|_| {})).unwrap();
+    let frame = crate::geo::Frame::new(VILNIUS.0, VILNIUS.1);
+    let terrain = crate::Terrain::flat();
+    for scale in [[1.0, 1.0, 1.0, 1.0], crate::profile::WorldProfile::default().lights.street.spacing_scale] {
+        let mut w = crate::profile::WorldProfile::default();
+        w.lights.street.spacing_scale = scale;
+        let profile = crate::profile::Profile::new(w).unwrap();
+        // Per ring 2, 3: (chunks, sprites, max sprites, lamps).
+        let mut rows = [(0usize, 0usize, 0usize, 0u64); 2];
+        for dy in 0..3u32 {
+            for dx in 0..3u32 {
+                let key = crate::geo::TileKey::new(11, 1166 + dx, 649 + dy);
+                let Ok((bytes, _)) = rt.block_on(f.fetch(key)) else { continue };
+                let dt = crate::data::decode_overview_tile(key, frame, &terrain, &bytes, &profile).unwrap();
+                for (i, (ring, zoom)) in [(2usize, 14u8), (3, 13)].into_iter().enumerate() {
+                    let s = zoom - 11;
+                    for cy in 0..(1u32 << s) {
+                        for cx in 0..(1u32 << s) {
+                            let k = crate::geo::TileKey::new(zoom, (key.x << s) + cx, (key.y << s) + cy);
+                            let d = crate::data::build_chunk(&dt, k, ring, &profile, &|| false).unwrap().unwrap();
+                            let (p, c) = d.lights.get_street(false);
+                            let r = &mut rows[i];
+                            r.0 += 1;
+                            r.1 += p.len();
+                            r.2 = r.2.max(p.len());
+                            r.3 += c.iter().map(|c| crate::lights::lamp_count(c[3]) as u64).sum::<u64>();
+                        }
+                    }
+                }
+            }
+        }
+        for (i, r) in rows.iter().enumerate() {
+            eprintln!(
+                "spacing_scale {scale:?} R{}: {} chunks, street sprites mean {:.0} / max {} per chunk, {} sprites standing for {} lamps",
+                i + 2,
+                r.0,
+                r.1 as f64 / r.0.max(1) as f64,
+                r.2,
+                r.1,
+                r.3
+            );
+        }
+    }
+}

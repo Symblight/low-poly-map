@@ -221,7 +221,10 @@ impl WorldStreamer {
     /// Tile keys to remove.
     #[func]
     fn poll_unload(&mut self) -> PackedStringArray {
-        self.world.drain_unload().iter().map(|&k| key_string(k)).collect()
+        let t = self.world.call_timer();
+        let out = self.world.drain_unload().iter().map(|&k| key_string(k)).collect();
+        self.world.end_call("poll_unload", t);
+        out
     }
 
     /// Every tile in a LOD transition: key (`z/x/y`) -> visible fraction `fade` (0..1). The
@@ -230,11 +233,13 @@ impl WorldStreamer {
     /// 1.0; outgoing 0.0, then unloaded by this frame's `poll_unload`).
     #[func]
     fn poll_fades(&mut self) -> VarDictionary {
+        let t = self.world.call_timer();
         let mut d = VarDictionary::new();
         // Finals come first; an active entry for the same key (not expected) overrides.
         for &(k, f) in self.world.drain_fades() {
             d.set(&key_string(k), f as f64);
         }
+        self.world.end_call("poll_fades", t);
         d
     }
 
@@ -248,6 +253,7 @@ impl WorldStreamer {
     /// Stats for the debug overlay. Per-ring counters are PackedInt32Array of length 4.
     #[func]
     fn debug_stats(&self) -> VarDictionary {
+        let t = self.world.call_timer();
         let st = self.world.stats();
         let mut d = VarDictionary::new();
         d.set("queued", &per_ring(st.queued));
@@ -323,6 +329,7 @@ impl WorldStreamer {
             // api 1.11 (review M1): SSE splits left out by `terrain.max_tiles`.
             d.set("terrain_budget_skipped", st.terrain_budget_skipped as i64);
         }
+        self.world.end_call("debug_stats", t);
         d
     }
 
@@ -365,7 +372,10 @@ impl WorldStreamer {
     /// for hosts that follow the live edges several times a second.
     #[func]
     fn lod_state(&self) -> VarDictionary {
-        lod_state_dict(&self.world.lod_state())
+        let t = self.world.call_timer();
+        let d = lod_state_dict(&self.world.lod_state());
+        self.world.end_call("lod_state", t);
+        d
     }
 
     /// LOD quality (api 1.10): live multiplier of the profile's `lod.tau_px` (2 = half the

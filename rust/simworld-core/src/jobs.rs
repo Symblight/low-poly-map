@@ -118,9 +118,6 @@ struct Inner {
     cv: Condvar,
     exit_cv: Condvar,
     cancelled: AtomicU64,
-    /// Bumped whenever a job enters the heap (idle workers poll it before they sleep).
-    pushes: AtomicU64,
-    idle_spin: Duration,
 }
 
 fn lock(m: &Mutex<State>) -> MutexGuard<'_, State> {
@@ -141,8 +138,6 @@ impl JobPool {
             cv: Condvar::new(),
             exit_cv: Condvar::new(),
             cancelled: AtomicU64::new(0),
-            pushes: AtomicU64::new(0),
-            idle_spin: cfg.idle_spin,
         });
         let n = cfg.threads.max(1);
         for i in 0..n {
@@ -209,7 +204,7 @@ impl JobPool {
         let missing = done.iter().filter(|o| o.is_none()).count();
         let p = Pending { spec, seq, run: Box::new(run), on_cancel: Box::new(on_cancel), missing, outputs: done.clone() };
         if missing == 0 {
-            push_ready(&self.inner, &mut st, p);
+            push_ready(&mut st, p);
             drop(st);
             self.inner.cv.notify_one();
         } else {
@@ -300,8 +295,7 @@ impl Drop for JobPool {
     }
 }
 
-fn push_ready(inner: &Inner, st: &mut State, p: Pending) {
-    inner.pushes.fetch_add(1, Ordering::Release);
+fn push_ready(st: &mut State, p: Pending) {
     st.heap.push(HeapItem { urgency: p.spec.priority.urgency, order: p.spec.priority.order, seq: p.seq, id: p.spec.id });
     st.ready.insert(p.spec.id, p);
 }
@@ -335,19 +329,8 @@ fn worker_loop(inner: &Inner) {
             break;
         }
         let Some(item) = st.heap.pop() else {
-            if !inner.idle_spin.is_zero() {
-                // Poll briefly without the lock: a job submitted right away starts at once.
-                let seen = inner.pushes.load(Ordering::Acquire);
-                drop(st);
-                let t0 = Instant::now();
-                while inner.pushes.load(Ordering::Acquire) == seen && t0.elapsed() < inner.idle_spin {
-                    std::thread::yield_now();
-                }
-                st = lock(&inner.state);
-                if !st.heap.is_empty() || st.shutdown {
-                    continue;
-                }
-            }
+            // Idle: block on the condition variable (no polling; `submit` notifies one worker
+            // per ready job, `shutdown` all).
             st = inner.cv.wait(st).unwrap_or_else(|e| e.into_inner());
             continue;
         };
@@ -384,7 +367,7 @@ fn worker_loop(inner: &Inner) {
                     p.missing -= 1;
                     if p.missing == 0 {
                         let p = st.waiting.remove(&w).expect("present");
-                        push_ready(inner, &mut st, p);
+                        push_ready(&mut st, p);
                         inner.cv.notify_one();
                     }
                 }

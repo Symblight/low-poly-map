@@ -9,7 +9,38 @@
 
 use crate::geo::{tile_x_to_lon, tile_y_to_lat, TileKey};
 
+use super::height::Probe;
 use super::Terrain;
+
+/// The 9 x 9 probe of `key` (81 height evaluations on the global z+3 lattice, corners and edges
+/// included, so neighbours share their edge samples): lowest and highest sample and the largest
+/// difference between neighbouring samples. Feeds [`Terrain::tile_range`] and the error proxy
+/// (`height::ErrorProxy`); pure in terrain and key, so it may run on any thread.
+pub fn probe(terrain: &Terrain, key: TileKey) -> Probe {
+    const P: usize = 8;
+    let mut h = [[0.0f64; P + 1]; P + 1];
+    for (j, row) in h.iter_mut().enumerate() {
+        for (i, v) in row.iter_mut().enumerate() {
+            let (lat, lon) = lattice_lat_lon(key, P as u32, i as i64, j as i64);
+            *v = terrain.height(lat, lon);
+        }
+    }
+    let (mut lo, mut hi, mut step) = (f64::INFINITY, f64::NEG_INFINITY, 0.0f64);
+    for j in 0..=P {
+        for i in 0..=P {
+            let v = h[j][i];
+            lo = lo.min(v);
+            hi = hi.max(v);
+            if i > 0 {
+                step = step.max((v - h[j][i - 1]).abs());
+            }
+            if j > 0 {
+                step = step.max((v - h[j - 1][i]).abs());
+            }
+        }
+    }
+    Probe { lo, hi, step }
+}
 
 /// WGS84 lat/lon of lattice sample `(i, j)` of `key` with `cells` cells per tile side (`i`, `j`
 /// may lie outside `0..=cells` for border samples).

@@ -591,6 +591,16 @@ impl World {
         self.cancel_buf = ids;
     }
 
+    /// Hand both layers' cold tile-box probes to the CPU pool (`scheduler::boxes`).
+    fn submit_probes(&mut self) {
+        let Some(w) = &self.worker else { return };
+        for s in [self.scheduler.as_mut(), self.terrain_sched.as_mut()].into_iter().flatten() {
+            if let Some(b) = s.take_probe_batch() {
+                w.probe(b);
+            }
+        }
+    }
+
     /// Hand the new jobs to the worker; CPU jobs queue by [`Scheduler::job_priority`] (fresh
     /// before re-deliveries, then nearest group first, both layers in one heap).
     fn submit_jobs(&mut self) {
@@ -785,7 +795,8 @@ impl World {
             Ok(mut w) => {
                 w.set_terrain(self.terrain.clone());
                 w.set_seed(self.seed.clone());
-                let mut s = Scheduler::new(frame, w.is_synthetic(), self.profile.clone()).with_terrain(self.terrain.clone());
+                let mut s =
+                    Scheduler::new(frame, w.is_synthetic(), self.profile.clone()).with_terrain(self.terrain.clone()).with_async_boxes();
                 s.set_lod_view(&self.lod_view, self.cover_quality());
                 // Tiles v2: chunks are cut from data tiles. An archive's levels are known once it
                 // opened (`WorkerMsg::Levels`: two-level, or the compatibility levels of an archive
@@ -804,7 +815,7 @@ impl World {
                 self.scheduler = Some(s);
                 if self.terrain.is_active() {
                     self.terrain_detail = self.clamp_detail(self.terrain_detail);
-                    let mut t = Scheduler::new_terrain(frame, self.profile.clone(), self.terrain.clone());
+                    let mut t = Scheduler::new_terrain(frame, self.profile.clone(), self.terrain.clone()).with_async_boxes();
                     t.set_detail(self.terrain_detail);
                     t.set_lod_view(&self.lod_view, self.cover_quality());
                     self.terrain_sched = Some(t);
@@ -1061,6 +1072,7 @@ impl World {
         self.cancel_orphans();
         self.order_jobs();
         self.submit_jobs();
+        self.submit_probes();
         if profile {
             let us = |a: Instant, b: Instant| b.duration_since(a).as_micros();
             let end = Instant::now();

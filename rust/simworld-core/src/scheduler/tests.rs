@@ -9,7 +9,7 @@ use crate::rings::{parent, ring_for_zoom, siblings, BandParams, LEAF_ZOOM, RING_
 use crate::worker::build_tile;
 use std::collections::{HashSet, VecDeque};
 
-const VILNIUS: (f64, f64) = (54.6872, 25.2797);
+pub(super) const VILNIUS: (f64, f64) = (54.6872, 25.2797);
 
 /// The default world profile (the spike's constants).
 fn dp() -> Arc<Profile> {
@@ -262,7 +262,7 @@ pub(super) struct Harness {
 }
 
 impl Harness {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let frame = Frame::new(VILNIUS.0, VILNIUS.1);
         Self {
             s: Scheduler::new(frame, false, dp()),
@@ -319,6 +319,7 @@ impl Harness {
             self.s.sync_memory(m);
         }
         self.s.update(cam, vel, self.now, &mut self.jobs);
+        super::boxes::tests::answer_probes(&mut self.s);
         if let Some(m) = &mut self.mem {
             self.s.sync_memory(m);
         }

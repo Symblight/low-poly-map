@@ -1,0 +1,215 @@
+//! Streaming perf harness (perf review 2, ignored; release, `--nocapture --test-threads=1`):
+//! `cargo test --release -p simworld-core perf_stream -- --ignored --nocapture --test-threads=1`.
+//! With `SIMWORLD_V2_ARCHIVE=<vilnius-v2.pmtiles>` the world runs on the real two-level archive
+//! (in-process range server, no disk cache), else on the synthetic city. Terrain on throughout.
+//!
+//! - `perf_stream_main_thread`: first `update_camera` after `configure_world`, the worst frame of
+//!   the settle, then a level flight at 250 m/s, 300 m (60 Hz real time): p50 / max of
+//!   `update_camera` and of `pop_ready` per delivered tile, frames over 3 ms, and keys delivered
+//!   again within 10 s of their unload (churn).
+//! - `perf_stream_cold_fill`: cold fill at the origin, then the same flight: first tile per band,
+//!   the settle time and the latency table (first deliveries: `mesh_wait` per band).
+//!
+//! `SIMWORLD_PERF_SECONDS` = flight seconds (default 30); `SIMWORLD_PERF_SET` = JSON profile
+//! overrides merged in (e.g. `{"streaming":{"worker_threads":8}}`).
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use crate::rings::LayerKey;
+use crate::world::{World, WorldOptions};
+
+const VILNIUS: (f64, f64) = (54.6872, 25.2797);
+const FRAME: Duration = Duration::from_micros(16_667);
+
+fn source() -> (String, &'static str) {
+    match std::env::var("SIMWORLD_V2_ARCHIVE") {
+        Ok(p) => (crate::data_world_tests::serve(std::fs::read(p).expect("v2 archive")).0, "v2"),
+        Err(_) => (String::new(), "synthetic"),
+    }
+}
+
+fn options(url: &str) -> WorldOptions {
+    let mut ov = serde_json::json!({ "terrain": { "enabled": true } });
+    if let Some(extra) = std::env::var("SIMWORLD_PERF_SET").ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()) {
+        merge(&mut ov, extra);
+    }
+    WorldOptions {
+        origin_lat: VILNIUS.0,
+        origin_lon: VILNIUS.1,
+        tile_url: url.into(),
+        profile_overrides: Some(ov),
+        layers: Some(vec!["world".into(), "terrain".into(), "landmarks".into()]),
+        ..WorldOptions::default()
+    }
+}
+
+fn merge(a: &mut serde_json::Value, b: serde_json::Value) {
+    match (a, b) {
+        (serde_json::Value::Object(a), serde_json::Value::Object(b)) => {
+            for (k, v) in b {
+                merge(a.entry(k).or_insert(serde_json::Value::Null), v);
+            }
+        }
+        (a, b) => *a = b,
+    }
+}
+
+fn seconds() -> f64 {
+    std::env::var("SIMWORLD_PERF_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(30.0)
+}
+
+fn ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1e3
+}
+
+/// p50 and max of `v`.
+fn p50_max(v: &mut [f64]) -> (f64, f64) {
+    if v.is_empty() {
+        return (0.0, 0.0);
+    }
+    v.sort_by(f64::total_cmp);
+    (v[v.len() / 2], v[v.len() - 1])
+}
+
+fn busy(w: &World) -> i32 {
+    let s = w.stats();
+    s.queued.iter().chain(&s.fetching).chain(&s.meshing).chain(&s.terrain_queued).chain(&s.terrain_fetching).chain(&s.terrain_meshing).sum()
+}
+
+/// Per-frame measurements of a run.
+#[derive(Default)]
+struct Run {
+    update_ms: Vec<f64>,
+    /// Thread CPU time of `update_camera` (robust against preemption on a busy machine).
+    update_cpu_ms: Vec<f64>,
+    pop_ms_per_tile: Vec<f64>,
+    unloaded_at: HashMap<LayerKey, Instant>,
+    churn: usize,
+    delivered: usize,
+}
+
+impl Run {
+    /// One host frame at `pos`, velocity `vel`; returns the origin shift.
+    fn frame(&mut self, w: &mut World, pos: [f64; 3], vel: [f64; 3]) -> Option<[f64; 3]> {
+        let (t, c) = (Instant::now(), crate::diag::thread_cpu_us());
+        let shift = w.update_camera(pos, vel, pos[1]);
+        self.update_ms.push(ms(t.elapsed()));
+        self.update_cpu_ms.push((crate::diag::thread_cpu_us() - c) as f64 / 1e3);
+        let t = Instant::now();
+        let mut keys = Vec::new();
+        let n = w.pop_ready(2, |v| keys.push(v.layer_key()));
+        if n > 0 {
+            self.pop_ms_per_tile.push(ms(t.elapsed()) / n as f64);
+        }
+        let now = Instant::now();
+        for k in keys {
+            self.delivered += 1;
+            if self.unloaded_at.get(&k).is_some_and(|u| now.duration_since(*u) < Duration::from_secs(10)) {
+                self.churn += 1;
+            }
+        }
+        let _ = w.drain_fades();
+        for &k in w.drain_unload() {
+            self.unloaded_at.insert(k, now);
+        }
+        shift
+    }
+}
+
+#[test]
+#[ignore]
+fn perf_stream_main_thread() {
+    let (url, name) = source();
+    for run in 0..3 {
+        let mut w = World::new(Arc::new(crate::NullLog), crate::Diagnostics::default(), "perf");
+        assert!(w.configure_world(options(&url)).ok);
+        let mut r = Run::default();
+        // Settle at the origin (first frame = the cold one).
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(60) {
+            let ft = Instant::now();
+            r.frame(&mut w, [0.0, 300.0, 0.0], [0.0; 3]);
+            if r.delivered > 0 && busy(&w) == 0 {
+                break;
+            }
+            std::thread::sleep(FRAME.saturating_sub(ft.elapsed()));
+        }
+        let first = (r.update_ms[0], r.update_cpu_ms[0]);
+        let settle_max = r.update_cpu_ms[1..].iter().cloned().fold(0.0, f64::max);
+        let settle_s = t0.elapsed().as_secs_f64();
+        // Level flight north.
+        let mut f = Run::default();
+        let (speed, mut z) = (250.0, 0.0f64);
+        for _ in 0..(seconds() * 60.0) as usize {
+            let ft = Instant::now();
+            z -= speed / 60.0;
+            if let Some(s) = f.frame(&mut w, [0.0, 300.0, z], [0.0, 0.0, -speed]) {
+                z -= s[2];
+            }
+            std::thread::sleep(FRAME.saturating_sub(ft.elapsed()));
+        }
+        let over3 = f.update_cpu_ms.iter().filter(|&&t| t > 3.0).count();
+        let (u50, umax) = p50_max(&mut f.update_ms);
+        let (c50, cmax) = p50_max(&mut f.update_cpu_ms);
+        let (p50, pmax) = p50_max(&mut f.pop_ms_per_tile);
+        eprintln!(
+            "[{name} run {run}] first update_camera {:.2} ms wall / {:.2} ms CPU, settle max {settle_max:.2} ms CPU ({settle_s:.1} s); flight {:.0} s: \
+             update_camera wall p50 {u50:.3} / max {umax:.2} ms, CPU p50 {c50:.3} / max {cmax:.2} ms ({over3} frames > 3 ms CPU), pop_ready per tile p50 {p50:.3} / max {pmax:.2} ms, \
+             delivered {}, re-delivered within 10 s of unload {} ({:.1} / min)",
+            first.0,
+            first.1,
+            seconds(),
+            f.delivered,
+            f.churn,
+            f.churn as f64 / seconds() * 60.0
+        );
+        assert!(w.shutdown());
+    }
+}
+
+#[test]
+#[ignore]
+fn perf_stream_cold_fill() {
+    let (url, name) = source();
+    let mut w = World::new(Arc::new(crate::NullLog), crate::Diagnostics::default(), "perf");
+    assert!(w.configure_world(options(&url)).ok);
+    let threads = w.worker().map_or(0, |x| x.cpu_threads());
+    let t0 = Instant::now();
+    let mut first_at = [None::<f64>; 4];
+    let mut r = Run::default();
+    loop {
+        let ft = Instant::now();
+        r.frame(&mut w, [0.0, 300.0, 0.0], [0.0; 3]);
+        let el = ms(t0.elapsed());
+        for (ring, s) in w.stats().loaded.iter().enumerate() {
+            if *s > 0 {
+                first_at[ring].get_or_insert(el);
+            }
+        }
+        if (r.delivered > 0 && busy(&w) == 0) || t0.elapsed() > Duration::from_secs(90) {
+            break;
+        }
+        std::thread::sleep(FRAME.saturating_sub(ft.elapsed()));
+    }
+    let settle = t0.elapsed().as_secs_f64();
+    let (speed, mut z) = (250.0, 0.0f64);
+    for _ in 0..(seconds() * 60.0) as usize {
+        let ft = Instant::now();
+        z -= speed / 60.0;
+        if let Some(s) = r.frame(&mut w, [0.0, 300.0, z], [0.0, 0.0, -speed]) {
+            z -= s[2];
+        }
+        std::thread::sleep(FRAME.saturating_sub(ft.elapsed()));
+    }
+    let terrain_loaded: i32 = w.stats().terrain_loaded.iter().sum();
+    eprintln!(
+        "[{name}, {threads} worker threads] settled in {settle:.2} s; first tile per band (ms) {:?}; terrain tiles held {terrain_loaded}; \
+         flight {:.0} s at 250 m/s\n{}",
+        first_at.map(|v| v.map(|x| x.round())),
+        seconds(),
+        w.latency().map(|l| l.report()).unwrap_or_default()
+    );
+    assert!(w.shutdown());
+}

@@ -34,6 +34,7 @@ use crate::profile::Profile;
 use crate::synthetic;
 
 mod levels_probe;
+mod probe;
 mod release;
 
 /// Decoded tile, ready for conversion on the main thread. Only flat arrays cross the channel:

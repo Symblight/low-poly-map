@@ -423,29 +423,8 @@ impl Terrain {
         if !self.active {
             return [0.0, 0.0];
         }
-        const N: u32 = 8;
-        let mut h = [[0.0f64; (N + 1) as usize]; (N + 1) as usize];
-        for (j, row) in h.iter_mut().enumerate() {
-            for (i, v) in row.iter_mut().enumerate() {
-                let (lat, lon) = sample::lattice_lat_lon(key, N, i as i64, j as i64);
-                *v = self.height(lat, lon);
-            }
-        }
-        let (mut lo, mut hi, mut step) = (f64::INFINITY, f64::NEG_INFINITY, 0.0f64);
-        for j in 0..=N as usize {
-            for i in 0..=N as usize {
-                let v = h[j][i];
-                lo = lo.min(v);
-                hi = hi.max(v);
-                if i > 0 {
-                    step = step.max((v - h[j][i - 1]).abs());
-                }
-                if j > 0 {
-                    step = step.max((v - h[j - 1][i]).abs());
-                }
-            }
-        }
-        self.range_from_probe(lo, hi, step)
+        let p = sample::probe(self, key);
+        self.range_from_probe(p.lo, p.hi, p.step)
     }
 
     /// [`Terrain::tile_range`] from its 9 x 9 probe (`lo`, `hi`, largest neighbour step), e.g.

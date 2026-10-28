@@ -501,31 +501,9 @@ impl ErrorProxy {
         }
     }
 
-    /// The 9 x 9 probe of `key` (81 height evaluations).
+    /// The 9 x 9 probe of `key` (81 height evaluations; [`sample::probe`]).
     pub fn probe(&self, key: TileKey) -> Probe {
-        const P: usize = 8;
-        let mut h = [[0.0f64; P + 1]; P + 1];
-        for (j, row) in h.iter_mut().enumerate() {
-            for (i, v) in row.iter_mut().enumerate() {
-                let (lat, lon) = sample::lattice_lat_lon(key, P as u32, i as i64, j as i64);
-                *v = self.terrain.height(lat, lon);
-            }
-        }
-        let (mut lo, mut hi, mut step) = (f64::INFINITY, f64::NEG_INFINITY, 0.0f64);
-        for j in 0..=P {
-            for i in 0..=P {
-                let v = h[j][i];
-                lo = lo.min(v);
-                hi = hi.max(v);
-                if i > 0 {
-                    step = step.max((v - h[j][i - 1]).abs());
-                }
-                if j > 0 {
-                    step = step.max((v - h[j - 1][i]).abs());
-                }
-            }
-        }
-        Probe { lo, hi, step }
+        sample::probe(&self.terrain, key)
     }
 
     /// Grid spacing (m) of `key`: ground width at the edge nearer the equator / N.

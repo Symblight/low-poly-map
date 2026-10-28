@@ -454,6 +454,9 @@ impl WorldStreamer {
         m.set("budget", mem.budget_bytes as f64 / MIB);
         m.set("over_budget", mem.over_budget_bytes as f64 / MIB);
         d.set("memory_mb", &m);
+        // Tiles v2 data tiles (step T2a): resident now / decoded since configure.
+        d.set("data_tiles_loaded", st.data_tiles_loaded as i64);
+        d.set("data_tiles_decoded", st.data_tiles_decoded.min(i64::MAX as u64) as i64);
         if let Some(l) = self.world.latency() {
             d.set("latency", &latency_dict(l));
         }

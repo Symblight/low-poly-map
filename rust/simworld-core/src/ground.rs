@@ -105,7 +105,8 @@ pub fn mesh_ground(g: &GroundFeatures, proj: &TileProjector, ring: usize, profil
     let Some(p) = profile.ground_params(ring) else { return MeshData::default() };
     let mut m = MeshData::default();
     let mut s = Scratch::default();
-    let rect = ClipRect::tile(proj.extent());
+    // The tile, or the chunk of a cut projector (Tiles v2: chunks cut from a data tile).
+    let rect = proj.rect();
     let m_per_px = proj.m_per_px();
     let min_area_px2 = p.min_area_m2 / (m_per_px * m_per_px);
     // Drape margin of the band (0.0 with the terrain off: `0.0 + x` keeps the flat output bit for bit).

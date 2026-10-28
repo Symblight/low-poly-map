@@ -56,6 +56,8 @@ pub enum TileState {
     Idle,
     Queued,
     Fetching,
+    /// Tiles v2: a chunk waiting for its data tile (being fetched or decoded, or backing off).
+    WaitData,
     Fetched(Bytes),
     Decoding,
     Ready(Box<TileData>),
@@ -72,7 +74,7 @@ impl TileState {
         match self {
             TileState::Idle | TileState::Ready(_) => "ready",
             TileState::Queued => "queued",
-            TileState::Fetching => "fetching",
+            TileState::Fetching | TileState::WaitData => "fetching",
             TileState::Fetched(_) | TileState::Decoding => "meshing",
             TileState::Failed { .. } | TileState::Broken => "failed",
         }

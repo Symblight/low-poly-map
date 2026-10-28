@@ -69,6 +69,15 @@
 //! slot frees up before the request or the build finishes (a cancelled mesh job replies
 //! `WorkerMsg::Dropped`).
 //!
+//! # Data tiles (Tiles v2, step T2a)
+//! With [`Scheduler::with_data_levels`] (an archive source) the chunks finer than the detail
+//! level (R0 z16, R1 z15 with the compatibility levels) are cut from their detail data tile
+//! instead of being fetched one by one ([`DataStore`], `scheduler/data.rs`): Queued -> WaitData
+//! (data tile fetching / decoding) -> Decoding ([`Job::MeshChunk`], depending on the data tile's
+//! decode job or on the resident tile) -> Ready. One fetch and one decode per data tile; the
+//! store's tiles live in the memory budget (`World` calls [`Scheduler::sync_memory`]). R2 / R3
+//! keep their own fetch as before. The synthetic city and the seed world stay per tile.
+//!
 //! # Layers (api 1.5)
 //! One `Scheduler` runs one quadtree layer ([`Layer`]): the vector world (zooms 13..16, the
 //! behaviour above, unchanged) or the terrain mesh (zooms `terrain.far_zoom..=near_zoom`, ring =
@@ -77,13 +86,16 @@
 //! cull (roots and whole sibling groups, with the band hysteresis) and detail re-deliveries
 //! (`set_terrain_detail`: held tiles are re-meshed and handed out again under the same key).
 
+mod data;
 mod fade;
 pub mod sim;
 mod state;
 #[cfg(test)]
 mod tests;
 
+pub use data::{DataStats, DataStore};
 pub use fade::{fade_gap_m, Fade};
+use data::DataState;
 pub use state::{CpuStats, Entry, ReadyTile, Stats, TileState};
 use state::DECODE_ATTEMPTS;
 
@@ -100,7 +112,7 @@ use crate::profile::Profile;
 use crate::rings::{above_horizon, children, horizon_line_m, look_ahead, Layer, LayerKind, ViewPoint, MAX_BOX_HEIGHT_M, MAX_RINGS};
 use crate::terrain::Terrain;
 use crate::jobs::Priority;
-use crate::worker::{Job, Payload, WorkerMsg};
+use crate::worker::{DataRef, Job, Payload, WorkerMsg};
 
 // Tuning (world profile): `streaming.max_fetch_per_band` / `max_mesh_per_band` (jobs in flight
 // per band), `lights.cluster_on_agl_m` / `cluster_off_agl_m` (light carpet switch),
@@ -159,6 +171,12 @@ pub struct Scheduler {
     detail_gen: u32,
     /// Worker CPU per ring.
     cpu: CpuStats,
+    /// Tiles v2 data tiles (archive sources only; `None` = every tile fetched on its own).
+    data: Option<DataStore>,
+    /// Reused buffers of the data needs pass and of the data jobs.
+    data_needs: Vec<(TileKey, f64, bool)>,
+    data_decodes: Vec<(TileKey, u64, bytes::Bytes)>,
+    data_fetches: Vec<(TileKey, u64)>,
 }
 
 impl Scheduler {
@@ -208,7 +226,96 @@ impl Scheduler {
             detail: 1.0,
             detail_gen: 0,
             cpu: CpuStats::default(),
+            data: None,
+            data_needs: Vec::new(),
+            data_decodes: Vec::new(),
+            data_fetches: Vec::new(),
         }
+    }
+
+    /// Cut the chunks finer than `levels.detail` from their detail data tile (Tiles v2, T2a).
+    /// Vector layer with an archive source only (a synthetic scheduler ignores it).
+    pub fn with_data_levels(mut self, levels: crate::data::DataLevels) -> Self {
+        if self.layer.kind == LayerKind::World && !self.synthetic {
+            let max = self.profile.streaming.max_fetch_per_band * 2;
+            self.data = Some(DataStore::new(levels, max));
+        }
+        self
+    }
+
+    /// The data store (Tiles v2), if this scheduler cuts chunks from data tiles.
+    pub fn data(&self) -> Option<&DataStore> {
+        self.data.as_ref()
+    }
+
+    /// Data tile counters (zero without data tiles).
+    pub fn data_stats(&self) -> DataStats {
+        self.data.as_ref().map(|d| d.stats()).unwrap_or_default()
+    }
+
+    /// Apply the data store's queued budget changes and drop what the budget evicted. `World`
+    /// calls it after every scheduler call that may change the store.
+    pub fn sync_memory(&mut self, mem: &mut crate::budget::MemoryBudget) {
+        if let Some(d) = &mut self.data {
+            d.sync(mem);
+        }
+    }
+
+    /// Unregister the data tiles from the budget (before the scheduler is dropped).
+    pub fn release_memory(&mut self, mem: &mut crate::budget::MemoryBudget) {
+        if let Some(d) = &mut self.data {
+            d.release(mem);
+        }
+    }
+
+    /// The detail data tile chunk `k` is cut from (`None`: the tile is fetched on its own).
+    fn data_key(&self, k: TileKey) -> Option<TileKey> {
+        self.data.as_ref().and_then(|d| d.levels.detail_of(k))
+    }
+
+    /// Queue priority of a data-tile job: on demand, ordered by the nearest chunk waiting for it.
+    pub fn data_job_priority(&self, k: TileKey) -> Priority {
+        let want = self.data_distance(k);
+        if want.is_finite() {
+            Priority::on_demand(want)
+        } else {
+            Priority::prefetch(f64::INFINITY)
+        }
+    }
+
+    /// Delivery order of the nearest chunk waiting for data tile `k` (infinite if none).
+    pub fn data_distance(&self, k: TileKey) -> f64 {
+        self.data.as_ref().and_then(|d| d.get(k)).map_or(f64::INFINITY, |e| e.want)
+    }
+
+    /// Data needs of this frame: which data tiles the chunks of the cover wait for or use;
+    /// cancels the data work nobody needs (see [`DataStore::end_needs`]).
+    fn update_data_needs(&mut self, now: Instant) {
+        if self.data.is_none() {
+            return;
+        }
+        let mut needs = std::mem::take(&mut self.data_needs);
+        needs.clear();
+        for e in self.entries.values() {
+            let Some(dk) = self.data_key(e.key) else { continue };
+            match e.state {
+                TileState::Queued | TileState::WaitData if !e.frozen => needs.push((dk, self.order_key(e).0, false)),
+                TileState::Decoding => needs.push((dk, f64::INFINITY, true)),
+                _ => {}
+            }
+        }
+        let cam = self.cam_view;
+        let ds = self.data.as_mut().expect("checked");
+        ds.begin_needs(now);
+        for &(dk, order, in_use) in &needs {
+            if in_use {
+                ds.use_tile(dk);
+            } else {
+                ds.want(dk, order);
+            }
+        }
+        ds.end_needs(&mut self.cancelled, |k| cam.map_or(f64::INFINITY, |v| v.slant_box_m(k, 0.0, 0.0)));
+        self.data_needs = needs;
     }
 
     pub fn layer(&self) -> &Layer {
@@ -571,6 +678,9 @@ impl Scheduler {
         // 5. Advance the fades; completed ones swap for good.
         self.advance_fades(now);
 
+        // 6. Data tiles (Tiles v2): what the chunks of the cover wait for.
+        self.update_data_needs(now);
+
         self.dispatch(jobs);
     }
 
@@ -627,6 +737,19 @@ impl Scheduler {
     }
 
     fn dispatch(&mut self, jobs: &mut Vec<Job>) {
+        // Data tiles first: decodes of fetched tiles (their chunk jobs below can depend on them).
+        if let Some(ds) = &mut self.data {
+            ds.take_decodes(&mut self.next_job, &mut self.data_decodes);
+            jobs.extend(self.data_decodes.drain(..).map(|(key, job, bytes)| Job::DecodeData { key, job, bytes }));
+        }
+        self.dispatch_tiles(jobs);
+        if let Some(ds) = &mut self.data {
+            ds.take_fetches(&mut self.next_job, &mut self.data_fetches);
+            jobs.extend(self.data_fetches.drain(..).map(|(key, job)| Job::FetchData { key, job }));
+        }
+    }
+
+    fn dispatch_tiles(&mut self, jobs: &mut Vec<Job>) {
         let max_fetch = self.layer.max_fetch;
         let max_decode = self.layer.max_mesh;
         let full = (0..self.layer.rings())
@@ -636,7 +759,7 @@ impl Scheduler {
         }
         self.cand.clear();
         for e in self.entries.values() {
-            if !e.frozen && matches!(e.state, TileState::Queued | TileState::Fetched(_)) {
+            if !e.frozen && matches!(e.state, TileState::Queued | TileState::Fetched(_) | TileState::WaitData) {
                 self.cand.push((e.ring, e.held, self.order_key(e).0, e.key));
             }
         }
@@ -651,6 +774,10 @@ impl Scheduler {
             .sort_unstable_by(|a, b| a.1.cmp(&b.1).then(a.2.total_cmp(&b.2)).then(a.0.cmp(&b.0)).then(a.3.cmp(&b.3)));
         for i in 0..self.cand.len() {
             let (ring, _, _, key) = self.cand[i];
+            if let Some(dk) = self.data_key(key) {
+                self.dispatch_chunk(key, ring, dk, max_decode, jobs);
+                continue;
+            }
             let Some(e) = self.entries.get_mut(&key) else { continue };
             let decode_stage = self.synthetic || matches!(e.state, TileState::Fetched(_));
             if decode_stage {
@@ -683,10 +810,67 @@ impl Scheduler {
         }
     }
 
+    /// A chunk cut from data tile `dk` (Tiles v2): a mesh job on the resident or decoding data
+    /// tile, or wait for it (the store fetches it).
+    fn dispatch_chunk(&mut self, key: TileKey, ring: usize, dk: TileKey, max_decode: u32, jobs: &mut Vec<Job>) {
+        let now = self.now;
+        let Some(ds) = self.data.as_mut() else { return };
+        let Some(e) = self.entries.get_mut(&key) else { return };
+        let (data, source) = match ds.get(dk) {
+            Some(d) => match &d.state {
+                DataState::Resident(a) => (Some(DataRef::Ready(a.clone())), d.source),
+                DataState::Decoding { job } => (Some(DataRef::After(*job)), d.source),
+                DataState::Broken => {
+                    // The data tile cannot be decoded: like a broken tile, the coarser one stays.
+                    e.state = TileState::Broken;
+                    return;
+                }
+                _ => (None, None),
+            },
+            None => (None, None),
+        };
+        let Some(data) = data else {
+            if !matches!(e.state, TileState::WaitData) {
+                e.state = TileState::WaitData;
+                e.times.fetch_start.get_or_insert(now);
+            }
+            return;
+        };
+        if self.decode_inflight[ring] >= max_decode {
+            return;
+        }
+        // Latency: `fetch_*` = waiting for the data tile (fetch + decode), when it had to wait.
+        if e.times.fetch_start.is_some() {
+            e.times.fetched = Some(now);
+            e.times.source = source;
+        }
+        e.state = TileState::Decoding;
+        e.job = self.next_job;
+        e.times.decode_start = Some(now);
+        self.next_job += 1;
+        self.decode_inflight[ring] += 1;
+        ds.pin(dk);
+        jobs.push(Job::MeshChunk { key, ring, job: e.job, data });
+    }
+
     /// Apply a worker result. Returns a warning to log (main thread) on failure.
     pub fn handle(&mut self, msg: WorkerMsg, now: Instant) -> Option<String> {
         match msg {
             WorkerMsg::Info(_) | WorkerMsg::Warn(_) | WorkerMsg::CacheDisabled(_) | WorkerMsg::Error(_) => None,
+            WorkerMsg::DataFetched { key, job, result } => {
+                let profile = self.profile.clone();
+                self.data.as_mut().and_then(|d| d.fetched(key, job, result, now, &profile))
+            }
+            WorkerMsg::DataDecoded { key, job, result } => {
+                let profile = self.profile.clone();
+                self.data.as_mut().and_then(|d| d.decoded(key, job, result, now, &profile))
+            }
+            WorkerMsg::DataDropped { key, job } => {
+                if let Some(d) = self.data.as_mut() {
+                    d.dropped(key, job);
+                }
+                None
+            }
             WorkerMsg::Fetched { key, ring, job, result } => {
                 self.fetch_inflight[ring] = self.fetch_inflight[ring].saturating_sub(1);
                 let e = self.entries.get_mut(&key).filter(|e| e.job == job)?;
@@ -710,8 +894,10 @@ impl Scheduler {
             }
             WorkerMsg::Dropped { key, ring, job, .. } => {
                 // A cancelled mesh job: only orphaned generations are cancelled; should a
-                // current one be (shutdown race), ask again.
+                // current one be (shutdown race, or its data tile's decode was cancelled or
+                // finished before the job was queued), ask again.
                 self.decode_inflight[ring] = self.decode_inflight[ring].saturating_sub(1);
+                self.unpin_data(key);
                 let e = self.entries.get_mut(&key).filter(|e| e.job == job)?;
                 if matches!(e.state, TileState::Decoding) {
                     e.state = TileState::Queued;
@@ -720,6 +906,7 @@ impl Scheduler {
             }
             WorkerMsg::Decoded { key, ring, job, result } | WorkerMsg::TerrainBuilt { key, ring, job, result } => {
                 self.decode_inflight[ring] = self.decode_inflight[ring].saturating_sub(1);
+                self.unpin_data(key);
                 if let Ok(d) = &result {
                     self.cpu.record(ring, d.cpu_us);
                 }
@@ -758,6 +945,15 @@ impl Scheduler {
                         ))
                     }
                 }
+            }
+        }
+    }
+
+    /// A chunk job of `key` ended: release its pin on the data tile (data-cut chunks only).
+    fn unpin_data(&mut self, key: TileKey) {
+        if let Some(dk) = self.data_key(key) {
+            if let Some(d) = self.data.as_mut() {
+                d.unpin(dk);
             }
         }
     }
@@ -1174,7 +1370,7 @@ impl Scheduler {
             }
             match e.state {
                 TileState::Queued => s.queued[r] += 1,
-                TileState::Fetching => s.fetching[r] += 1,
+                TileState::Fetching | TileState::WaitData => s.fetching[r] += 1,
                 TileState::Fetched(_) | TileState::Decoding => s.meshing[r] += 1,
                 TileState::Failed { .. } | TileState::Broken => s.failed[r] += 1,
                 TileState::Idle | TileState::Ready(_) => {}

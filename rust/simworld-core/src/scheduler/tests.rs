@@ -76,16 +76,38 @@ struct FakeWorker {
     profile: Option<Arc<Profile>>,
     /// Terrain jobs: real TINs on this terrain (with `real` and `profile`), else stand-ins.
     terrain: Option<Terrain>,
+    /// Data tiles (Tiles v2): the archive's bytes per data tile key (absent = empty tile).
+    data_src: AHashMap<TileKey, Bytes>,
+    /// Decoded data tiles by decode job (decoded at submit, so a dependent chunk job finds it).
+    data_out: AHashMap<u64, Arc<crate::data::DataTile>>,
+    /// Data jobs seen: fetches, decodes.
+    data_jobs: (u32, u32),
+    /// Zoom of every per-tile `Fetch`.
+    fetch_zooms: Vec<u8>,
+    /// Last building mesh built per chunk cut from a data tile.
+    chunk_meshes: std::collections::BTreeMap<TileKey, MeshData>,
 }
 
 impl FakeWorker {
     fn new() -> Self {
-        Self { pending: VecDeque::new(), frame: 0, real: None, profile: None, terrain: None }
+        Self {
+            pending: VecDeque::new(),
+            frame: 0,
+            real: None,
+            profile: None,
+            terrain: None,
+            data_src: AHashMap::new(),
+            data_out: AHashMap::new(),
+            data_jobs: (0, 0),
+            fetch_zooms: Vec::new(),
+            chunk_meshes: Default::default(),
+        }
     }
     fn submit(&mut self, jobs: &mut Vec<Job>) {
         for j in jobs.drain(..) {
             let (delay, msg) = match j {
                 Job::Fetch { key, ring, job } => {
+                    self.fetch_zooms.push(key.z);
                     (3, WorkerMsg::Fetched { key, ring, job, result: Ok((Bytes::new(), Source::Network)) })
                 }
                 Job::Decode { key, ring, job, payload } => {
@@ -94,6 +116,38 @@ impl FakeWorker {
                         None => Ok(fake_data(key, ring)),
                     };
                     (2, WorkerMsg::Decoded { key, ring, job, result })
+                }
+                Job::FetchData { key, job } => {
+                    self.data_jobs.0 += 1;
+                    let bytes = self.data_src.get(&key).cloned().unwrap_or_default();
+                    (3, WorkerMsg::DataFetched { key, job, result: Ok((bytes, Source::Network)) })
+                }
+                Job::DecodeData { key, job, bytes } => {
+                    self.data_jobs.1 += 1;
+                    let f = self.real.unwrap_or(Frame::new(VILNIUS.0, VILNIUS.1));
+                    let p = self.profile.clone().unwrap_or_else(dp);
+                    let result = crate::data::decode_data_tile(key, f, &Terrain::flat(), &bytes, &p).map(Arc::new);
+                    if let Ok(d) = &result {
+                        self.data_out.insert(job, d.clone());
+                    }
+                    (2, WorkerMsg::DataDecoded { key, job, result })
+                }
+                Job::MeshChunk { key, ring, job, data } => {
+                    let d = match data {
+                        crate::worker::DataRef::Ready(d) => Some(d),
+                        crate::worker::DataRef::After(j) => self.data_out.get(&j).cloned(),
+                    };
+                    let p = self.profile.clone().unwrap_or_else(dp);
+                    match d {
+                        Some(d) => {
+                            let result = crate::data::build_chunk(&d, key, ring, &p, &|| false).map(|o| o.expect("not stopped"));
+                            if let Ok(t) = &result {
+                                self.chunk_meshes.insert(key, t.mesh.clone());
+                            }
+                            (2, WorkerMsg::Decoded { key, ring, job, result })
+                        }
+                        None => (1, WorkerMsg::Dropped { layer: LayerKind::World, key, ring, job }),
+                    }
                 }
                 Job::Terrain { key, ring, job, detail } => {
                     let result = match (self.real, &self.profile, &self.terrain) {
@@ -128,6 +182,8 @@ const DT: f64 = 1.0 / 30.0;
 struct Harness {
     s: Scheduler,
     w: FakeWorker,
+    /// Memory budget of the data tiles (Tiles v2 tests; synced like `World` does).
+    mem: Option<crate::budget::MemoryBudget>,
     g: GodotSim,
     /// The layer under test (zooms for the contract checks).
     l: Layer,
@@ -170,6 +226,7 @@ impl Harness {
         Self {
             s: Scheduler::new(frame, false, dp()),
             w: FakeWorker::new(),
+            mem: None,
             g: GodotSim::default(),
             l: layer(),
             jobs: Vec::new(),
@@ -214,7 +271,13 @@ impl Harness {
         self.prev_visible = self.g.uploaded.iter().copied().filter(|&k| self.g.visible(k)).collect();
         self.fresh.clear();
         self.w.step(&mut self.s, self.now);
+        if let Some(m) = &mut self.mem {
+            self.s.sync_memory(m);
+        }
         self.s.update(cam, vel, self.now, &mut self.jobs);
+        if let Some(m) = &mut self.mem {
+            self.s.sync_memory(m);
+        }
         self.w.submit(&mut self.jobs);
         for e in self.s.entries() {
             self.ever_requested.insert(e.key);
@@ -1769,4 +1832,106 @@ fn fade_cap_limits_concurrent_swaps() {
     for (cap, faded, capped, peak) in runs {
         eprintln!("fade cap {cap}: {faded} swaps faded, {capped} without a fade, peak {peak} at once");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tiles v2, step T2a: R0 / R1 cut from detail data tiles
+
+/// A harness whose vector scheduler cuts R0 / R1 from z14 data tiles (the compatibility levels);
+/// the z14 tile under the origin holds the `data::fixture` area, every other data tile is empty.
+/// R2 / R3 stay fake per-tile jobs. `budget`: the data tiles' memory budget in bytes.
+fn data_harness(budget: u64) -> Harness {
+    let mut h = Harness::new();
+    let frame = Frame::new(VILNIUS.0, VILNIUS.1);
+    h.s = Scheduler::new(frame, false, dp()).with_data_levels(crate::data::DataLevels::COMPAT);
+    h.w.real = Some(frame);
+    let k14 = crate::data::fixture::key14();
+    h.w.data_src.insert(k14, crate::data::fixture::tile_bytes(k14).into());
+    h.mem = Some(crate::budget::MemoryBudget::new(budget));
+    h
+}
+
+/// The detail data tiles of every chunk the cover ever wanted.
+fn data_tiles_of(h: &Harness) -> HashSet<TileKey> {
+    h.ever_requested.iter().filter_map(|k| crate::data::DataLevels::COMPAT.detail_of(*k)).collect()
+}
+
+/// One fetch and one decode per data tile, however many R0 / R1 chunks are cut from it; no
+/// per-tile fetch of a z15 / z16 key; every requested chunk is delivered (guarantee 2); the
+/// chunks under the camera carry the fixture's buildings; the decoded tiles are in the memory
+/// budget and pinned only while chunk jobs run.
+#[test]
+fn data_tiles_are_fetched_and_decoded_once_for_all_their_chunks() {
+    let mut h = data_harness(512 << 20);
+    let cam = [0.0, 0.0, 300.0];
+    let frames = h.settle(cam, 20_000);
+    let tiles = data_tiles_of(&h);
+    let chunks = h.ever_requested.iter().filter(|k| k.z >= 15).count();
+    assert!(tiles.len() >= 2 && chunks >= 4 * tiles.len(), "{chunks} chunks from {} data tiles", tiles.len());
+    let n = tiles.len() as u32;
+    assert_eq!(h.w.data_jobs, (n, n), "one fetch and one decode per data tile");
+    let st = h.s.data_stats();
+    assert_eq!((st.decoded, st.fetched, st.loaded, st.fetching), (n as u64, n as u64, n, 0));
+    assert!(h.w.fetch_zooms.iter().all(|&z| z <= 14), "a chunk was fetched on its own: {:?}", h.w.fetch_zooms);
+    assert_eq!(h.ever_requested, h.ever_delivered);
+    let under = crate::geo::tile_for(VILNIUS.0, VILNIUS.1, 16);
+    assert!(h.w.chunk_meshes.get(&under).is_some_and(|m| !m.is_empty()), "R0 under the camera has the fixture's buildings");
+    let mem = h.mem.as_ref().unwrap().stats();
+    let pool = mem.pool(crate::budget::Pool::DataTiles);
+    assert_eq!((pool.items, pool.pinned_items, pool.evictions), (n, 0, 0));
+    assert!(pool.bytes > 20_000, "{}", pool.bytes);
+    eprintln!("settled in {frames} frames: {chunks} chunks cut from {n} data tiles ({} KB)", pool.bytes / 1024);
+}
+
+/// Under a budget too small for one data tile, every decoded tile is evicted as soon as no chunk
+/// job pins it, and the chunks still waiting fetch and decode it again: the cover completes with
+/// the same chunk meshes as without eviction, and nothing pinned stays over the budget.
+#[test]
+fn evicted_data_tiles_are_fetched_again_and_give_the_same_chunks() {
+    let cam = [0.0, 0.0, 300.0];
+    let mut a = data_harness(512 << 20);
+    a.settle(cam, 20_000);
+    let mut b = data_harness(1);
+    b.settle(cam, 40_000);
+    assert_eq!(b.ever_requested, b.ever_delivered);
+    let n = data_tiles_of(&b).len() as u64;
+    let st = b.s.data_stats();
+    assert!(st.decoded > n && st.fetched == st.decoded, "re-fetched after eviction: {st:?} for {n} tiles");
+    assert_eq!(st.loaded, 0, "nothing stays resident over the budget");
+    assert_eq!(a.w.chunk_meshes, b.w.chunk_meshes, "same chunks with and without eviction");
+    let mem = b.mem.as_ref().unwrap().stats();
+    let pool = mem.pool(crate::budget::Pool::DataTiles);
+    assert_eq!((pool.items, pool.pinned_items, mem.over_budget_bytes), (0, 0, 0));
+    assert!(pool.evictions > n, "{pool:?}");
+    eprintln!("budget 1 byte: {} decodes for {n} data tiles, {} evictions", st.decoded, pool.evictions);
+}
+
+/// A data fetch nobody needs any more (the camera left before it arrived) is cancelled, and its
+/// late reply changes nothing.
+#[test]
+fn unneeded_data_fetches_are_cancelled() {
+    let frame = Frame::new(VILNIUS.0, VILNIUS.1);
+    let mut s = Scheduler::new(frame, false, dp()).with_data_levels(crate::data::DataLevels::COMPAT);
+    let t0 = Instant::now();
+    let mut jobs = Vec::new();
+    s.update([0.0, 0.0, 300.0], [0.0; 3], t0, &mut jobs);
+    let fetches: Vec<(TileKey, u64)> =
+        jobs.iter().filter_map(|j| if let Job::FetchData { key, job } = j { Some((*key, *job)) } else { None }).collect();
+    assert!(!fetches.is_empty() && fetches.iter().all(|(k, _)| k.z == 14));
+    assert!(jobs.iter().all(|j| !matches!(j, Job::Fetch { key, .. } if key.z >= 15)));
+    assert_eq!(s.data_stats().fetching, fetches.len() as u32);
+    // Teleport 60 km east: no chunk of the old area is wanted.
+    jobs.clear();
+    s.update([60_000.0, 0.0, 300.0], [0.0; 3], t0 + Duration::from_millis(30), &mut jobs);
+    let mut cancelled = Vec::new();
+    s.drain_cancelled(&mut cancelled);
+    for (_, job) in &fetches {
+        assert!(cancelled.contains(job), "fetch {job} not cancelled");
+    }
+    // The cancelled replies free the slots; a late success is ignored (the job is stale).
+    for (i, (key, job)) in fetches.iter().enumerate() {
+        let result = if i == 0 { Ok((Bytes::new(), Source::Network)) } else { Err(FetchError::new(crate::fetch::FetchErrorKind::Cancelled, "x")) };
+        assert!(s.handle(WorkerMsg::DataFetched { key: *key, job: *job, result }, t0).is_none());
+    }
+    assert!(s.data().unwrap().get(fetches[0].0).is_none_or(|e| !matches!(e.state, DataState::Fetched(_))));
 }

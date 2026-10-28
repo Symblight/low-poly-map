@@ -57,6 +57,13 @@ impl LightSet {
         let (clustered_positions, clustered_colors) = cluster(&positions, &colors, profile.cluster_cell_m());
         Self { positions, colors, clustered_positions, clustered_colors, ..Self::default() }
     }
+    /// [`LightSet::from_buildings`] for the tile or chunk of `proj`: ownership and centroid by
+    /// [`TileProjector::place`] (identical to `from_buildings` for a whole tile).
+    pub fn from_buildings_in<'a>(buildings: impl IntoIterator<Item = &'a Building>, proj: &TileProjector, profile: &Profile) -> Self {
+        let (positions, colors) = light_points_in(buildings, proj, profile);
+        let (clustered_positions, clustered_colors) = cluster(&positions, &colors, profile.cluster_cell_m());
+        Self { positions, colors, clustered_positions, clustered_colors, ..Self::default() }
+    }
     /// Adds the street lamps (and their clusters) of a tile's roads.
     pub fn set_streets(&mut self, roads: &[RoadLine], proj: &TileProjector, profile: &Profile) {
         let (p, c) = street_points(roads, proj, profile);
@@ -66,6 +73,10 @@ impl LightSet {
     /// Adds the beacons of the tile's tall buildings.
     pub fn set_beacons(&mut self, buildings: &[Building], proj: &TileProjector, profile: &Profile) {
         (self.beacon_positions, self.beacon_colors) = beacon_points(buildings, proj, profile);
+    }
+    /// [`LightSet::set_beacons`] over any sequence of buildings (a chunk's candidates).
+    pub fn set_beacons_in<'a>(&mut self, buildings: impl IntoIterator<Item = &'a Building>, proj: &TileProjector, profile: &Profile) {
+        (self.beacon_positions, self.beacon_colors) = beacon_points_in(buildings, proj, profile);
     }
     /// Adds a seed world's airport lights (tile pixels): y = terrain + the weighted drape margin
     /// (`Terrain::lift_weight` x the band's margin: 0 inside the fence, contract section 9
@@ -117,15 +128,25 @@ impl LightSet {
 
 /// One light per owned building (count 1 each), except `dark` buildings, which have none.
 pub fn light_points(buildings: &[Building], profile: &Profile) -> (Vec<[f32; 3]>, Vec<[f32; 4]>) {
-    let n = buildings.iter().filter(|b| b.owned).count();
+    let placed = buildings.iter().filter(|b| b.owned).map(|b| (b, b.centroid));
+    light_points_placed(placed, buildings.iter().filter(|b| b.owned).count(), profile)
+}
+
+/// [`light_points`] for the tile or chunk of `proj` ([`TileProjector::place`]: a chunk owns
+/// the buildings whose centroid lies in its rectangle).
+pub fn light_points_in<'a>(buildings: impl IntoIterator<Item = &'a Building>, proj: &TileProjector, profile: &Profile) -> (Vec<[f32; 3]>, Vec<[f32; 4]>) {
+    light_points_placed(buildings.into_iter().filter_map(|b| proj.place(b).map(|c| (b, c))), 0, profile)
+}
+
+fn light_points_placed<'a>(placed: impl Iterator<Item = (&'a Building, [f32; 2])>, n: usize, profile: &Profile) -> (Vec<[f32; 3]>, Vec<[f32; 4]>) {
     let mut pos = Vec::with_capacity(n);
     let mut col = Vec::with_capacity(n);
-    for b in buildings.iter().filter(|b| b.owned) {
+    for (b, centroid) in placed {
         let r = resolve(b, profile);
         if r.profile == PROFILE_DARK {
             continue; // dark buildings have no light point (a landmark's is its floodlight color)
         }
-        pos.push([b.centroid[0], b.base_m + r.height, -b.centroid[1]]);
+        pos.push([centroid[0], b.base_m + r.height, -centroid[1]]);
         let mut c = profile.profile_color(r.profile);
         c[3] = intensity(1);
         col.push(c);
@@ -139,18 +160,26 @@ const BEACON_SALT: u64 = 0xB3AC_0A11_6E77_D2F5;
 /// Beacons of every owned building at least `min_height_m` tall (see module docs). Buildings come in decode order (sorted),
 /// so the output is deterministic.
 pub fn beacon_points(buildings: &[Building], proj: &TileProjector, profile: &Profile) -> (Vec<[f32; 3]>, Vec<[f32; 4]>) {
+    beacon_points_placed(buildings.iter().filter(|b| b.owned).map(|b| (b, b.centroid)), proj, profile)
+}
+
+/// [`beacon_points`] for the tile or chunk of `proj` (ownership by [`TileProjector::place`]).
+pub fn beacon_points_in<'a>(buildings: impl IntoIterator<Item = &'a Building>, proj: &TileProjector, profile: &Profile) -> (Vec<[f32; 3]>, Vec<[f32; 4]>) {
+    beacon_points_placed(buildings.into_iter().filter_map(|b| proj.place(b).map(|c| (b, c))), proj, profile)
+}
+
+fn beacon_points_placed<'a>(placed: impl Iterator<Item = (&'a Building, [f32; 2])>, proj: &TileProjector, profile: &Profile) -> (Vec<[f32; 3]>, Vec<[f32; 4]>) {
     let s = &profile.lights.beacons;
     let mut pos = Vec::new();
     let mut col = Vec::new();
     let mut corners: Vec<[f32; 2]> = Vec::with_capacity(4);
-    for b in buildings.iter().filter(|b| b.owned) {
+    for (b, c) in placed {
         let h = resolve(b, profile).height;
         if (h as f64) < s.min_height_m {
             continue;
         }
         let Some(ring) = b.polygons.first().and_then(|p| p.first()) else { continue };
         // Outer ring in meters (east, north) relative to the centroid.
-        let c = b.centroid;
         let pts = ring.iter().map(|&p| {
             let [e, n] = proj.project64(p);
             [e as f32 - c[0], n as f32 - c[1]]
@@ -214,7 +243,8 @@ const STREET_TYPE_SALT: u64 = 0x57EE_71A3_9C2D_4B61;
 pub fn street_points(roads: &[RoadLine], proj: &TileProjector, profile: &Profile) -> (Vec<[f32; 3]>, Vec<[f32; 4]>) {
     let s = &profile.lights.street;
     let spacing = s.spacing_m.max(1.0);
-    let ext = proj.extent();
+    // The tile rectangle, or the chunk's (a cut projector): each lamp lands in exactly one.
+    let rect = proj.rect();
     let main = [s.color[0] as f32, s.color[1] as f32, s.color[2] as f32, intensity(1)];
     let alt = [s.alt_color[0] as f32, s.alt_color[1] as f32, s.alt_color[2] as f32, intensity(1)];
     let mut pos = Vec::new();
@@ -235,7 +265,7 @@ pub fn street_points(roads: &[RoadLine], proj: &TileProjector, profile: &Profile
                 while next <= walked + seg {
                     let t = if seg > 0.0 { (next - walked) / seg } else { 0.0 };
                     let px = [line[i - 1][0] + (line[i][0] - line[i - 1][0]) * t, line[i - 1][1] + (line[i][1] - line[i - 1][1]) * t];
-                    if (0.0..ext).contains(&px[0]) && (0.0..ext).contains(&px[1]) {
+                    if (rect.x0..rect.x1).contains(&px[0]) && (rect.y0..rect.y1).contains(&px[1]) {
                         let e = a[0] + (b[0] - a[0]) * t;
                         let n = a[1] + (b[1] - a[1]) * t;
                         // The terrain under the lamp, not the chord between the polyline ends.

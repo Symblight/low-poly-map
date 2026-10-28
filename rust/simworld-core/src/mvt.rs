@@ -362,19 +362,83 @@ pub fn centroid_px(polys: &[Vec<Vec<[f64; 2]>>]) -> Option<[f64; 2]> {
 /// Projects tile pixels to ENU relative to the tile center, with the terrain height there.
 /// Workers get their heights only through this (`Terrain` is part of the job): flat (0) unless
 /// built [`TileProjector::with_terrain`].
+///
+/// Chunks (Tiles v2, step T2): a projector can be [`TileProjector::cut`] to a finer tile (a
+/// render chunk) inside its pixel tile: pixels stay those of the data tile (exact Web Mercator,
+/// so the chunk rectangle is axis-aligned and seams clip bit for bit), while the output origin,
+/// the clip rectangle, the band and the metres per pixel follow the chunk.
 #[derive(Clone, Debug)]
 pub struct TileProjector {
+    /// The tile the pixels belong to (the data tile of a cut projector).
     key: TileKey,
     frame: Frame,
     extent: f64,
+    /// Output origin: center of the target tile (the chunk of a cut projector).
     center: [f64; 2],
     terrain: Terrain,
+    /// The target tile (`key` unless cut) and its rectangle in `key`'s pixels.
+    target: TileKey,
+    rect: crate::mesher::ClipRect,
 }
 
 impl TileProjector {
     /// A projector over flat terrain (every height 0).
     pub fn new(key: TileKey, frame: Frame, extent: f64) -> Self {
-        Self { key, frame, extent, center: frame.tile_center(key), terrain: Terrain::flat() }
+        Self {
+            key,
+            frame,
+            extent,
+            center: frame.tile_center(key),
+            terrain: Terrain::flat(),
+            target: key,
+            rect: crate::mesher::ClipRect::tile(extent),
+        }
+    }
+    /// The same pixels (of this projector's tile) seen from `chunk`, a tile at or inside it:
+    /// output relative to the chunk center, clip rectangle = the chunk, band and metres per
+    /// pixel of the chunk. `None` if `chunk` is not inside this projector's pixel tile.
+    pub fn cut(&self, chunk: TileKey) -> Option<Self> {
+        if chunk.z < self.key.z || chunk.z - self.key.z > 20 {
+            return None;
+        }
+        let dz = chunk.z - self.key.z;
+        if (chunk.x >> dz, chunk.y >> dz) != (self.key.x, self.key.y) {
+            return None;
+        }
+        let n = (1u64 << dz) as f64;
+        let s = self.extent / n;
+        let (ix, iy) = ((chunk.x - (self.key.x << dz)) as f64, (chunk.y - (self.key.y << dz)) as f64);
+        let rect = crate::mesher::ClipRect { x0: ix * s, y0: iy * s, x1: (ix + 1.0) * s, y1: (iy + 1.0) * s };
+        Some(Self { center: self.frame.tile_center(chunk), target: chunk, rect, ..self.clone() })
+    }
+    /// The target tile: the projector's own tile, or the chunk it was [`TileProjector::cut`] to.
+    /// Bands, drape margins and airport fields follow it.
+    #[allow(clippy::misnamed_getters)]
+    pub fn key(&self) -> TileKey {
+        self.target
+    }
+    /// The tile the pixel coordinates belong to (the data tile of a cut projector).
+    pub fn pixel_key(&self) -> TileKey {
+        self.key
+    }
+    /// The target tile's rectangle in pixels (the whole tile unless cut).
+    pub fn rect(&self) -> crate::mesher::ClipRect {
+        self.rect
+    }
+    /// Whether this is a chunk cut from a larger pixel tile.
+    pub fn is_cut(&self) -> bool {
+        self.target != self.key
+    }
+    /// Ownership of a building by its centroid, and its centroid relative to the target tile:
+    /// the decode result (`owned`, `centroid`) for a whole tile; for a chunk, the chunk whose
+    /// half-open rectangle contains the centroid (each building belongs to exactly one of the
+    /// chunks of its data tile).
+    pub fn place(&self, b: &Building) -> Option<[f32; 2]> {
+        if !self.is_cut() {
+            return b.owned.then_some(b.centroid);
+        }
+        let (r, c) = (&self.rect, b.centroid_px);
+        (c[0] >= r.x0 && c[0] < r.x1 && c[1] >= r.y0 && c[1] < r.y1).then(|| self.project(c))
     }
     /// The same projector sampling `terrain` for every height.
     pub fn with_terrain(mut self, terrain: Terrain) -> Self {
@@ -383,9 +447,6 @@ impl TileProjector {
     }
     pub fn terrain(&self) -> &Terrain {
         &self.terrain
-    }
-    pub fn key(&self) -> TileKey {
-        self.key
     }
     /// WGS84 lat/lon of a tile pixel.
     pub fn lat_lon(&self, px: [f64; 2]) -> (f64, f64) {
@@ -493,8 +554,13 @@ impl TileProjector {
         let [e, n] = self.project64(px);
         [e as f32, n as f32]
     }
-    /// Meters per pixel at the tile center (for tolerances and areas).
+    /// Meters per pixel at the target tile's center (for tolerances and areas).
     pub fn m_per_px(&self) -> f64 {
+        if self.is_cut() {
+            let (lat, _) = self.target.center_lat_lon();
+            let px = self.rect.x1 - self.rect.x0;
+            return crate::geo::tile_width_m(lat, self.target.z) / px;
+        }
         let (lat, _) = self.key.center_lat_lon();
         crate::geo::tile_width_m(lat, self.key.z) / self.extent
     }
@@ -775,17 +841,41 @@ fn layer_extent(l: &mvt_reader::layer::Layer) -> f64 {
     }
 }
 
+/// Scale every point by `k` (a layer whose extent differs from the tile's common extent; the
+/// common extent is the largest, so `k` is a power of two for the usual extents and exact).
+fn scale_rings(rings: &mut [Vec<[f64; 2]>], k: f64) {
+    if k != 1.0 {
+        for p in rings.iter_mut().flatten() {
+            p[0] *= k;
+            p[1] *= k;
+        }
+    }
+}
+
+/// The common pixel extent of a tile: the largest extent of the layers the decoder reads. Each
+/// layer may have its own extent (the Tiles v2 overview level mixes 4096 and 16384); every layer
+/// is scaled to the common one, so all geometry of a tile shares one pixel space.
+fn common_extent(layers: &[mvt_reader::layer::Layer]) -> f64 {
+    layers
+        .iter()
+        .filter(|l| l.name == BUILDINGS_LAYER || l.name == LANDUSE_LAYER || l.name == ROADS_LAYER)
+        .map(layer_extent)
+        .fold(None, |a: Option<f64>, e| Some(a.map_or(e, |a| a.max(e))))
+        .unwrap_or(4096.0)
+}
+
 /// `landuse` layer -> building fallback index, plus ground areas when `ground` is set.
 fn decode_landuse(
     reader: &mvt_reader::Reader,
     layers: &[mvt_reader::layer::Layer],
     ground: Option<&mut Vec<GroundArea>>,
     profile: &Profile,
+    extent: f64,
 ) -> Result<LanduseIndex, String> {
     let Some(layer) = layers.iter().find(|l| l.name == LANDUSE_LAYER) else {
         return Ok(LanduseIndex::empty());
     };
-    let extent = layer_extent(layer);
+    let k = extent / layer_extent(layer);
     let features = reader
         .get_features(layer.layer_index)
         .map_err(|e| format!("mvt landuse: {e:?}"))?;
@@ -800,10 +890,11 @@ fn decode_landuse(
         let fallback = feeds_building_fallback(&kind);
         let class = Landuse::parse(&kind);
         let (gclass, level) = profile.ground_area_class(&kind);
-        for rings in pp {
+        for mut rings in pp {
             if rings.is_empty() || rings[0].len() < 3 {
                 continue;
             }
+            scale_rings(&mut rings, k);
             match areas.as_deref_mut() {
                 Some(a) => {
                     if fallback {
@@ -825,10 +916,12 @@ fn decode_roads(
     layers: &[mvt_reader::layer::Layer],
     out: &mut Vec<RoadLine>,
     profile: &Profile,
+    extent: f64,
 ) -> Result<(), String> {
     let Some(layer) = layers.iter().find(|l| l.name == ROADS_LAYER) else {
         return Ok(());
     };
+    let k = extent / layer_extent(layer);
     let features = reader
         .get_features(layer.layer_index)
         .map_err(|e| format!("mvt roads: {e:?}"))?;
@@ -839,6 +932,7 @@ fn decode_roads(
         if lines.is_empty() {
             continue;
         }
+        scale_rings(&mut lines, k);
         let props = f.properties.as_ref().unwrap_or(&empty);
         let kind = props.get("kind").and_then(text).unwrap_or_default();
         let (class, link, minor) = profile.road_class(&kind);
@@ -899,30 +993,32 @@ pub fn decode_tile_on(
     let reader = mvt_reader::Reader::new(data).map_err(|e| format!("mvt: {e:?}"))?;
     let layers = reader.get_layer_metadata().map_err(|e| format!("mvt layers: {e:?}"))?;
     let mut ground = GroundFeatures::default();
-    let landuse = decode_landuse(&reader, &layers, want_ground.then_some(&mut ground.areas), profile)?;
+    // One pixel space per tile: the largest layer extent; other layers are scaled to it.
+    let extent = common_extent(&layers);
+    let landuse = decode_landuse(&reader, &layers, want_ground.then_some(&mut ground.areas), profile, extent)?;
     if want_roads {
-        decode_roads(&reader, &layers, &mut ground.roads, profile)?;
+        decode_roads(&reader, &layers, &mut ground.roads, profile, extent)?;
     }
     if want_ground || want_roads {
         ground.sort();
     }
-    // All layers share the tile's extent (4096 in our archive); take it from whichever exists.
-    let extent = layers
-        .iter()
-        .find(|l| l.name == BUILDINGS_LAYER)
-        .or_else(|| layers.iter().find(|l| l.name == LANDUSE_LAYER || l.name == ROADS_LAYER))
-        .map_or(4096.0, layer_extent);
     let proj = TileProjector::new(key, frame, extent).with_terrain(terrain.clone());
     let Some(layer) = layers.iter().find(|l| l.name == BUILDINGS_LAYER) else {
         return Ok(DecodedTile { buildings: Vec::new(), ground, proj });
     };
+    let kb = extent / layer_extent(layer);
     let features = reader
         .get_features(layer.layer_index)
         .map_err(|e| format!("mvt features: {e:?}"))?;
     let empty = HashMap::new();
     let mut out = Vec::with_capacity(features.len());
     for f in features {
-        let Some(polygons) = feature_polys(&f.geometry) else { continue };
+        let Some(mut polygons) = feature_polys(&f.geometry) else { continue };
+        if kb != 1.0 {
+            for p in polygons.iter_mut() {
+                scale_rings(p, kb);
+            }
+        }
         let props = f.properties.as_ref().unwrap_or(&empty);
         let id = props
             .get("id")
@@ -1007,6 +1103,11 @@ pub(crate) mod test_mvt {
 
     /// Encode one layer; `lines` = LINESTRING features (each "ring" is one open line).
     pub fn encode_layer_typed(name: &str, feats: &[Feat], lines: bool) -> Vec<u8> {
+        encode_layer_ext(name, feats, lines, 4096)
+    }
+
+    /// [`encode_layer_typed`] with the layer's `extent`.
+    pub fn encode_layer_ext(name: &str, feats: &[Feat], lines: bool, extent: u32) -> Vec<u8> {
         let mut keys: Vec<&str> = Vec::new();
         let mut vals: Vec<Vec<u8>> = Vec::new();
         let mut layer = Vec::new();
@@ -1069,7 +1170,7 @@ pub(crate) mod test_mvt {
             bytes_field(&mut layer, 4, v);
         }
         tag(&mut layer, 5, 0);
-        varint(&mut layer, 4096);
+        varint(&mut layer, extent as u64);
         let mut tile = Vec::new();
         bytes_field(&mut tile, 3, &layer);
         tile

@@ -289,6 +289,12 @@ pub struct WorldStats {
     pub jobs: JobStats,
     /// The memory budget of the core's CPU-side pools (`World::memory`).
     pub memory: MemoryStats,
+    /// Tiles v2 data tiles (vector layer, archive sources): decoded tiles resident now, and
+    /// decodes since the world was configured (a re-decode after an eviction counts again).
+    pub data_tiles_loaded: u32,
+    pub data_tiles_decoded: u64,
+    /// Data tile fetches completed since configure (disk cache or network).
+    pub data_tiles_fetched: u64,
 }
 
 fn first4(a: [i32; MAX_RINGS]) -> [i32; RING_COUNT] {
@@ -481,14 +487,17 @@ impl World {
                 }
                 m => {
                     match &m {
-                        WorkerMsg::Fetched { result, .. } => self.health.record_fetch(result, now),
-                        WorkerMsg::Decoded { result: Err(e), .. } => self.health.record_decode_failure(e, now),
+                        WorkerMsg::Fetched { result, .. } | WorkerMsg::DataFetched { result, .. } => self.health.record_fetch(result, now),
+                        WorkerMsg::Decoded { result: Err(e), .. } | WorkerMsg::DataDecoded { result: Err(e), .. } => {
+                            self.health.record_decode_failure(e, now)
+                        }
                         _ => {}
                     }
                     warns.extend(sched.handle(m, now));
                 }
             }
         }
+        sched.sync_memory(&mut self.memory);
         for w in warns {
             self.warn(&w);
         }
@@ -505,7 +514,8 @@ impl World {
         self.jobs.sort_by(|a, b| {
             let d = |j: &Job| match *j {
                 Job::Terrain { key, .. } => t.camera_distance(key),
-                Job::Fetch { key, .. } | Job::Decode { key, .. } => w.camera_distance(key),
+                Job::FetchData { key, .. } | Job::DecodeData { key, .. } => w.data_distance(key),
+                Job::Fetch { key, .. } | Job::Decode { key, .. } | Job::MeshChunk { key, .. } => w.camera_distance(key),
             };
             d(a).total_cmp(&d(b))
         });
@@ -535,7 +545,10 @@ impl World {
             for j in self.jobs.drain(..) {
                 let prio = match &j {
                     Job::Terrain { key, .. } => self.terrain_sched.as_ref().map(|t| t.job_priority(*key)),
-                    Job::Fetch { key, .. } | Job::Decode { key, .. } => self.scheduler.as_ref().map(|s| s.job_priority(*key)),
+                    Job::FetchData { key, .. } | Job::DecodeData { key, .. } => self.scheduler.as_ref().map(|s| s.data_job_priority(*key)),
+                    Job::Fetch { key, .. } | Job::Decode { key, .. } | Job::MeshChunk { key, .. } => {
+                        self.scheduler.as_ref().map(|s| s.job_priority(*key))
+                    }
                 };
                 w.submit(j, prio.unwrap_or(Priority::prefetch(f64::INFINITY)));
             }
@@ -717,7 +730,14 @@ impl World {
             Ok(mut w) => {
                 w.set_terrain(self.terrain.clone());
                 w.set_seed(self.seed.clone());
-                self.scheduler = Some(Scheduler::new(frame, w.is_synthetic(), self.profile.clone()).with_terrain(self.terrain.clone()));
+                let mut s = Scheduler::new(frame, w.is_synthetic(), self.profile.clone()).with_terrain(self.terrain.clone());
+                if !w.is_synthetic() {
+                    // Tiles v2 (T2a): R0 / R1 are cut from detail data tiles. An archive without
+                    // `simworld_levels` metadata (zooms 13..16) is read with the compatibility
+                    // levels (detail z14); two-level archives come with step T2b.
+                    s = s.with_data_levels(crate::data::DataLevels::COMPAT);
+                }
+                self.scheduler = Some(s);
                 if self.terrain.is_active() {
                     self.terrain_detail = self.clamp_detail(self.terrain_detail);
                     let mut t = Scheduler::new_terrain(frame, self.profile.clone(), self.terrain.clone());
@@ -824,8 +844,10 @@ impl World {
     /// Returns false if the bounded wait timed out.
     fn stop_running(&mut self, next: Option<(&str, &str, u64)>) -> (bool, Option<Arc<DiskCache>>) {
         // The host keeps whatever we handed out before: unload it with the next drain_unload.
-        if let Some(s) = &self.scheduler {
+        if let Some(s) = &mut self.scheduler {
             self.stale_unloads.extend(s.delivered_keys().into_iter().map(LayerKey::world));
+            // The decoded data tiles go with the scheduler: out of the memory budget.
+            s.release_memory(&mut self.memory);
         }
         if let Some(t) = &self.terrain_sched {
             self.stale_unloads.extend(t.delivered_keys().into_iter().map(LayerKey::terrain));
@@ -963,6 +985,7 @@ impl World {
         if let Some(s) = &mut self.scheduler {
             s.set_fades_elsewhere(self.terrain_sched.as_ref().map_or(0, |t| t.active_fades()));
             s.update(cam, vel, now, &mut self.jobs);
+            s.sync_memory(&mut self.memory);
         }
         if let Some(t) = &mut self.terrain_sched {
             t.set_fades_elsewhere(self.scheduler.as_ref().map_or(0, |s| s.active_fades()));
@@ -1059,6 +1082,17 @@ impl World {
         n
     }
 
+    /// The worker (tests).
+    #[cfg(test)]
+    pub(crate) fn worker(&self) -> Option<&Worker> {
+        self.worker.as_ref()
+    }
+
+    /// The vector layer's scheduler (tests and tools).
+    pub fn scheduler(&self) -> Option<&Scheduler> {
+        self.scheduler.as_ref()
+    }
+
     /// Tile keys the host must remove (including tiles left over from a previous `configure`).
     /// The slice is valid until the next call.
     pub fn drain_unload(&mut self) -> &[LayerKey] {
@@ -1099,6 +1133,7 @@ impl World {
 
     pub fn stats(&self) -> WorldStats {
         let st = self.scheduler.as_ref().map(|s| s.stats()).unwrap_or_default();
+        let data = self.scheduler.as_ref().map(|s| s.data_stats()).unwrap_or_default();
         let cache_mb = self.worker.as_ref().map_or(0.0, |w| w.cache_bytes() as f64 / 1_048_576.0);
         // Lat/lon of the *current* local origin (moves with re-centering).
         let (origin_lat, origin_lon) = match &self.frame {
@@ -1123,6 +1158,9 @@ impl World {
             terrain_tris: tst.tris,
             jobs: self.worker.as_ref().map(|w| w.job_stats()).unwrap_or_default(),
             memory: self.memory.stats(),
+            data_tiles_loaded: data.loaded,
+            data_tiles_decoded: data.decoded,
+            data_tiles_fetched: data.fetched,
         }
     }
 

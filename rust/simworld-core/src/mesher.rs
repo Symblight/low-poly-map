@@ -396,6 +396,17 @@ struct Scratch {
 
 /// Mesh every building fragment inside `rect` (tile pixels) into one merged buffer.
 pub fn mesh_buildings(buildings: &[Building], proj: &TileProjector, rect: ClipRect, params: LodParams, profile: &Profile) -> MeshData {
+    mesh_building_iter(buildings, proj, rect, params, profile)
+}
+
+/// [`mesh_buildings`] over any sequence of buildings (a chunk's candidates from its data tile).
+pub fn mesh_building_iter<'a>(
+    buildings: impl IntoIterator<Item = &'a Building>,
+    proj: &TileProjector,
+    rect: ClipRect,
+    params: LodParams,
+    profile: &Profile,
+) -> MeshData {
     let mut m = MeshData::default();
     let mut s = Scratch::default();
     let m_per_px = proj.m_per_px();
@@ -896,10 +907,11 @@ fn emit_polygon(m: &mut MeshData, s: &mut Scratch, res: &Resolved, color: [f32; 
 }
 
 /// Ring-dependent meshing: one merged mesh per tile, clipped exactly to the tile rectangle
-/// (R0 full detail, R1 boxes, R2 coarse merged blocks); R3 has no mesh.
+/// (R0 full detail, R1 boxes, R2 coarse merged blocks); R3 has no mesh. A cut projector
+/// ([`TileProjector::cut`]) meshes its chunk's rectangle of the data tile.
 pub fn mesh_tile(buildings: &[Building], proj: &TileProjector, ring: usize, profile: &Profile) -> MeshData {
     match profile.lod(ring) {
-        Some(p) => mesh_buildings(buildings, proj, ClipRect::tile(proj.extent()), p, profile),
+        Some(p) => mesh_buildings(buildings, proj, proj.rect(), p, profile),
         None => MeshData::default(),
     }
 }

@@ -18,7 +18,8 @@ use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender};
 use tokio::task::AbortHandle;
 
-use crate::jobs::{default_threads, JobEnd, JobPool, JobSpec, JobStats, PoolConfig, Priority};
+use crate::data::{build_chunk, decode_data_tile, DataTile};
+use crate::jobs::{default_threads, JobEnd, JobPool, JobSpec, JobStats, Output, PoolConfig, Priority};
 use crate::rings::LayerKind;
 use crate::fetch::{DiskCache, FetchError, FetchErrorKind, FetchParams, Fetcher, Note, Source};
 use crate::geo::{Frame, TileKey};
@@ -223,6 +224,42 @@ pub enum Job {
     /// Terrain layer (api 1.5): build the TIN of a terrain tile at `detail` times the band's
     /// `max_error_m`. No fetch stage (the terrain is a function).
     Terrain { key: TileKey, ring: usize, job: u64, detail: f64 },
+    /// Tiles v2 (T2a): fetch the raw bytes of data tile `key` (I/O runtime, disk cache first).
+    FetchData { key: TileKey, job: u64 },
+    /// Tiles v2: decode data tile `key` into an `Arc<DataTile>` (CPU pool); the output goes to
+    /// the dependent [`Job::MeshChunk`]s and back to the main thread ([`WorkerMsg::DataDecoded`]).
+    DecodeData { key: TileKey, job: u64, bytes: Bytes },
+    /// Tiles v2: cut render chunk `key` (band `ring`) from its data tile. Replies like a
+    /// [`Job::Decode`] (`Decoded` or `Dropped`).
+    MeshChunk { key: TileKey, ring: usize, job: u64, data: DataRef },
+}
+
+/// The data tile a [`Job::MeshChunk`] is cut from.
+#[derive(Debug, Clone)]
+pub enum DataRef {
+    /// Already decoded (resident on the main thread).
+    Ready(Arc<DataTile>),
+    /// The output of the pending [`Job::DecodeData`] with this job id (a pool dependency: a
+    /// failed or cancelled decode cancels the chunk job).
+    After(u64),
+}
+
+impl Job {
+    /// Tile key of the job (the data tile for `FetchData` / `DecodeData`).
+    pub fn key(&self) -> TileKey {
+        match *self {
+            Job::Fetch { key, .. }
+            | Job::Decode { key, .. }
+            | Job::Terrain { key, .. }
+            | Job::FetchData { key, .. }
+            | Job::DecodeData { key, .. }
+            | Job::MeshChunk { key, .. } => key,
+        }
+    }
+    /// A data-tile job (`FetchData` / `DecodeData`) rather than a job of a tracked tile.
+    pub fn is_data(&self) -> bool {
+        matches!(self, Job::FetchData { .. } | Job::DecodeData { .. })
+    }
 }
 
 #[derive(Debug)]
@@ -231,9 +268,16 @@ pub enum WorkerMsg {
     Decoded { key: TileKey, ring: usize, job: u64, result: Result<TileData, String> },
     /// Result of a [`Job::Terrain`] (routed to the terrain layer's scheduler).
     TerrainBuilt { key: TileKey, ring: usize, job: u64, result: Result<TileData, String> },
-    /// A `Decode` (`layer` World) or `Terrain` job that was cancelled before or while it ran
-    /// (a stale generation, or shutdown): frees its slot, carries no result.
+    /// A `Decode` / `MeshChunk` (`layer` World) or `Terrain` job that was cancelled before or
+    /// while it ran (a stale generation, a cancelled dependency, or shutdown): frees its slot,
+    /// carries no result.
     Dropped { layer: LayerKind, key: TileKey, ring: usize, job: u64 },
+    /// Result of a [`Job::FetchData`].
+    DataFetched { key: TileKey, job: u64, result: Result<(Bytes, Source), FetchError> },
+    /// Result of a [`Job::DecodeData`] (sent before the dependent chunk jobs run).
+    DataDecoded { key: TileKey, job: u64, result: Result<Arc<DataTile>, String> },
+    /// A [`Job::DecodeData`] that was cancelled before or while it ran.
+    DataDropped { key: TileKey, job: u64 },
     Info(String),
     /// Logged as a (rate-limited) warning on the main thread.
     Warn(String),
@@ -675,6 +719,32 @@ impl Worker {
         self.pool.threads()
     }
 
+    /// Tests: occupy every CPU pool thread with a job that ignores cancellation and blocks until
+    /// the returned sender is dropped; returns once all of them run. Jobs submitted meanwhile
+    /// stay queued, so "jobs in flight" is a fact, not a race.
+    #[cfg(test)]
+    pub(crate) fn hold_cpu_threads(&self) -> crossbeam_channel::Sender<()> {
+        let (gate_tx, gate_rx) = crossbeam_channel::unbounded::<()>();
+        let (started_tx, started_rx) = crossbeam_channel::unbounded::<()>();
+        for i in 0..self.pool.threads() {
+            let (gate, started) = (gate_rx.clone(), started_tx.clone());
+            // Ids far above the scheduler's generation numbers.
+            self.pool.submit(
+                JobSpec::new((1 << 62) + i as u64, Priority::on_demand(f64::NEG_INFINITY)),
+                move |_| {
+                    let _ = started.send(());
+                    let _ = gate.recv();
+                    JobEnd::Done(None)
+                },
+                || {},
+            );
+        }
+        for _ in 0..self.pool.threads() {
+            started_rx.recv_timeout(std::time::Duration::from_secs(5)).expect("hold job started");
+        }
+        gate_tx
+    }
+
     pub fn try_recv(&self) -> Option<WorkerMsg> {
         self.rx.try_recv().ok()
     }
@@ -684,32 +754,85 @@ impl Worker {
     pub fn submit(&self, job: Job, prio: Priority) {
         match job {
             Job::Fetch { key, ring, job } => {
+                self.spawn_fetch(key, job, move |result| WorkerMsg::Fetched { key, ring, job, result });
+            }
+            Job::FetchData { key, job } => {
+                self.spawn_fetch(key, job, move |result| WorkerMsg::DataFetched { key, job, result });
+            }
+            Job::DecodeData { key, job, bytes } => {
                 let tx = self.tx.clone();
-                let (Some(rt), Some(f)) = (&self.rt, &self.fetcher) else {
-                    let _ = tx.send(WorkerMsg::Fetched {
-                        key,
-                        ring,
-                        job,
-                        result: Err("no tile source".into()),
-                    });
-                    return;
+                let frame = self.frame;
+                let terrain = self.terrain.clone();
+                let profile = self.profile.clone();
+                let tx_cancel = self.tx.clone();
+                let spec = JobSpec::new(pool_id(LayerKind::World, job), prio);
+                self.pool.submit(
+                    spec,
+                    move |ctx| {
+                        if ctx.is_cancelled() {
+                            return JobEnd::Cancelled;
+                        }
+                        let result = catch_unwind(AssertUnwindSafe(|| decode_data_tile(key, frame, &terrain, &bytes, &profile)))
+                            .unwrap_or_else(|p| Err(format!("data decode panic: {}", panic_text(p))));
+                        if result.is_ok() && ctx.is_cancelled() {
+                            return JobEnd::Cancelled;
+                        }
+                        match result {
+                            Ok(d) => {
+                                let d = Arc::new(d);
+                                // Main thread first (resident tile), then the dependants.
+                                let _ = tx.send(WorkerMsg::DataDecoded { key, job, result: Ok(d.clone()) });
+                                JobEnd::Done(Some(d as Output))
+                            }
+                            Err(e) => {
+                                let _ = tx.send(WorkerMsg::DataDecoded { key, job, result: Err(e) });
+                                JobEnd::Failed
+                            }
+                        }
+                    },
+                    move || {
+                        let _ = tx_cancel.send(WorkerMsg::DataDropped { key, job });
+                    },
+                );
+            }
+            Job::MeshChunk { key, ring, job, data } => {
+                let tx = self.tx.clone();
+                let profile = self.profile.clone();
+                let on_cancel = self.dropped_reply(LayerKind::World, key, ring, job);
+                let (ready, deps) = match data {
+                    DataRef::Ready(d) => (Some(d), Vec::new()),
+                    DataRef::After(j) => (None, vec![pool_id(LayerKind::World, j)]),
                 };
-                let f = f.clone();
-                // Inner task so a panic or a cancel becomes a JoinError instead of a lost reply
-                // (the scheduler's in-flight counters need exactly one reply per job).
-                let inner = rt.spawn(async move { f.fetch(key).await });
-                let fetches = self.fetches.clone();
-                // Registered before the outer task exists, so its removal always comes after.
-                lock(&fetches).insert(job, inner.abort_handle());
-                rt.spawn(async move {
-                    let result = match inner.await {
-                        Ok(r) => r,
-                        Err(e) if e.is_cancelled() => Err(FetchError::new(FetchErrorKind::Cancelled, format!("{key}: cancelled"))),
-                        Err(e) => Err(format!("fetch task: {e}").into()),
-                    };
-                    lock(&fetches).remove(&job);
-                    let _ = tx.send(WorkerMsg::Fetched { key, ring, job, result });
-                });
+                let spec = JobSpec::new(pool_id(LayerKind::World, job), prio).with_deps(deps);
+                self.pool.submit(
+                    spec,
+                    move |ctx| {
+                        let data = match ready {
+                            Some(d) => d,
+                            None => match ctx.deps().first().cloned().and_then(|o| o.downcast::<DataTile>().ok()) {
+                                Some(d) => d,
+                                None => return JobEnd::Cancelled,
+                            },
+                        };
+                        let stop = || ctx.is_cancelled();
+                        let result = catch_unwind(AssertUnwindSafe(|| build_chunk(&data, key, ring, &profile, &stop)))
+                            .unwrap_or_else(|p| Err(format!("chunk panic: {}", panic_text(p))));
+                        let result = match result {
+                            Ok(None) => return JobEnd::Cancelled,
+                            Ok(Some(_)) if ctx.is_cancelled() => return JobEnd::Cancelled,
+                            Ok(Some(d)) => Ok(d),
+                            Err(e) => Err(e),
+                        };
+                        let failed = result.is_err();
+                        let _ = tx.send(WorkerMsg::Decoded { key, ring, job, result });
+                        if failed {
+                            JobEnd::Failed
+                        } else {
+                            JobEnd::Done(None)
+                        }
+                    },
+                    on_cancel,
+                );
             }
             Job::Decode { key, ring, job, payload } => {
                 let tx = self.tx.clone();
@@ -785,6 +908,32 @@ impl Worker {
 }
 
 impl Worker {
+    /// Fetch `key` on the I/O runtime; `reply` turns the result into the message sent back
+    /// (exactly one per job, also on cancel or panic). Registered for [`Worker::cancel`] by `job`.
+    fn spawn_fetch(&self, key: TileKey, job: u64, reply: impl FnOnce(Result<(Bytes, Source), FetchError>) -> WorkerMsg + Send + 'static) {
+        let tx = self.tx.clone();
+        let (Some(rt), Some(f)) = (&self.rt, &self.fetcher) else {
+            let _ = tx.send(reply(Err("no tile source".into())));
+            return;
+        };
+        let f = f.clone();
+        // Inner task so a panic or a cancel becomes a JoinError instead of a lost reply
+        // (the scheduler's in-flight counters need exactly one reply per job).
+        let inner = rt.spawn(async move { f.fetch(key).await });
+        let fetches = self.fetches.clone();
+        // Registered before the outer task exists, so its removal always comes after.
+        lock(&fetches).insert(job, inner.abort_handle());
+        rt.spawn(async move {
+            let result = match inner.await {
+                Ok(r) => r,
+                Err(e) if e.is_cancelled() => Err(FetchError::new(FetchErrorKind::Cancelled, format!("{key}: cancelled"))),
+                Err(e) => Err(format!("fetch task: {e}").into()),
+            };
+            lock(&fetches).remove(&job);
+            let _ = tx.send(reply(result));
+        });
+    }
+
     /// The `Dropped` reply of a cancelled CPU job (sent at most once, by the pool).
     fn dropped_reply(&self, layer: LayerKind, key: TileKey, ring: usize, job: u64) -> impl FnOnce() + Send + 'static {
         let tx = self.tx.clone();

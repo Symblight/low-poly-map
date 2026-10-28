@@ -943,15 +943,23 @@ fn shutdown_with_jobs_in_flight_does_not_block() {
     let mut w = world();
     for _ in 0..3 {
         assert!(w.configure_world(synthetic(VILNIUS.0, VILNIUS.1)).ok);
+        // Deterministic: every pool thread is busy with a job that ignores its cancel flag
+        // (a long build stage), so the mesh jobs of the cover stay queued behind them. Before,
+        // a fast machine could finish the synthetic jobs before the check (flaky under load).
+        let threads = w.worker().unwrap().cpu_threads();
+        let gate = w.worker().unwrap().hold_cpu_threads();
         for _ in 0..3 {
             w.update_camera([0.0, 50.0, 0.0], [0.0; 3], 50.0);
         }
         let j = w.stats().jobs;
-        assert!(j.queued + j.running > 0, "jobs in flight: {j:?}");
+        assert_eq!(j.running, threads, "jobs in flight: {j:?}");
+        assert!(j.queued > 0, "jobs in flight: {j:?}");
         let t0 = Instant::now();
         assert!(w.shutdown());
         assert!(t0.elapsed() < Duration::from_millis(500), "shutdown took {:?}", t0.elapsed());
         assert_eq!(w.stats().jobs, crate::jobs::JobStats::default());
+        // The held threads exit once released (they never touch the world).
+        drop(gate);
     }
     assert!(w.configure_world(synthetic(VILNIUS.0, VILNIUS.1)).ok);
     let (_, d) = run_until(&mut w, 5);

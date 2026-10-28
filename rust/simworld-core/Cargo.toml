@@ -46,6 +46,11 @@ ahash = "0.8.12"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Tests only: write small .pmtiles fixtures (served by a test HTTP server). Dev-dependency
+# features are not unified into normal builds (resolver 2).
+[dev-dependencies]
+pmtiles = { version = "0.25.0", default-features = false, features = ["write"] }
+
 # Disk cache benchmark, old file-per-tile cache vs SQLite (docs/spec-tile-cache.md): plain `main`,
 # no bench framework. `cargo bench -p simworld-core --bench cache_bench` (needs data/out/vilnius.pmtiles).
 [[bench]]

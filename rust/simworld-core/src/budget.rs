@@ -270,15 +270,21 @@ impl MemoryBudget {
     /// budget. Returns whether `key` is still resident: false = it was itself the lowest
     /// priority and got evicted (it is then also in the pool's evicted queue).
     pub fn insert(&mut self, key: ItemKey, bytes: u64, priority: f64) -> bool {
+        self.insert_pinned(key, bytes, priority, 0)
+    }
+
+    /// [`MemoryBudget::insert`] with `pins` pins added before the budget is enforced, so an item
+    /// that running jobs already depend on is never evicted by its own insertion.
+    pub fn insert_pinned(&mut self, key: ItemKey, bytes: u64, priority: f64, pins: u32) -> bool {
         let prio = Prio::new(priority);
-        let pins = match self.items.get(&key).copied() {
+        let old_pins = match self.items.get(&key).copied() {
             Some(old) => {
                 self.detach(key, old);
                 old.pins
             }
             None => 0,
         };
-        self.attach(key, Item { bytes, prio, pins });
+        self.attach(key, Item { bytes, prio, pins: old_pins + pins });
         self.enforce();
         self.items.contains_key(&key)
     }
@@ -541,6 +547,11 @@ mod tests {
         assert_eq!((s.total_bytes, s.over_budget_bytes, s.overshoots), (90, 40, 1));
         assert_eq!((s.pool(D).pinned_items, s.pool(D).pinned_bytes), (1, 60));
         check(&b);
+        // An item inserted with pins is protected from its own insertion.
+        assert!(b.insert_pinned(k(H, 7), 500, -100.0, 1));
+        assert!(b.is_pinned(k(H, 7)) && b.contains(k(H, 7)));
+        assert!(b.unpin(k(H, 7)));
+        assert_eq!(evicted(&mut b, H), vec![7]);
         // Updating a pinned item keeps its pins.
         b.insert(k(D, 1), 70, 0.0);
         assert!(b.is_pinned(k(D, 1)));

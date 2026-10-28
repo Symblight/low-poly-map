@@ -109,7 +109,9 @@ fn bench_update_camera_cost() {
                         let result = build_tile(key, ring, frame, &payload, &Profile::default());
                         let _ = s.handle(WorkerMsg::Decoded { key, ring, job, result }, t_start);
                     }
-                    Job::Terrain { .. } => unreachable!("vector layer"),
+                    Job::Terrain { .. } | Job::FetchData { .. } | Job::DecodeData { .. } | Job::MeshChunk { .. } => {
+                        unreachable!("vector layer, per-tile scheduler")
+                    }
                 }
             }
             for _ in 0..2 {
@@ -185,11 +187,7 @@ fn m4_budget() {
             }
             s.update(cam, [0.0; 3], Instant::now(), &mut jobs);
             for j in jobs.drain(..) {
-                let prio = match &j {
-                    crate::worker::Job::Fetch { key, .. } | crate::worker::Job::Decode { key, .. } | crate::worker::Job::Terrain { key, .. } => {
-                        s.job_priority(*key)
-                    }
-                };
+                let prio = if j.is_data() { s.data_job_priority(j.key()) } else { s.job_priority(j.key()) };
                 worker.submit(j, prio);
             }
             while let Some(t) = s.pop_ready(true) {
@@ -352,4 +350,88 @@ fn m4_budget() {
     }
     eprintln!("winding checked {checked} bad {bad_winding}");
     assert_eq!(bad_winding, 0);
+}
+
+/// Streaming measurement against a served archive (Tiles v2 step T2a, prints only): cold-cache
+/// fill at a fixed spot (300 m AGL) until every queued / fetching / meshing counter is 0, then a
+/// 20 s flight north at 250 m/s, 300 m AGL; prints the fill time and the latency table of each.
+/// `SIMPLANE_TEST_URL=http://127.0.0.1:8787/vilnius.pmtiles cargo test --release -p simworld-core
+/// archive_streaming_measure -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn archive_streaming_measure() {
+    use crate::world::{World, WorldOptions};
+    use std::time::Duration;
+    let Some(url) = url() else {
+        eprintln!("SIMPLANE_TEST_URL not set; skipped");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("simworld-measure-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let opts = || WorldOptions {
+        origin_lat: 54.6872,
+        origin_lon: 25.2797,
+        tile_url: url.clone(),
+        cache_dir: dir.to_string_lossy().into_owned(),
+        ..WorldOptions::default()
+    };
+    let busy = |w: &World| {
+        let s = w.stats();
+        s.queued.iter().chain(s.fetching.iter()).chain(s.meshing.iter()).sum::<i32>()
+    };
+    for pass in ["cold", "warm"] {
+        let mut w = World::new(Arc::new(crate::NullLog), crate::Diagnostics::default(), "measure");
+        assert!(w.configure_world(opts()).ok);
+        let t0 = Instant::now();
+        let mut n = 0usize;
+        loop {
+            w.update_camera([0.0, 300.0, 0.0], [0.0; 3], 300.0);
+            n += w.pop_ready(1024, |_| {});
+            let _ = w.drain_fades();
+            let _ = w.drain_unload();
+            if n > 0 && busy(&w) == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+            assert!(t0.elapsed() < Duration::from_secs(120), "fill did not settle");
+        }
+        let st = w.stats();
+        println!(
+            "{pass} fill: {n} deliveries in {:.0} ms, loaded per band {:?}, data tiles loaded {} decoded {} fetched {}",
+            t0.elapsed().as_secs_f64() * 1000.0,
+            st.loaded,
+            st.data_tiles_loaded,
+            st.data_tiles_decoded,
+            st.data_tiles_fetched
+        );
+        if let Some(l) = w.latency() {
+            println!("{pass} fill latency: {}", l.report());
+        }
+        w.shutdown();
+    }
+    let mut w = World::new(Arc::new(crate::NullLog), crate::Diagnostics::default(), "measure");
+    assert!(w.configure_world(opts()).ok);
+    let mut n = 0usize;
+    let mut z = 0.0f64;
+    for _ in 0..(60 * 20) {
+        let t0 = Instant::now();
+        z -= 250.0 / 60.0;
+        if let Some(s) = w.update_camera([0.0, 300.0, z], [0.0, 0.0, -250.0], 300.0) {
+            z -= s[2];
+        }
+        n += w.pop_ready(2, |_| {});
+        let _ = w.drain_fades();
+        let _ = w.drain_unload();
+        std::thread::sleep(Duration::from_millis(16).saturating_sub(t0.elapsed()));
+    }
+    let st = w.stats();
+    println!(
+        "flight 250 m/s 20 s: {n} deliveries, loaded per band {:?}, data tiles loaded {} decoded {} fetched {}",
+        st.loaded, st.data_tiles_loaded, st.data_tiles_decoded, st.data_tiles_fetched
+    );
+    if let Some(l) = w.latency() {
+        println!("flight latency: {}", l.report());
+    }
+    w.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
 }

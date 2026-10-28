@@ -21,6 +21,7 @@
 //! equal to the spike's constants), resolved by [`World::configure_world`].
 
 pub mod budget;
+pub mod data;
 pub mod diag;
 pub mod fetch;
 pub mod geo;
@@ -42,6 +43,8 @@ pub mod terrain;
 pub mod worker;
 pub mod world;
 
+#[cfg(test)]
+mod data_world_tests;
 #[cfg(test)]
 mod golden_tests;
 #[cfg(test)]

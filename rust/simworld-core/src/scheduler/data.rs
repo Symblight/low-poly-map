@@ -1,0 +1,387 @@
+//! Data tiles on the main thread (Tiles v2, step T2a): which data tiles are being fetched,
+//! decoded or are resident, how many chunk jobs depend on each, and their entries in the shared
+//! memory budget (pool `DataTiles`).
+//!
+//! Per data tile: Absent -> Fetching -> Fetched -> Decoding -> Resident; errors -> Failed (backoff)
+//! -> Absent, after [`DECODE_ATTEMPTS`] decode failures in a row -> Broken. One fetch and one decode
+//! per data tile however many chunks need it; a resident tile is reused by every later chunk job
+//! without any job of its own. A chunk job of a decoding tile depends on the decode job (a pool
+//! dependency), so it runs as soon as the decode finishes.
+//!
+//! Memory: a resident tile is registered in the budget with its byte estimate and a priority
+//! (needed by a chunk of the cover: nearest first; otherwise by distance, lower), pinned once per
+//! chunk job in flight that uses it. The scheduler does not own the budget: the changes are
+//! queued as [`MemOp`]s and applied by [`DataStore::sync`] (called by `World` after every
+//! scheduler call), which also drops the tiles the budget evicted. Eviction only drops the
+//! store's `Arc`: a running chunk job keeps its own.
+
+use std::sync::Arc;
+use std::time::Instant;
+
+use ahash::AHashMap;
+use bytes::Bytes;
+
+use super::state::DECODE_ATTEMPTS;
+use crate::budget::{ItemKey, MemoryBudget, Pool};
+use crate::data::{DataLevels, DataTile};
+use crate::fetch::{FetchError, FetchErrorKind, Source};
+use crate::geo::TileKey;
+use crate::profile::Profile;
+
+/// State of one data tile.
+#[derive(Debug)]
+pub(super) enum DataState {
+    Absent,
+    Fetching { job: u64 },
+    Fetched(Bytes),
+    Decoding { job: u64 },
+    Resident(Arc<DataTile>),
+    Failed { retry_at: Instant },
+    Broken,
+}
+
+#[derive(Debug)]
+pub(super) struct DataEntry {
+    pub state: DataState,
+    attempts: u32,
+    decode_failures: u32,
+    /// Chunk jobs in flight that use this tile (one budget pin each while resident).
+    pins: u32,
+    /// Smallest delivery order of the chunks of the cover waiting for this tile (infinite when
+    /// none waits), recomputed every `update`.
+    pub want: f64,
+    /// A chunk of the cover has a job in flight on it.
+    pub in_use: bool,
+    /// Where the last fetch came from (chunk latency stats).
+    pub source: Option<Source>,
+}
+
+impl DataEntry {
+    fn new() -> Self {
+        Self { state: DataState::Absent, attempts: 0, decode_failures: 0, pins: 0, want: f64::INFINITY, in_use: false, source: None }
+    }
+    fn needed(&self) -> bool {
+        self.want.is_finite() || self.in_use
+    }
+}
+
+/// A queued change to the memory budget (applied by [`DataStore::sync`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MemOp {
+    Insert { id: u64, bytes: u64, prio: f64, pins: u32 },
+    Pin { id: u64 },
+    Unpin { id: u64 },
+    Priority { id: u64, prio: f64 },
+}
+
+/// Packed key of a data tile in the budget pool (`(z << 58) | (x << 29) | y`).
+pub(super) fn item_id(k: TileKey) -> u64 {
+    crate::fetch::pack_key(k) as u64
+}
+
+fn unpack(id: u64) -> TileKey {
+    TileKey::new((id >> 58) as u8, ((id >> 29) & ((1 << 29) - 1)) as u32, (id & ((1 << 29) - 1)) as u32)
+}
+
+/// Priority of a tile a waiting chunk needs: above every unneeded tile, nearest first.
+fn needed_priority(order: f64) -> f64 {
+    1.0e9 - order.min(1.0e8)
+}
+
+/// Counters for `debug_stats`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DataStats {
+    /// Data tiles decoded and resident now.
+    pub loaded: u32,
+    /// Data tiles decoded since the scheduler started (a re-decode after eviction counts again).
+    pub decoded: u64,
+    /// Data tile fetches completed (disk or network) since the scheduler started.
+    pub fetched: u64,
+    /// Data fetches in flight.
+    pub fetching: u32,
+}
+
+#[derive(Debug)]
+pub struct DataStore {
+    pub(super) levels: DataLevels,
+    pub(super) tiles: AHashMap<TileKey, DataEntry>,
+    ops: Vec<MemOp>,
+    evicted: Vec<u64>,
+    max_fetch: u32,
+    fetch_inflight: u32,
+    decoded: u64,
+    fetched: u64,
+}
+
+impl DataStore {
+    pub fn new(levels: DataLevels, max_fetch: u32) -> Self {
+        Self {
+            levels,
+            tiles: AHashMap::new(),
+            ops: Vec::new(),
+            evicted: Vec::new(),
+            max_fetch: max_fetch.max(1),
+            fetch_inflight: 0,
+            decoded: 0,
+            fetched: 0,
+        }
+    }
+
+    pub fn levels(&self) -> DataLevels {
+        self.levels
+    }
+
+    pub fn stats(&self) -> DataStats {
+        DataStats {
+            loaded: self.tiles.values().filter(|e| matches!(e.state, DataState::Resident(_))).count() as u32,
+            decoded: self.decoded,
+            fetched: self.fetched,
+            fetching: self.fetch_inflight,
+        }
+    }
+
+    pub(super) fn get(&self, k: TileKey) -> Option<&DataEntry> {
+        self.tiles.get(&k)
+    }
+
+    /// Start of an `update`: forget the previous frame's needs; elapsed backoffs go back to Absent.
+    pub(super) fn begin_needs(&mut self, now: Instant) {
+        for e in self.tiles.values_mut() {
+            e.want = f64::INFINITY;
+            e.in_use = false;
+            if let DataState::Failed { retry_at } = e.state {
+                if now >= retry_at {
+                    e.state = DataState::Absent;
+                }
+            }
+        }
+    }
+
+    /// A chunk of the cover waits for data tile `k` (delivery order `order`).
+    pub(super) fn want(&mut self, k: TileKey, order: f64) {
+        let e = self.tiles.entry(k).or_insert_with(DataEntry::new);
+        e.want = e.want.min(order);
+    }
+
+    /// A chunk of the cover has a job in flight on data tile `k`.
+    pub(super) fn use_tile(&mut self, k: TileKey) {
+        if let Some(e) = self.tiles.get_mut(&k) {
+            e.in_use = true;
+        }
+    }
+
+    /// End of the needs pass: cancel the fetches and decodes nobody needs any more (their ids go
+    /// to `cancelled`), set budget priorities, forget idle unneeded entries. `dist` = distance
+    /// (m) from the camera to a data tile, for the priority of tiles kept without a need.
+    pub(super) fn end_needs(&mut self, cancelled: &mut Vec<u64>, dist: impl Fn(TileKey) -> f64) {
+        let ops = &mut self.ops;
+        self.tiles.retain(|&k, e| {
+            let needed = e.needed();
+            match &e.state {
+                DataState::Fetching { job } | DataState::Decoding { job } if !needed => {
+                    cancelled.push(*job);
+                    e.state = DataState::Absent;
+                }
+                DataState::Fetched(_) if !needed => e.state = DataState::Absent,
+                DataState::Resident(_) => {
+                    let prio = if e.want.is_finite() { needed_priority(e.want) } else { -dist(k) };
+                    ops.push(MemOp::Priority { id: item_id(k), prio });
+                }
+                _ => {}
+            }
+            // Keep an entry while it holds data, work, pins or a need (a Broken tile is kept
+            // while needed, so the chunks under it stay broken instead of retrying).
+            needed || e.pins > 0 || matches!(e.state, DataState::Resident(_) | DataState::Fetching { .. } | DataState::Decoding { .. })
+        });
+    }
+
+    /// Queue the decode of every fetched tile (job ids from `next_job`). Returns (key, job, bytes).
+    pub(super) fn take_decodes(&mut self, next_job: &mut u64, out: &mut Vec<(TileKey, u64, Bytes)>) {
+        let mut keys: Vec<TileKey> = self.tiles.iter().filter(|(_, e)| matches!(e.state, DataState::Fetched(_))).map(|(k, _)| *k).collect();
+        keys.sort_unstable();
+        for k in keys {
+            let e = self.tiles.get_mut(&k).expect("listed");
+            let job = *next_job;
+            *next_job += 1;
+            if let DataState::Fetched(b) = std::mem::replace(&mut e.state, DataState::Decoding { job }) {
+                out.push((k, job, b));
+            }
+        }
+    }
+
+    /// Queue fetches of the needed absent tiles, nearest need first, within the in-flight limit.
+    pub(super) fn take_fetches(&mut self, next_job: &mut u64, out: &mut Vec<(TileKey, u64)>) {
+        if self.fetch_inflight >= self.max_fetch {
+            return;
+        }
+        let mut cand: Vec<(f64, TileKey)> =
+            self.tiles.iter().filter(|(_, e)| e.want.is_finite() && matches!(e.state, DataState::Absent)).map(|(k, e)| (e.want, *k)).collect();
+        cand.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        for (_, k) in cand {
+            if self.fetch_inflight >= self.max_fetch {
+                break;
+            }
+            let job = *next_job;
+            *next_job += 1;
+            self.fetch_inflight += 1;
+            self.tiles.get_mut(&k).expect("listed").state = DataState::Fetching { job };
+            out.push((k, job));
+        }
+    }
+
+    /// A chunk job on tile `k` was submitted: one pin (applied to the budget while resident).
+    pub(super) fn pin(&mut self, k: TileKey) {
+        let e = self.tiles.entry(k).or_insert_with(DataEntry::new);
+        e.pins += 1;
+        if matches!(e.state, DataState::Resident(_)) {
+            self.ops.push(MemOp::Pin { id: item_id(k) });
+        }
+    }
+
+    /// A chunk job on tile `k` ended (result or cancel).
+    pub(super) fn unpin(&mut self, k: TileKey) {
+        let Some(e) = self.tiles.get_mut(&k) else { return };
+        if e.pins == 0 {
+            return;
+        }
+        e.pins -= 1;
+        if matches!(e.state, DataState::Resident(_)) {
+            self.ops.push(MemOp::Unpin { id: item_id(k) });
+        }
+    }
+
+    /// A [`crate::worker::WorkerMsg::DataFetched`]. Returns a warning on failure.
+    pub(super) fn fetched(&mut self, k: TileKey, job: u64, result: Result<(Bytes, Source), FetchError>, now: Instant, profile: &Profile) -> Option<String> {
+        self.fetch_inflight = self.fetch_inflight.saturating_sub(1);
+        if result.is_ok() {
+            self.fetched += 1;
+        }
+        let e = self.tiles.get_mut(&k)?;
+        if !matches!(e.state, DataState::Fetching { job: j } if j == job) {
+            return None;
+        }
+        match result {
+            Ok((bytes, source)) => {
+                e.state = DataState::Fetched(bytes);
+                e.source = Some(source);
+                None
+            }
+            Err(err) if err.kind == FetchErrorKind::Cancelled => {
+                e.state = DataState::Absent;
+                None
+            }
+            Err(err) => {
+                e.attempts += 1;
+                let wait = profile.backoff(e.attempts);
+                e.state = DataState::Failed { retry_at: now + wait };
+                Some(format!(
+                    "WorldStreamer: fetch data tile {k} failed (attempt {}, retry in {:.1}s): {}",
+                    e.attempts,
+                    wait.as_secs_f32(),
+                    err.message
+                ))
+            }
+        }
+    }
+
+    /// A [`crate::worker::WorkerMsg::DataDecoded`]. Returns a warning on failure.
+    pub(super) fn decoded(&mut self, k: TileKey, job: u64, result: Result<Arc<DataTile>, String>, now: Instant, profile: &Profile) -> Option<String> {
+        if result.is_ok() {
+            self.decoded += 1;
+        }
+        let e = self.tiles.get_mut(&k)?;
+        if !matches!(e.state, DataState::Decoding { job: j } if j == job) {
+            return None;
+        }
+        match result {
+            Ok(d) => {
+                e.attempts = 0;
+                e.decode_failures = 0;
+                let id = item_id(k);
+                let prio = if e.want.is_finite() { needed_priority(e.want) } else { needed_priority(1.0e8) };
+                // Pinned by the chunk jobs already waiting on it (never evicted by its own insert).
+                self.ops.push(MemOp::Insert { id, bytes: d.bytes, prio, pins: e.pins });
+                e.state = DataState::Resident(d);
+                None
+            }
+            Err(err) => {
+                e.decode_failures += 1;
+                if e.decode_failures >= DECODE_ATTEMPTS {
+                    e.state = DataState::Broken;
+                    return Some(format!(
+                        "WorldStreamer: decode data tile {k} failed {} times, giving up (the coarser tiles stay): {err}",
+                        e.decode_failures
+                    ));
+                }
+                e.attempts += 1;
+                let wait = profile.backoff(e.attempts);
+                e.state = DataState::Failed { retry_at: now + wait };
+                Some(format!("WorldStreamer: decode data tile {k} failed (attempt {}, retry in {:.1}s): {err}", e.attempts, wait.as_secs_f32()))
+            }
+        }
+    }
+
+    /// A [`crate::worker::WorkerMsg::DataDropped`] (a cancelled decode).
+    pub(super) fn dropped(&mut self, k: TileKey, job: u64) {
+        if let Some(e) = self.tiles.get_mut(&k) {
+            if matches!(e.state, DataState::Decoding { job: j } if j == job) {
+                e.state = DataState::Absent;
+            }
+        }
+    }
+
+    /// Apply the queued budget changes, then drop the tiles the budget evicted.
+    pub fn sync(&mut self, mem: &mut MemoryBudget) {
+        for op in self.ops.drain(..) {
+            match op {
+                MemOp::Insert { id, bytes, prio, pins } => {
+                    mem.insert_pinned(ItemKey::new(Pool::DataTiles, id), bytes, prio, pins);
+                }
+                MemOp::Pin { id } => {
+                    mem.pin(ItemKey::new(Pool::DataTiles, id));
+                }
+                MemOp::Unpin { id } => {
+                    mem.unpin(ItemKey::new(Pool::DataTiles, id));
+                }
+                MemOp::Priority { id, prio } => {
+                    mem.set_priority(ItemKey::new(Pool::DataTiles, id), prio);
+                }
+            }
+        }
+        self.evicted.clear();
+        mem.take_evicted(Pool::DataTiles, &mut self.evicted);
+        for &id in &self.evicted {
+            if let Some(e) = self.tiles.get_mut(&unpack(id)) {
+                if matches!(e.state, DataState::Resident(_)) {
+                    e.state = DataState::Absent;
+                }
+            }
+        }
+    }
+
+    /// Unregister every resident tile from the budget (the scheduler is being replaced or shut
+    /// down); the store is empty afterwards.
+    pub fn release(&mut self, mem: &mut MemoryBudget) {
+        self.ops.clear();
+        for (k, e) in self.tiles.drain() {
+            if matches!(e.state, DataState::Resident(_)) {
+                mem.remove(ItemKey::new(Pool::DataTiles, item_id(k)));
+            }
+        }
+        // Anything the budget evicted from this pool meanwhile is moot now.
+        self.evicted.clear();
+        mem.take_evicted(Pool::DataTiles, &mut self.evicted);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn item_ids_round_trip() {
+        for k in [TileKey::new(14, 9341, 5206), TileKey::new(0, 0, 0), TileKey::new(20, (1 << 20) - 1, 12345)] {
+            assert_eq!(unpack(item_id(k)), k);
+        }
+    }
+}

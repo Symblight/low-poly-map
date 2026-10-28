@@ -1421,6 +1421,7 @@ dependencies = [
  "flate2",
  "geo-types",
  "libc",
+ "libm",
  "mvt-reader",
  "pmtiles",
  "rayon",

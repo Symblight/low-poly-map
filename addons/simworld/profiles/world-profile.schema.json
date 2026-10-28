@@ -6,7 +6,7 @@
   "type": "object",
   "properties": {
     "profile_version": {
-      "description": "Profile schema version (integer). A file with the library's version or older is strict (an unknown key is an error); a newer file loads and unknown keys are ignored with a warning. The library reads version 3 (version 2 added buildings.r0..r2.min_height_m, version 3 added lights.min_ring; an older file loads with their defaults).",
+      "description": "Profile schema version (integer). A file with the library's version or older is strict (an unknown key is an error); a newer file loads and unknown keys are ignored with a warning. The library reads version 6 (version 2 added buildings.r0..r2.min_height_m, version 3 added lights.min_ring, version 4 added the landmark and dark light profiles, lights.profiles.*.windows / floodlight, buildings.overrides, dark_states, slender_tower, min_window_wall_m, lights.street and lights.beacons, version 5 added the terrain section, version 6 added the seed section; an older file loads with their defaults).",
       "type": "integer",
       "minimum": 1,
       "maximum": 1000000
@@ -67,7 +67,7 @@
       "additionalProperties": false
     },
     "buildings": {
-      "description": "Building meshing per band (R3 has no buildings).",
+      "description": "Building meshing per band (R3 has no buildings) and the light-profile resolution rules (profile_version 4; docs/spec-night-windows.md section 1).",
       "type": "object",
       "properties": {
         "r0": {
@@ -144,12 +144,66 @@
             }
           },
           "additionalProperties": false
+        },
+        "overrides": {
+          "description": "Light profile by OSM id, first rule of the resolution (wins over state tags, kind tables and the shape heuristic). Keys: `n`, `w` or `r` followed by the OSM id (e.g. `w123456`); values: a light profile name. For hand-picked places where tagging or shape fails. Default: none (profile_version 4).",
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[nwr][0-9]+$"
+          },
+          "additionalProperties": {
+            "description": "Light profile of this OSM element.",
+            "type": "string",
+            "enum": [
+              "residential",
+              "office",
+              "retail",
+              "industrial",
+              "civic",
+              "landmark",
+              "dark"
+            ]
+          }
+        },
+        "dark_states": {
+          "description": "State tags that make a building `dark` (no windows, no light point) whatever its kind: `key` (attribute present; for the flags: yes) or `key=value`, over the tile attributes historic, man_made, ruins, disused, abandoned (profile_version 4).",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^(historic|man_made|ruins|disused|abandoned)(=.+)?$"
+          },
+          "uniqueItems": true
+        },
+        "slender_tower": {
+          "description": "Shape heuristic for buildings of a generic kind (in no profile's kinds, nor their historic / man_made values) with a tagged height or levels and a footprint the tile encoder did not clip: height >= ratio x sqrt(area) and area < max_area_m2 makes it a landmark (profile_version 4).",
+          "type": "object",
+          "properties": {
+            "ratio": {
+              "description": "Minimum roof height over the square root of the footprint area.",
+              "type": "number",
+              "minimum": 0.5,
+              "maximum": 50
+            },
+            "max_area_m2": {
+              "description": "Footprints at least this large (square meters) are never towers.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 100000
+            }
+          },
+          "additionalProperties": false
+        },
+        "min_window_wall_m": {
+          "description": "Wall parts lower than this (meters, extrusion height = height - min_height) get no windows (profile_version 4).",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
         }
       },
       "additionalProperties": false
     },
     "ground": {
-      "description": "Ground meshing (landuse areas and road strips) per band, road classes and widths, area classes and stacking levels. R3 has no ground.",
+      "description": "Ground meshing (landuse areas and road strips) per band, road classes and widths, area classes and stacking levels. R3 has a coarse ground since api 1.3.",
       "type": "object",
       "properties": {
         "r0": {
@@ -176,7 +230,14 @@
             },
             "max_road_class": {
               "description": "Keep roads of this class and every more important one (other = all roads).",
-              "enum": ["motorway", "primary", "secondary", "tertiary", "residential", "other"],
+              "enum": [
+                "motorway",
+                "primary",
+                "secondary",
+                "tertiary",
+                "residential",
+                "other"
+              ],
               "type": "string"
             },
             "minor_paths": {
@@ -216,7 +277,14 @@
             },
             "max_road_class": {
               "description": "Keep roads of this class and every more important one (other = all roads).",
-              "enum": ["motorway", "primary", "secondary", "tertiary", "residential", "other"],
+              "enum": [
+                "motorway",
+                "primary",
+                "secondary",
+                "tertiary",
+                "residential",
+                "other"
+              ],
               "type": "string"
             },
             "minor_paths": {
@@ -256,7 +324,61 @@
             },
             "max_road_class": {
               "description": "Keep roads of this class and every more important one (other = all roads).",
-              "enum": ["motorway", "primary", "secondary", "tertiary", "residential", "other"],
+              "enum": [
+                "motorway",
+                "primary",
+                "secondary",
+                "tertiary",
+                "residential",
+                "other"
+              ],
+              "type": "string"
+            },
+            "minor_paths": {
+              "description": "Keep minor paths (ground.roads.minor_paths).",
+              "type": "boolean"
+            },
+            "lift_step_m": {
+              "description": "Vertical lift per stacking level, meters (against z-fighting; level up to 13 for roads).",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 0.5
+            }
+          },
+          "additionalProperties": false
+        },
+        "r3": {
+          "description": "Ground meshing at R3 (z13, farthest band; api 1.3): a coarse ground so a far tile is never see-through while its R2 children load. The archive has major roads only at z13.",
+          "type": "object",
+          "properties": {
+            "area_dp_m": {
+              "description": "Douglas-Peucker tolerance for area outlines, meters.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 50
+            },
+            "min_area_m2": {
+              "description": "Drop areas smaller than this, square meters (0 = keep all).",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1000000
+            },
+            "road_dp_m": {
+              "description": "Douglas-Peucker tolerance for road centerlines, meters.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 50
+            },
+            "max_road_class": {
+              "description": "Keep roads of this class and every more important one (other = all roads).",
+              "enum": [
+                "motorway",
+                "primary",
+                "secondary",
+                "tertiary",
+                "residential",
+                "other"
+              ],
               "type": "string"
             },
             "minor_paths": {
@@ -434,7 +556,15 @@
             "properties": {
               "class": {
                 "description": "Ground class (contract ground COLOR r = id / 16): grass 0, forest 1, water 2, residential 3, commercial 4, industrial 5, other 6.",
-                "enum": ["grass", "forest", "water", "residential", "commercial", "industrial", "other"],
+                "enum": [
+                  "grass",
+                  "forest",
+                  "water",
+                  "residential",
+                  "commercial",
+                  "industrial",
+                  "other"
+                ],
                 "type": "string"
               },
               "level": {
@@ -454,7 +584,11 @@
               }
             },
             "additionalProperties": false,
-            "required": ["class", "level", "kinds"]
+            "required": [
+              "class",
+              "level",
+              "kinds"
+            ]
           }
         },
         "other_area_level": {
@@ -489,17 +623,135 @@
           "maximum": 10000
         },
         "min_ring": {
-          "description": "Finest band that carries light sprites (0 = R0 ... 3 = R3 only; profile_version 3). Default 2: R2 and R3 only, the finer bands are meant to get windows. Lower values put sprites on top of the R1 (and R0) building meshes, a stopgap until the window shader exists.",
+          "description": "Finest band that carries light sprites (0 = R0 ... 3 = R3 only; profile_version 3). Default 1 (profile_version 4; 2 before): R1 to R3. R0 has windows only; R1 has windows up close and the host cross-fades windows and sprites over its blend range (docs/spec-night-windows.md W4). 2 = R2 and R3 only (R1 windows fade to nothing, no sprites there); 0 also puts sprites on R0.",
           "type": "integer",
           "minimum": 0,
           "maximum": 3
         },
+        "street": {
+          "description": "Street lamps along roads: their own sprite set (ready-tile keys street_lights / street_light_colors, api 1.1), drawn near and far (no window cross-fade).",
+          "type": "object",
+          "properties": {
+            "min_ring": {
+              "description": "Finest band with street lamps (0 = R0 ... 3 = R3 only, 4 = none). R3 (z13) tiles hold major roads only, so R3 lamps line motorways to secondaries.",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4
+            },
+            "color": {
+              "description": "Street lamp sprite color, linear rgb 0..1 (sodium orange by default).",
+              "type": "array",
+              "items": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "minItems": 3,
+              "maxItems": 3
+            },
+            "alt_color": {
+              "description": "Second lamp type, linear rgb 0..1 (white LED by default), used on alt_share of the roads.",
+              "type": "array",
+              "items": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "minItems": 3,
+              "maxItems": 3
+            },
+            "alt_share": {
+              "description": "Share of lit roads (0..1) whose lamps are alt_color, chosen per road by its OSM id (a street keeps one lamp type in every tile and band). 0 = every road in color.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "spacing_m": {
+              "description": "Distance between lamps along a road centerline (meters).",
+              "type": "number",
+              "minimum": 5,
+              "maximum": 1000
+            },
+            "height_m": {
+              "description": "Lamp height above the road (meters).",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 100
+            },
+            "untagged_max_class": {
+              "description": "Roads of this class or a more important one (1 motorway, 2 primary, 3 secondary, 4 tertiary, 5 residential, 6 other) get lamps without a lit tag; a road with a lit tag always does. 0 = tagged roads only.",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 6
+            }
+          },
+          "additionalProperties": false
+        },
+        "beacons": {
+          "description": "Aircraft warning beacons on tall buildings, placed from geometry alone (resolved roof height and footprint, never tags), so synthesised cities get them by the same rule. Ready-tile keys beacon_lights / beacon_light_colors (api 1.2; a = blink phase).",
+          "type": "object",
+          "properties": {
+            "min_ring": {
+              "description": "Finest band with beacons (0 = R0 ... 3 = R3 only, 4 = none).",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4
+            },
+            "min_height_m": {
+              "description": "Buildings whose resolved roof height (meters above their base) reaches this get beacons on the roof corners.",
+              "type": "number",
+              "minimum": 1,
+              "maximum": 1000
+            },
+            "level_spacing_m": {
+              "description": "Taller buildings also get a ring of beacons every this many meters up the facade, while at least half a spacing below the roof. 0 = roof only.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 500
+            },
+            "corner_min_size_m": {
+              "description": "Footprints narrower than this (meters, along either axis) get one beacon in the middle of the roof instead of the corners.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 500
+            },
+            "color": {
+              "description": "Beacon color, linear rgb 0..1 (red by default).",
+              "type": "array",
+              "items": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "minItems": 3,
+              "maxItems": 3
+            },
+            "alt_color": {
+              "description": "Second beacon color, linear rgb 0..1 (green by default), used on alt_share of the beacon buildings.",
+              "type": "array",
+              "items": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "minItems": 3,
+              "maxItems": 3
+            },
+            "alt_share": {
+              "description": "Share of beacon buildings (0..1) in alt_color, chosen per building by its OSM id.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            }
+          },
+          "additionalProperties": false
+        },
         "profiles": {
-          "description": "Light profiles (contract vertex COLOR r = id / 8: residential 0, office 1, retail 2, industrial 3, civic 4): which OSM building values belong to each, and the sprite color.",
+          "description": "Light profiles (contract vertex COLOR r = id / 8: residential 0, office 1, retail 2, industrial 3, civic 4, landmark 6, dark 7; 5 is reserved): which OSM building, historic and man_made values belong to each, the sprite color, and the window / floodlight parameters. A value may appear in one profile only (profile_version 4 adds landmark and dark).",
           "type": "object",
           "properties": {
             "residential": {
-              "description": "Light profile residential.",
+              "description": "Light profile residential (id 0): warm 2700 K, windows.",
               "type": "object",
               "properties": {
                 "color": {
@@ -514,19 +766,43 @@
                   "maxItems": 3
                 },
                 "kinds": {
-                  "description": "OSM `building` values of this profile (a value may appear in one profile only).",
+                  "description": "OSM `building`, `historic` and `man_made` values of this profile (a value may appear in one profile only).",
                   "type": "array",
                   "items": {
                     "type": "string",
                     "minLength": 1
                   },
                   "uniqueItems": true
+                },
+                "windows": {
+                  "description": "Lit windows (residential, office, retail and civic only; no key = no windows).",
+                  "type": "object",
+                  "properties": {
+                    "width_m": {
+                      "description": "Target window column width, meters (the mesher fits a whole number of columns per wall run).",
+                      "type": "number",
+                      "minimum": 0.5,
+                      "maximum": 50
+                    },
+                    "lit_share": {
+                      "description": "Share of lit windows per local hour 0..23 (24 values, 0..1; read by the host shader). Between 18 h and 3 h it should only fall (a rise is logged as a warning).",
+                      "type": "array",
+                      "items": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1
+                      },
+                      "minItems": 24,
+                      "maxItems": 24
+                    }
+                  },
+                  "additionalProperties": false
                 }
               },
               "additionalProperties": false
             },
             "office": {
-              "description": "Light profile office.",
+              "description": "Light profile office (id 1): cool 4500 K, windows.",
               "type": "object",
               "properties": {
                 "color": {
@@ -541,19 +817,43 @@
                   "maxItems": 3
                 },
                 "kinds": {
-                  "description": "OSM `building` values of this profile (a value may appear in one profile only).",
+                  "description": "OSM `building`, `historic` and `man_made` values of this profile (a value may appear in one profile only).",
                   "type": "array",
                   "items": {
                     "type": "string",
                     "minLength": 1
                   },
                   "uniqueItems": true
+                },
+                "windows": {
+                  "description": "Lit windows (residential, office, retail and civic only; no key = no windows).",
+                  "type": "object",
+                  "properties": {
+                    "width_m": {
+                      "description": "Target window column width, meters (the mesher fits a whole number of columns per wall run).",
+                      "type": "number",
+                      "minimum": 0.5,
+                      "maximum": 50
+                    },
+                    "lit_share": {
+                      "description": "Share of lit windows per local hour 0..23 (24 values, 0..1; read by the host shader). Between 18 h and 3 h it should only fall (a rise is logged as a warning).",
+                      "type": "array",
+                      "items": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1
+                      },
+                      "minItems": 24,
+                      "maxItems": 24
+                    }
+                  },
+                  "additionalProperties": false
                 }
               },
               "additionalProperties": false
             },
             "retail": {
-              "description": "Light profile retail.",
+              "description": "Light profile retail (id 2): bright white, windows.",
               "type": "object",
               "properties": {
                 "color": {
@@ -568,19 +868,43 @@
                   "maxItems": 3
                 },
                 "kinds": {
-                  "description": "OSM `building` values of this profile (a value may appear in one profile only).",
+                  "description": "OSM `building`, `historic` and `man_made` values of this profile (a value may appear in one profile only).",
                   "type": "array",
                   "items": {
                     "type": "string",
                     "minLength": 1
                   },
                   "uniqueItems": true
+                },
+                "windows": {
+                  "description": "Lit windows (residential, office, retail and civic only; no key = no windows).",
+                  "type": "object",
+                  "properties": {
+                    "width_m": {
+                      "description": "Target window column width, meters (the mesher fits a whole number of columns per wall run).",
+                      "type": "number",
+                      "minimum": 0.5,
+                      "maximum": 50
+                    },
+                    "lit_share": {
+                      "description": "Share of lit windows per local hour 0..23 (24 values, 0..1; read by the host shader). Between 18 h and 3 h it should only fall (a rise is logged as a warning).",
+                      "type": "array",
+                      "items": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1
+                      },
+                      "minItems": 24,
+                      "maxItems": 24
+                    }
+                  },
+                  "additionalProperties": false
                 }
               },
               "additionalProperties": false
             },
             "industrial": {
-              "description": "Light profile industrial.",
+              "description": "Light profile industrial (id 3): sodium, no windows.",
               "type": "object",
               "properties": {
                 "color": {
@@ -595,7 +919,7 @@
                   "maxItems": 3
                 },
                 "kinds": {
-                  "description": "OSM `building` values of this profile (a value may appear in one profile only).",
+                  "description": "OSM `building`, `historic` and `man_made` values of this profile (a value may appear in one profile only).",
                   "type": "array",
                   "items": {
                     "type": "string",
@@ -607,7 +931,7 @@
               "additionalProperties": false
             },
             "civic": {
-              "description": "Light profile civic.",
+              "description": "Light profile civic (id 4): warm, windows.",
               "type": "object",
               "properties": {
                 "color": {
@@ -622,7 +946,104 @@
                   "maxItems": 3
                 },
                 "kinds": {
-                  "description": "OSM `building` values of this profile (a value may appear in one profile only).",
+                  "description": "OSM `building`, `historic` and `man_made` values of this profile (a value may appear in one profile only).",
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "uniqueItems": true
+                },
+                "windows": {
+                  "description": "Lit windows (residential, office, retail and civic only; no key = no windows).",
+                  "type": "object",
+                  "properties": {
+                    "width_m": {
+                      "description": "Target window column width, meters (the mesher fits a whole number of columns per wall run).",
+                      "type": "number",
+                      "minimum": 0.5,
+                      "maximum": 50
+                    },
+                    "lit_share": {
+                      "description": "Share of lit windows per local hour 0..23 (24 values, 0..1; read by the host shader). Between 18 h and 3 h it should only fall (a rise is logged as a warning).",
+                      "type": "array",
+                      "items": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1
+                      },
+                      "minItems": 24,
+                      "maxItems": 24
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            },
+            "landmark": {
+              "description": "Light profile landmark (id 6): castles, towers, churches; no windows, floodlit facade, light points in its color.",
+              "type": "object",
+              "properties": {
+                "color": {
+                  "description": "Light sprite color, linear rgb 0..1.",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "minItems": 3,
+                  "maxItems": 3
+                },
+                "kinds": {
+                  "description": "OSM `building`, `historic` and `man_made` values of this profile (a value may appear in one profile only).",
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "uniqueItems": true
+                },
+                "floodlight": {
+                  "description": "Floodlit facade (landmark only, required there; read by the host shader).",
+                  "type": "object",
+                  "properties": {
+                    "strength": {
+                      "description": "Emission multiplier at the base of the facade.",
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 100
+                    },
+                    "fade_height_m": {
+                      "description": "Height above the wall bottom (meters) over which the floodlight fades out.",
+                      "type": "number",
+                      "minimum": 0.5,
+                      "maximum": 1000
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            },
+            "dark": {
+              "description": "Light profile dark (id 7): ruins, garages, chimneys; no windows and no light point (its color is unused).",
+              "type": "object",
+              "properties": {
+                "color": {
+                  "description": "Light sprite color, linear rgb 0..1.",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "minItems": 3,
+                  "maxItems": 3
+                },
+                "kinds": {
+                  "description": "OSM `building`, `historic` and `man_made` values of this profile (a value may appear in one profile only).",
                   "type": "array",
                   "items": {
                     "type": "string",
@@ -642,37 +1063,93 @@
           "properties": {
             "residential": {
               "description": "Profile for landuse residential.",
-              "enum": ["residential", "office", "retail", "industrial", "civic"],
+              "enum": [
+                "residential",
+                "office",
+                "retail",
+                "industrial",
+                "civic",
+                "landmark",
+                "dark"
+              ],
               "type": "string"
             },
             "commercial": {
               "description": "Profile for landuse commercial.",
-              "enum": ["residential", "office", "retail", "industrial", "civic"],
+              "enum": [
+                "residential",
+                "office",
+                "retail",
+                "industrial",
+                "civic",
+                "landmark",
+                "dark"
+              ],
               "type": "string"
             },
             "retail": {
               "description": "Profile for landuse retail.",
-              "enum": ["residential", "office", "retail", "industrial", "civic"],
+              "enum": [
+                "residential",
+                "office",
+                "retail",
+                "industrial",
+                "civic",
+                "landmark",
+                "dark"
+              ],
               "type": "string"
             },
             "industrial": {
               "description": "Profile for landuse industrial (and railway, port, depot, garages, quarry).",
-              "enum": ["residential", "office", "retail", "industrial", "civic"],
+              "enum": [
+                "residential",
+                "office",
+                "retail",
+                "industrial",
+                "civic",
+                "landmark",
+                "dark"
+              ],
               "type": "string"
             },
             "civic": {
               "description": "Profile for landuse religious, education, institutional, civic, military.",
-              "enum": ["residential", "office", "retail", "industrial", "civic"],
+              "enum": [
+                "residential",
+                "office",
+                "retail",
+                "industrial",
+                "civic",
+                "landmark",
+                "dark"
+              ],
               "type": "string"
             },
             "other": {
               "description": "Profile for any other landuse.",
-              "enum": ["residential", "office", "retail", "industrial", "civic"],
+              "enum": [
+                "residential",
+                "office",
+                "retail",
+                "industrial",
+                "civic",
+                "landmark",
+                "dark"
+              ],
               "type": "string"
             },
             "none": {
               "description": "Profile when no landuse polygon contains the building.",
-              "enum": ["residential", "office", "retail", "industrial", "civic"],
+              "enum": [
+                "residential",
+                "office",
+                "retail",
+                "industrial",
+                "civic",
+                "landmark",
+                "dark"
+              ],
               "type": "string"
             }
           },
@@ -727,6 +1204,12 @@
           "type": "number",
           "minimum": 0.1,
           "maximum": 60
+        },
+        "max_active": {
+          "description": "Most LOD swaps (a coarse tile and its 4 children) fading at once, vector and terrain layer together (count; default 4, profile_version 6). The dithered variant discards pixels, which turns off hidden surface removal on tile-based GPUs (Apple); a swap beyond the cap completes at once without a fade. 0 = no fades.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 256
         }
       },
       "additionalProperties": false
@@ -777,6 +1260,512 @@
           "type": "number",
           "minimum": 1,
           "maximum": 86400
+        }
+      },
+      "additionalProperties": false
+    },
+    "terrain": {
+      "description": "Procedural terrain (profile_version 5, docs/spec-terrain.md): heights from a seeded function (fractal hills, ridged mountain chains, plateaus, valleys, a sea level and a flat zone around the configure origin), no data. Active only when terrain.enabled is true AND the host passes configure_world option layers containing \"terrain\"; otherwise the world stays flat (a warning is logged once when only enabled is set). bands, skirt_m, shading, horizon_*, max_fetch and max_mesh drive the terrain-mesh layer (api 1.5: terrain tiles with keys t/z/x/y for that host).",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Terrain on (needs the host layer \"terrain\" too).",
+          "type": "boolean"
+        },
+        "seed": {
+          "description": "Seed of the height function: same seed, same world.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "amplitude_m": {
+          "description": "Relief scale, meters: heights are about amplitude_m x (0.5 + s), with the shape value s mostly in [-1, 1] (ridges reach above).",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 3000
+        },
+        "feature_size_m": {
+          "description": "Size of the largest hills (first noise octave), meters.",
+          "type": "number",
+          "minimum": 200,
+          "maximum": 200000
+        },
+        "octaves": {
+          "description": "Noise octaves (each half the size of the previous).",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10
+        },
+        "ridge_share": {
+          "description": "Strength of ridged mountain chains (inside a low-frequency mountain mask), 0..1.",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "valley_share": {
+          "description": "Depth of the meandering valleys, 0..1 (1 = down to the valley floor below sea level, i.e. flat river plains).",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "plateau_share": {
+          "description": "Share of the land raised into flat-topped plateaus with escarpments, 0..1.",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "sea_level_m": {
+          "description": "Nothing is lower than this (flat sea, lakes, river plains), meters above MSL.",
+          "type": "number",
+          "minimum": -1000,
+          "maximum": 3000
+        },
+        "flat_radius_m": {
+          "description": "Radius of the flat zone around the configure origin, meters (re-centering does not move it). 0 with flat_blend_m 0 = no flat zone.",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100000
+        },
+        "flat_blend_m": {
+          "description": "Width of the smooth blend from the flat zone into the relief, meters.",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100000
+        },
+        "exaggeration": {
+          "description": "Vertical scale of every height (terrain, building bases, lights, ground_height_at).",
+          "type": "number",
+          "minimum": 0.1,
+          "maximum": 5
+        },
+        "height_offset_m": {
+          "description": "Added to every height, meters.",
+          "type": "number",
+          "minimum": -500,
+          "maximum": 500
+        },
+        "water_snap_m": {
+          "description": "Water-area vertices take the minimum terrain height within this radius (5 x 5 window) and water is not subdivided, meters; 0 (default) = water drapes like every other area. Only for terrain with flat lakes of its own (a DEM).",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 200
+        },
+        "drape_step_m": {
+          "description": "Ground area and road edges longer than this are subdivided where the terrain is not flat within 0.1 m along them, meters.",
+          "type": "number",
+          "minimum": 5,
+          "maximum": 200
+        },
+        "detail_scale_max": {
+          "description": "Upper bound of the runtime terrain detail scale (terrain-mesh phase); sizes the drape lift: lift(band) = largest max_error_m x detail_scale_max of the terrain bands within that band's reach.",
+          "type": "number",
+          "minimum": 1,
+          "maximum": 8
+        },
+        "skirt_m": {
+          "description": "Skirt depth of terrain tiles, meters; 0 = automatic (terrain-mesh phase).",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 200
+        },
+        "shading": {
+          "description": "Terrain mesh shading (terrain-mesh phase): flat (normals from screen derivatives) or smooth (NORMAL array).",
+          "type": "string",
+          "enum": [
+            "flat",
+            "smooth"
+          ]
+        },
+        "horizon_cull": {
+          "description": "Drop terrain tiles below the horizon of a real-size Earth (terrain-mesh phase).",
+          "type": "boolean"
+        },
+        "horizon_margin_m": {
+          "description": "Extra distance past the horizon before a terrain tile is culled, meters (terrain-mesh phase).",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 50000
+        },
+        "max_fetch": {
+          "description": "Terrain jobs waiting for their samples per band (terrain-mesh phase).",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16
+        },
+        "max_mesh": {
+          "description": "Terrain mesh jobs in flight per band (terrain-mesh phase).",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16
+        },
+        "near_zoom": {
+          "description": "Finest zoom of the terrain layer (ring 0). Must not be below far_zoom.",
+          "type": "integer",
+          "minimum": 8,
+          "maximum": 16
+        },
+        "far_zoom": {
+          "description": "Coarsest zoom of the terrain layer (the roots).",
+          "type": "integer",
+          "minimum": 8,
+          "maximum": 16
+        },
+        "bands": {
+          "description": "One entry per terrain zoom, near_zoom first (exactly near_zoom - far_zoom + 1 entries; edges strictly increasing). The array replaces the default as a whole.",
+          "type": "array",
+          "items": {
+            "description": "One terrain band (ring i = zoom near_zoom - i).",
+            "type": "object",
+            "properties": {
+              "edge_m": {
+                "description": "Outer slant-distance edge of the band, meters; strictly increasing over the array.",
+                "type": "number",
+                "minimum": 100,
+                "maximum": 500000
+              },
+              "max_error_m": {
+                "description": "Max vertical error of the terrain mesh in this band, meters (the low-poly knob; terrain-mesh phase). Also sizes the drape lift of the vector world (lift rule).",
+                "type": "number",
+                "minimum": 0.05,
+                "maximum": 200
+              },
+              "max_edge_m": {
+                "description": "Seed grid spacing so the visual earth curvature bends flat tiles, meters; 0 = corners only, else at least 500 (terrain-mesh phase).",
+                "type": "number",
+                "minimum": 0,
+                "maximum": 50000
+              },
+              "max_triangles": {
+                "description": "Hard triangle cap per terrain tile (terrain-mesh phase).",
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 65000
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "seed": {
+      "description": "World seed (profile_version 6, docs/spec-world-seed.md section 9.2): how a seed world's generated airports, countryside and terrain-water rule look. Used only by a world configured with the configure_world option seed_world (api 1.7). Phase S1 keys; later phases add city, styles, roads and landmarks.",
+      "type": "object",
+      "properties": {
+        "aeroway_class": {
+          "description": "Ground class written for airport fences and pavements: 7 (aeroway, api 1.7, COLOR b = sub-kind / 8: 0 field, 1 runway paved, 2 runway grass, 3 taxiway, 4 apron) or 6 (other; for a host without the class 7 shader branch, which then shows class 7 in its unknown-class colour).",
+          "type": "integer",
+          "minimum": 6,
+          "maximum": 7
+        },
+        "water": {
+          "description": "The terrain-water rule (spec section 5.2a): the sea is flat at terrain.sea_level_m, lakes at their level, land slopes down to the water. Rivers are not part of the rule (vector water only).",
+          "type": "object",
+          "properties": {
+            "blend_m": {
+              "description": "Land within this distance of the sea or a lake slopes down to the water level, meters.",
+              "type": "number",
+              "minimum": 50,
+              "maximum": 5000
+            },
+            "raster_n": {
+              "description": "Signed-distance raster samples per side of a z11 cell (64 desktop, 32 for a quarter of the memory, e.g. iOS).",
+              "type": "integer",
+              "minimum": 8,
+              "maximum": 256
+            }
+          },
+          "additionalProperties": false
+        },
+        "airport": {
+          "description": "Generated airports (spec section 5.1): runways from the airport file, strips, taxiways, apron, terminal, hangars, tower, fence and lights.",
+          "type": "object",
+          "properties": {
+            "shoulder_m": {
+              "description": "The flat airport ground blends into the surrounding terrain over this distance outside the fence, meters.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 2000
+            },
+            "strip_end_m": {
+              "description": "The runway strip extends this far past each physical runway end, meters.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 500
+            },
+            "strip_half_m": {
+              "description": "Half-width of the runway strip (no buildings or streets; level in the terrain), meters, by airport type.",
+              "type": "object",
+              "properties": {
+                "large": {
+                  "description": "Value for large_airport.",
+                  "type": "number",
+                  "minimum": 10,
+                  "maximum": 500
+                },
+                "medium": {
+                  "description": "Value for medium_airport.",
+                  "type": "number",
+                  "minimum": 10,
+                  "maximum": 500
+                },
+                "small": {
+                  "description": "Value for small_airport (and every other type).",
+                  "type": "number",
+                  "minimum": 10,
+                  "maximum": 500
+                }
+              },
+              "additionalProperties": false
+            },
+            "fence_margin_m": {
+              "description": "The fence is the rectangle around every strip, pavement and building plus this margin, meters.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 2000
+            },
+            "taxi_offset_m": {
+              "description": "Parallel taxiway centreline distance from the main runway centreline, meters, by airport type (0 or too close = no parallel taxiway; small fields never get one).",
+              "type": "object",
+              "properties": {
+                "large": {
+                  "description": "Value for large_airport.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1000
+                },
+                "medium": {
+                  "description": "Value for medium_airport.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1000
+                },
+                "small": {
+                  "description": "Value for small_airport (and every other type).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1000
+                }
+              },
+              "additionalProperties": false
+            },
+            "taxiway_width_m": {
+              "description": "Taxiway width, meters, by airport type.",
+              "type": "object",
+              "properties": {
+                "large": {
+                  "description": "Value for large_airport.",
+                  "type": "number",
+                  "minimum": 3,
+                  "maximum": 100
+                },
+                "medium": {
+                  "description": "Value for medium_airport.",
+                  "type": "number",
+                  "minimum": 3,
+                  "maximum": 100
+                },
+                "small": {
+                  "description": "Value for small_airport (and every other type).",
+                  "type": "number",
+                  "minimum": 3,
+                  "maximum": 100
+                }
+              },
+              "additionalProperties": false
+            },
+            "runway_width_m": {
+              "description": "Runway width when the airport file has none, meters, by airport type.",
+              "type": "object",
+              "properties": {
+                "large": {
+                  "description": "Value for large_airport.",
+                  "type": "number",
+                  "minimum": 5,
+                  "maximum": 150
+                },
+                "medium": {
+                  "description": "Value for medium_airport.",
+                  "type": "number",
+                  "minimum": 5,
+                  "maximum": 150
+                },
+                "small": {
+                  "description": "Value for small_airport (and every other type).",
+                  "type": "number",
+                  "minimum": 5,
+                  "maximum": 150
+                }
+              },
+              "additionalProperties": false
+            },
+            "default_length_m": {
+              "description": "Length of a runway whose file entry has neither ends nor length_ft, meters.",
+              "type": "number",
+              "minimum": 100,
+              "maximum": 6000
+            },
+            "max_slope": {
+              "description": "Steepest runway in the terrain (rise over run, 0.01 = 1 %): threshold heights of the relief further apart than this are moved toward their mean, so the procedural hills never give a runway a ski-jump slope.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 0.1
+            },
+            "lights": {
+              "description": "Airport lights (ready-tile keys airport_lights / airport_light_colors, api 1.7) for runways marked lighted in the airport file. Never clustered.",
+              "type": "object",
+              "properties": {
+                "height_m": {
+                  "description": "Height of a light above the drawn pavement, meters.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 10
+                },
+                "edge_spacing_m": {
+                  "description": "Runway edge lights every this many meters on both edges (white).",
+                  "type": "number",
+                  "minimum": 10,
+                  "maximum": 500
+                },
+                "approach_length_m": {
+                  "description": "Length of the approach light row before each threshold, meters (0 = none).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 3000
+                },
+                "approach_spacing_m": {
+                  "description": "Spacing of the approach lights along the row, meters.",
+                  "type": "number",
+                  "minimum": 5,
+                  "maximum": 500
+                },
+                "approach_min_runway_m": {
+                  "description": "Only paved runways at least this long get approach lights, meters.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 6000
+                },
+                "taxiway_spacing_m": {
+                  "description": "Taxiway edge lights every this many meters (medium and large airports, blue).",
+                  "type": "number",
+                  "minimum": 10,
+                  "maximum": 500
+                },
+                "intensity": {
+                  "description": "COLOR a of every airport light (intensity weight, like the other light keys).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "edge_color": {
+                  "description": "Runway edge light colour, linear rgb 0..1 (white).",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "minItems": 3,
+                  "maxItems": 3
+                },
+                "threshold_color": {
+                  "description": "Threshold light colour, linear rgb 0..1 (green).",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "minItems": 3,
+                  "maxItems": 3
+                },
+                "end_color": {
+                  "description": "Runway end light colour, linear rgb 0..1 (red).",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "minItems": 3,
+                  "maxItems": 3
+                },
+                "approach_color": {
+                  "description": "Approach light colour, linear rgb 0..1 (white).",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "minItems": 3,
+                  "maxItems": 3
+                },
+                "taxiway_color": {
+                  "description": "Taxiway edge light colour, linear rgb 0..1 (blue).",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "minItems": 3,
+                  "maxItems": 3
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "countryside": {
+          "description": "Countryside ground (spec section 5.2): forest / farmland / meadow patches on the z15 grid with warped edges, plus a tint per patch (ground COLOR g = tint / 8).",
+          "type": "object",
+          "properties": {
+            "forest_share": {
+              "description": "Approximate share of the land that is forest.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "water_forest_share": {
+              "description": "Forest share for patches within water_distance_m of water.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "water_distance_m": {
+              "description": "See water_forest_share, meters.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 5000
+            },
+            "meadow_share": {
+              "description": "Share of the non-forest patches that are meadow (the rest is farmland; both resolve to the grass class, the tint tells them apart).",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "noise_cells": {
+              "description": "Size of the low-frequency noise that groups forests, in z15 cells (about 700 m each).",
+              "type": "number",
+              "minimum": 1,
+              "maximum": 64
+            },
+            "tint_levels": {
+              "description": "Number of tint values (COLOR g = tint / 8, tint 0..levels-1).",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 8
+            },
+            "edge_warp": {
+              "description": "Patch corners and edge points move up to this share of a z15 cell, so fields are not squares.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 0.4
+            }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false

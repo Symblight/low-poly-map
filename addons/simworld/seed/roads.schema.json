@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://simworld.local/seed/roads.schema.json",
+  "title": "SimWorld seed roads file (roads.json)",
+  "description": "Author-drawn inter-city roads (docs/spec-world-seed.md sections 4.5, 5.4). Each road passes through every author point.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "roads"],
+  "properties": {
+    "format": { "description": "File format version. This library reads 1.", "type": "integer", "const": 1 },
+    "roads": {
+      "description": "Roads.",
+      "type": "array",
+      "items": {
+        "description": "One road.",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "class", "points"],
+        "properties": {
+          "id": { "description": "Stable id, unique in the file; seeds the road's cosmetic noise.", "type": "string", "pattern": "^[a-z0-9_-]+$" },
+          "name": { "description": "Display name (e.g. A1).", "type": "string" },
+          "class": { "description": "Road class (profile road classes: width, lamps, LOD drop).", "type": "string", "enum": ["motorway", "trunk", "primary", "secondary", "tertiary"] },
+          "lit": { "description": "Share 0..1 of the length with street lamps (default 0).", "type": "number", "minimum": 0, "maximum": 1 },
+          "from": { "description": "City id or airport:<ident> the road starts at; null = ends where its points end.", "type": ["string", "null"] },
+          "to": { "description": "City id or airport:<ident> the road ends at; null = ends where its points end.", "type": ["string", "null"] },
+          "points": {
+            "description": "Author points [lon, lat], at least 2.",
+            "type": "array",
+            "minItems": 2,
+            "items": { "$ref": "water.schema.json#/$defs/point" }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,7 @@
+"id","ident","type","name","latitude_deg","longitude_deg","elevation_ft","continent","iso_country","iso_region","municipality","scheduled_service","icao_code","iata_code","gps_code","local_code","home_link","wikipedia_link","keywords"
+2591,"EETN","large_airport","Lennart Meri Tallinn Airport",59.41329956049999,24.832799911499997,131,"EU","EE","EE-37","Tallinn","yes","EETN","TLL","EETN",,"https://www.tallinn-airport.ee/","https://en.wikipedia.org/wiki/Tallinn_Airport","Ülemiste"
+4250,"EVRA","large_airport","Riga International Airport",56.92359924316406,23.971099853515625,36,"EU","LV","LV-062","Riga","yes","EVRA","RIX","EVRA",,"http://www.riga-airport.com/","https://en.wikipedia.org/wiki/Riga_International_Airport",
+2779,"EYKA","medium_airport","Kaunas International Airport, ""Karmėlava""",54.96390151977539,24.084800720214844,256,"EU","LT","LT-KU","Kaunas","yes","EYKA","KUN","EYKA",,,"https://en.wikipedia.org/wiki/Kaunas_Airport",
+2781,"EYPA","medium_airport","Palanga International Airport",55.97320175170898,21.093900680541992,33,"EU","LT","LT-KL","Palanga","yes","EYPA","PLQ","EYPA",,,,
+2785,"EYVI","large_airport","Vilnius International Airport",54.634102,25.285801,646,"EU","LT","LT-VL","Vilnius","yes","EYVI","VNO","EYVI",,,,
+300001,"LT-0003","small_airport","Fixture field, no runway ends",54.75,24.6,,"EU","LT","LT-KU","Somewhere","no",,,,,,,

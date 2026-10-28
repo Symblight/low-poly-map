@@ -6,11 +6,23 @@ use godot::classes::FileAccess;
 use godot::prelude::*;
 use serde_json::{Map, Number, Value};
 
-use simworld_core::{Diagnostics, WorldOptions};
+use std::sync::Arc;
+
+use simworld_core::{Diagnostics, SeedFileReader, WorldOptions};
 
 /// Option keys `configure_world` understands (contract section 3, api 0.6).
-const OPTION_KEYS: &[&str] =
-    &["origin_lat", "origin_lon", "tile_url", "cache_dir", "profile_path", "profile_overrides", "diagnostics"];
+const OPTION_KEYS: &[&str] = &[
+    "origin_lat",
+    "origin_lon",
+    "tile_url",
+    "cache_dir",
+    "profile_path",
+    "profile_overrides",
+    "diagnostics",
+    "layers",
+    "terrain_center",
+    "seed_world",
+];
 
 fn num(x: f64, path: &str) -> Result<Value, String> {
     Number::from_f64(x).map(Value::Number).ok_or_else(|| format!("{path}: non-finite number {x}"))
@@ -132,6 +144,23 @@ fn read_profile(path: &str) -> Result<String, String> {
     Ok(text)
 }
 
+/// Seed world files (api 1.7) through Godot's file system (`res://`, `user://`, OS paths); the
+/// core resolves relative paths against the manifest. Called by the core only inside
+/// `configure_world`, i.e. on the main thread.
+fn read_seed_file(path: &str) -> Result<String, String> {
+    if !FileAccess::file_exists(path) {
+        return Err("file not found".to_string());
+    }
+    let text = FileAccess::get_file_as_string(path).to_string();
+    if text.is_empty() {
+        let err = FileAccess::get_open_error();
+        if err != godot::global::Error::OK {
+            return Err(format!("cannot read ({err:?})"));
+        }
+    }
+    Ok(text)
+}
+
 /// `configure_world` options Dictionary -> core options. Unknown option keys are returned as
 /// warnings (a host written for a newer contract may pass keys this library does not know).
 pub fn options_from_dict(d: &VarDictionary, current: &Diagnostics) -> Result<(WorldOptions, Vec<String>), String> {
@@ -156,6 +185,58 @@ pub fn options_from_dict(d: &VarDictionary, current: &Diagnostics) -> Result<(Wo
         Some(v) if v.get_type() == VariantType::DICTIONARY => Some(variant_to_json(&v, "profile_overrides")?),
         Some(v) => return Err(format!("profile_overrides must be a Dictionary, got {:?}", v.get_type())),
     };
+    // api 1.4: Array (or PackedStringArray) of layer names; validated by the core.
+    let layers = match d.get("layers") {
+        None => None,
+        Some(v) if v.is_nil() => None,
+        Some(v) => match v.get_type() {
+            VariantType::PACKED_STRING_ARRAY => Some(v.to::<PackedStringArray>().as_slice().iter().map(|s| s.to_string()).collect()),
+            VariantType::ARRAY => {
+                let mut out = Vec::new();
+                for x in v.to::<VarArray>().iter_shared() {
+                    match x.get_type() {
+                        VariantType::STRING | VariantType::STRING_NAME => out.push(x.to_string()),
+                        t => return Err(format!("layers must hold Strings, got {t:?}")),
+                    }
+                }
+                Some(out)
+            }
+            t => return Err(format!("layers must be an Array of String, got {t:?}")),
+        },
+    };
+    // api 1.6: [lat, lon] (Array of 2 numbers, PackedFloat64Array or Vector2 = (lat, lon)); range-checked by the core.
+    let terrain_center = match d.get("terrain_center") {
+        None => None,
+        Some(v) if v.is_nil() => None,
+        Some(v) => {
+            let pair = match v.get_type() {
+                VariantType::VECTOR2 => {
+                    let c = v.to::<Vector2>();
+                    vec![c.x as f64, c.y as f64]
+                }
+                VariantType::PACKED_FLOAT64_ARRAY => v.to::<PackedFloat64Array>().as_slice().to_vec(),
+                VariantType::PACKED_FLOAT32_ARRAY => v.to::<PackedFloat32Array>().as_slice().iter().map(|&x| x as f64).collect(),
+                VariantType::ARRAY => {
+                    let mut out = Vec::new();
+                    for x in v.to::<VarArray>().iter_shared() {
+                        match x.get_type() {
+                            VariantType::FLOAT => out.push(x.to::<f64>()),
+                            VariantType::INT => out.push(x.to::<i64>() as f64),
+                            t => return Err(format!("terrain_center must hold numbers, got {t:?}")),
+                        }
+                    }
+                    out
+                }
+                t => return Err(format!("terrain_center must be an Array of 2 numbers [lat, lon], got {t:?}")),
+            };
+            match pair[..] {
+                [lat, lon] => Some([lat, lon]),
+                _ => return Err(format!("terrain_center must hold exactly 2 numbers [lat, lon], got {}", pair.len())),
+            }
+        }
+    };
+    // api 1.7: path of a seed world manifest (validated and loaded by the core).
+    let seed_world = get_string(d, "seed_world")?.filter(|p| !p.trim().is_empty());
     let diagnostics = match d.get("diagnostics") {
         None => None,
         Some(v) if v.is_nil() => None,
@@ -195,6 +276,10 @@ pub fn options_from_dict(d: &VarDictionary, current: &Diagnostics) -> Result<(Wo
             profile_json,
             profile_overrides,
             diagnostics,
+            layers,
+            terrain_center,
+            seed_world,
+            seed_reader: Some(SeedFileReader(Arc::new(read_seed_file))),
         },
         warns,
     ))

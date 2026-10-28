@@ -107,7 +107,7 @@ public partial class GeodeticFlightTest : Node
         _startedAt = Time.GetTicksMsec() / 1000.0;
         var s = Bridge?.Streamer;
         if (Bridge == null || Camera == null || s == null || !s.IsAvailable) { Fail("bridge/camera/WorldStreamer unavailable"); return; }
-        if (!s.HasHostApi) { Fail($"library api {s.ApiVersionText} has no geodetic API (needs 0.7)"); return; }
+        if (!s.HasHostApi) { Fail($"library api {s.ApiVersionText} has no geodetic API (needs 1.0)"); return; }
         if (!Bridge.WorldRunning) { Fail("world not configured: " + Bridge.ConfigureError); return; }
         Camera.SetProcess(false);
         Camera.SetProcessUnhandledInput(false);
@@ -180,7 +180,7 @@ public partial class GeodeticFlightTest : Node
         if (shifted)
         {
             _shiftFrames++;
-            GD.Print($"[GeodeticFlightTest] origin shift #{bridge.OriginShiftCount} {bridge.LastShift} at t={_simTime:0.0}s, loaded tiles {bridge.Cover.Loaded}, camera {cam}");
+            GD.Print($"[GeodeticFlightTest] origin shift #{bridge.OriginShiftCount} {bridge.LastShift} at t={_simTime:0.0}s, loaded tiles {bridge.TotalLoaded}, camera {cam}");
             if (bridge.SignalShiftCount != bridge.OriginShiftCount || bridge.LastSignalShift != bridge.LastShift)
             {
                 _shiftChecksFailed++;
@@ -188,8 +188,8 @@ public partial class GeodeticFlightTest : Node
             }
         }
         if (shifted || _frames % TileCheckEveryFrames == 0) CheckTiles(shifted);
-        if (shifted && _loadedBeforeShift > 0 && bridge.Cover.Loaded == 0) Fail("all tiles gone after an origin shift");
-        _loadedBeforeShift = bridge.Cover.Loaded;
+        if (shifted && _loadedBeforeShift > 0 && bridge.TotalLoaded == 0) Fail("all tiles gone after an origin shift");
+        _loadedBeforeShift = bridge.TotalLoaded;
 
         if (_pathDone)
         {
@@ -207,12 +207,16 @@ public partial class GeodeticFlightTest : Node
         for (int i = 0; i < _tiles.Count; i++)
         {
             var t = _tiles[i];
-            if (t.Packed == 0 || t.State != TileState.Ready || !bridge.Cover.TryGet(t.Packed, out var nodes)) continue;
+            // Terrain tiles (api 1.5) live in their own tile map; the key z/x/y alone would match a vector tile of the same slippy tile.
+            if (t.Packed == 0 || t.State != TileState.Ready || !(t.Terrain ? bridge.TerrainCover : bridge.Cover).TryGet(t.Packed, out var nodes)) continue;
             var c = (t.Min + t.Max) * 0.5f;
             double err = new Vector2(nodes.Root.Position.X - c.X, nodes.Root.Position.Z - c.Y).Length();
             _tilesChecked++;
             if (err > _maxTileErr) _maxTileErr = err;
-            if (err > TileLimitM)
+            // Terrain roots are placed at the tile centre of the Mercator projection at the tile's latitude, the debug rect is the projected corners:
+            // the two differ by about 0.1 % of the tile width on 22 km tiles (23 m at z10) - a Rust-side projection detail, tolerated up to 0.15 %.
+            double limit = t.Terrain ? System.Math.Max(TileLimitM, 0.0015 * (t.Max.X - t.Min.X)) : TileLimitM;
+            if (err > limit)
             {
                 _tileMismatches++;
                 if (_tileMismatches <= 3) GD.PushError($"[GeodeticFlightTest] tile {t.Key} root {nodes.Root.Position} is {err:0.0} m off its debug_tiles rect centre {c}{(afterShift ? " (right after a shift)" : "")}");

@@ -52,6 +52,9 @@ pub struct Status {
     pub failed_fetches: u64,
     /// The latest fetch or decode error (empty if none since the last configure).
     pub last_error: String,
+    /// The terrain is active in this configuration (api 1.6): the host asked for the layer and
+    /// the profile enables it. False when not configured or after a failed configure.
+    pub terrain_active: bool,
 }
 
 pub const MSG_NOT_CONFIGURED: &str = "not configured";
@@ -116,6 +119,8 @@ impl Health {
                     self.unreachable = false;
                 }
             }
+            // A fetch the scheduler cancelled says nothing about the source.
+            Err(e) if e.kind == FetchErrorKind::Cancelled => {}
             Err(e) => {
                 self.failed_fetches += 1;
                 self.last_error = e.message.clone();
@@ -123,7 +128,7 @@ impl Health {
                 match e.kind {
                     FetchErrorKind::Unreachable => self.unreachable = true,
                     FetchErrorKind::Contract => self.set_fatal(&e.message),
-                    FetchErrorKind::Tile => {}
+                    FetchErrorKind::Tile | FetchErrorKind::Cancelled => {}
                 }
             }
         }
@@ -156,7 +161,7 @@ impl Health {
         } else {
             (StatusState::Ok, String::new())
         };
-        Status { state, message, failed_fetches: self.failed_fetches, last_error: self.last_error.clone() }
+        Status { state, message, failed_fetches: self.failed_fetches, last_error: self.last_error.clone(), terrain_active: false }
     }
 }
 

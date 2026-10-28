@@ -6,7 +6,9 @@ namespace SimWorld;
 
 /// <summary>
 /// The set of uploaded tiles plus the sibling-swap visibility rule of the quadtree cover:
-/// a tile is visible iff (z == 13 or all 4 siblings are uploaded) and not all 4 of its children are uploaded.
+/// a tile is visible iff (z == root zoom or all 4 siblings are uploaded) and not all 4 of its children are uploaded.
+/// One instance per layer: the vector layer (root z13, leaf z16, 4 rings) and, since api 1.5, the terrain layer (root =
+/// terrain.far_zoom, leaf = terrain.near_zoom, default z10..z14, 5 rings; see <see cref="Configure"/>).
 /// Dithered LOD fades add two exceptions: a tile that has a poll_fades entry (<see cref="TileNodes.Fading"/>) is visible
 /// whenever it is uploaded (both sides of a swap show at once), and a freshly uploaded tile stays hidden
 /// (<see cref="Vis.AwaitingFade"/>) until poll_fades has run once after its upload, so its shader fade is set before its
@@ -18,6 +20,41 @@ namespace SimWorld;
 public sealed class TileCover
 {
     public enum Vis { Visible = 0, HiddenByChildren = 1, WaitingSiblings = 2, AwaitingFade = 3 }
+
+    /// <summary>Coarsest zoom of this layer (the sibling rule does not apply to it): 13 for the vector layer.</summary>
+    public int RootZ { get; private set; } = TileKey.RootZ;
+    /// <summary>Finest zoom of this layer (tiles of it have no children): 16 for the vector layer.</summary>
+    public int LeafZ { get; private set; } = TileKey.LeafZ;
+    /// <summary>Number of rings = zooms of this layer (ring = LeafZ - z).</summary>
+    public int Rings => LeafZ - RootZ + 1;
+
+    public TileCover() { }
+
+    public TileCover(int rootZ, int leafZ) { Configure(rootZ, leafZ); }
+
+    /// <summary>
+    /// Sets the zoom range (root = coarsest, leaf = finest) and resizes the per-ring counters. Only allowed while no tile is held
+    /// (the terrain layer's range comes from the profile after each configure, when everything has been unloaded).
+    /// </summary>
+    public void Configure(int rootZ, int leafZ)
+    {
+        if (_tiles.Count != 0) throw new System.InvalidOperationException("TileCover.Configure with tiles held");
+        if (leafZ < rootZ) throw new System.ArgumentException("leafZ < rootZ");
+        RootZ = rootZ;
+        LeafZ = leafZ;
+        VisibleByRing = new int[Rings];
+        LoadedByRing = new int[Rings];
+        HiddenByChildren = 0;
+        WaitingSiblings = 0;
+        AwaitingFadeTiles = 0;
+        FadingTiles = 0;
+        TrianglesLoaded = TrianglesVisible = 0;
+        GroundTilesLoaded = GroundTilesVisible = 0;
+        GroundTrianglesLoaded = GroundTrianglesVisible = 0;
+        LightsLoaded = LightsVisible = 0;
+        LightTilesLoaded = ClusteredTilesLoaded = ClusteredTilesVisible = LightTilesVisible = 0;
+        _awaiting.Clear();
+    }
 
     /// <summary>
     /// True once the Rust build exports poll_fades(): new tiles then wait for the first poll_fades after their upload.
@@ -32,8 +69,8 @@ public sealed class TileCover
 
     // Counters kept incrementally (see Account).
     public int Loaded => _tiles.Count;
-    public readonly int[] VisibleByRing = new int[4];
-    public readonly int[] LoadedByRing = new int[4];
+    public int[] VisibleByRing { get; private set; } = new int[4];
+    public int[] LoadedByRing { get; private set; } = new int[4];
     public int HiddenByChildren { get; private set; }
     public int WaitingSiblings { get; private set; }
     public int AwaitingFadeTiles { get; private set; }
@@ -137,7 +174,7 @@ public sealed class TileCover
     private bool Present(long k)
     {
         if (_tiles.ContainsKey(k)) return true;
-        return TileKey.Z(k) < TileKey.LeafZ && AllChildrenPresent(k);
+        return TileKey.Z(k) < LeafZ && AllChildrenPresent(k);
     }
 
     private bool AllChildrenPresent(long k)
@@ -161,8 +198,8 @@ public sealed class TileCover
             if (self.Fading) return Vis.Visible;
         }
         int z = TileKey.Z(k);
-        if (z > TileKey.RootZ && !AllSiblingsPresent(k)) return Vis.WaitingSiblings;
-        if (z < TileKey.LeafZ && AllChildrenPresent(k)) return Vis.HiddenByChildren;
+        if (z > RootZ && !AllSiblingsPresent(k)) return Vis.WaitingSiblings;
+        if (z < LeafZ && AllChildrenPresent(k)) return Vis.HiddenByChildren;
         return Vis.Visible;
     }
 
@@ -174,19 +211,19 @@ public sealed class TileCover
     private void RefreshAround(long k)
     {
         int z = TileKey.Z(k);
-        if (z < TileKey.LeafZ)
+        if (z < LeafZ)
             for (int q = 0; q < 4; q++) Refresh(TileKey.Child(k, q));
         long a = k;
-        for (int az = z; az >= TileKey.RootZ; az--)
+        for (int az = z; az >= RootZ; az--)
         {
-            if (az > TileKey.RootZ)
+            if (az > RootZ)
                 for (int q = 0; q < 4; q++)
                 {
                     long s = TileKey.Sibling(a, q);
                     if (s != k) Refresh(s);
                 }
-            if (az > TileKey.RootZ) a = TileKey.Parent(a);
-            if (az > TileKey.RootZ) Refresh(a); // ancestor: hidden-by-children state
+            if (az > RootZ) a = TileKey.Parent(a);
+            if (az > RootZ) Refresh(a); // ancestor: hidden-by-children state
         }
     }
 
@@ -206,7 +243,7 @@ public sealed class TileCover
     private void Account(TileNodes t, int s)
     {
         int ring = t.Ring;
-        if ((uint)ring > 3) ring = 3;
+        if ((uint)ring >= (uint)LoadedByRing.Length) ring = LoadedByRing.Length - 1;
         bool vis = t.Vis == Vis.Visible;
         LoadedByRing[ring] += s;
         TrianglesLoaded += s * t.Tris;
@@ -232,7 +269,7 @@ public sealed class TileCover
 
     /// <summary>
     /// Walks every uploaded tile. Errors: (a) stored state differs from the rule; (b) a visible tile has a visible
-    /// ancestor (ground covered twice); (c) a z13 root that has uploaded tiles is not fully covered by visible tiles
+    /// ancestor (ground covered twice); (c) a root-zoom tile that has uploaded tiles is not fully covered by visible tiles
     /// (ground covered 0 times) while it is not in <paramref name="pendingRoots"/> and was already suspect on the
     /// previous call (<paramref name="suspectRoots"/> is updated in place); (d) counters differ from a recount.
     /// Returns the number of errors; details are appended to <paramref name="report"/>.
@@ -241,13 +278,13 @@ public sealed class TileCover
     {
         int errors = 0;
         var roots = new HashSet<long>();
-        var recountVis = new int[4];
+        var recountVis = new int[VisibleByRing.Length];
         int recountHidden = 0, recountWait = 0, recountAwait = 0, recountFading = 0;
         foreach (var kv in _tiles)
         {
             long k = kv.Key;
             var t = kv.Value;
-            roots.Add(TileKey.Ancestor(k, TileKey.RootZ));
+            roots.Add(TileKey.Ancestor(k, RootZ));
             var want = Evaluate(k);
             if (want != t.Vis || t.Root.Visible != (want == Vis.Visible))
             {
@@ -258,9 +295,9 @@ public sealed class TileCover
             if (t.Fading) recountFading++;
             if (t.Vis == Vis.Visible)
             {
-                recountVis[System.Math.Clamp(t.Ring, 0, 3)]++;
+                recountVis[System.Math.Clamp(t.Ring, 0, recountVis.Length - 1)]++;
                 // Double cover is intended while a swap fades: skip pairs where either side is in a transition.
-                for (int z = TileKey.Z(k) - 1; z >= TileKey.RootZ; z--)
+                for (int z = TileKey.Z(k) - 1; z >= RootZ; z--)
                 {
                     if (!t.Fading && _tiles.TryGetValue(TileKey.Ancestor(k, z), out var a) && a.Vis == Vis.Visible && !a.Fading)
                     {
@@ -276,7 +313,7 @@ public sealed class TileCover
             else recountWait++;
         }
 
-        for (int r = 0; r < 4; r++)
+        for (int r = 0; r < recountVis.Length; r++)
             if (recountVis[r] != VisibleByRing[r]) { errors++; report.Append("counter VisibleByRing[").Append(r).Append("] ").Append(VisibleByRing[r]).Append(" != ").Append(recountVis[r]).Append('\n'); }
         if (recountHidden != HiddenByChildren) { errors++; report.Append("counter HiddenByChildren ").Append(HiddenByChildren).Append(" != ").Append(recountHidden).Append('\n'); }
         if (recountWait != WaitingSiblings) { errors++; report.Append("counter WaitingSiblings ").Append(WaitingSiblings).Append(" != ").Append(recountWait).Append('\n'); }
@@ -302,11 +339,30 @@ public sealed class TileCover
         return errors;
     }
 
+    /// <summary>
+    /// Debug: root-zoom tiles that have uploaded tiles below them but whose ground is not fully covered by visible tiles right now
+    /// (a hole), ignoring roots in <paramref name="pending"/> (still being built). <paramref name="worst"/> = the lowest coverage found.
+    /// </summary>
+    public int CountUncoveredRoots(HashSet<long>? pending, out float worst)
+    {
+        worst = 1f;
+        var roots = new HashSet<long>();
+        foreach (var k in _tiles.Keys) roots.Add(TileKey.Ancestor(k, RootZ));
+        int n = 0;
+        foreach (long root in roots)
+        {
+            if (pending != null && pending.Contains(root)) continue;
+            float c = Coverage(root);
+            if (c < 1f) { n++; if (c < worst) worst = c; }
+        }
+        return n;
+    }
+
     /// <summary>Fraction of the tile's ground covered by visible tiles at or below it.</summary>
     private float Coverage(long k)
     {
         if (_tiles.TryGetValue(k, out var t) && t.Vis == Vis.Visible) return 1f;
-        if (TileKey.Z(k) >= TileKey.LeafZ) return 0f;
+        if (TileKey.Z(k) >= LeafZ) return 0f;
         float sum = 0f;
         for (int q = 0; q < 4; q++) sum += Coverage(TileKey.Child(k, q));
         return sum * 0.25f;

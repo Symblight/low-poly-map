@@ -14,7 +14,15 @@ Out of scope: interior mapping, per-window geometry, the window/sprite cross-fad
 
 ## Status
 
-Design only. Nothing built. Revised 2026-10-27 after review (see "Decisions").
+Revised 2026-10-27 after review (see "Decisions"). Built so far:
+
+- **W1 done** (shader only, `addons/simworld/shaders/building_windows.gdshader`).
+- **W2 done** (Rust, tile schema, profile_version 4; `CHANGELOG.md`).
+- **W3 Godot half done** (2026-10-27): `building_windows.gdshader` reads `floor(UV)` / `fract(UV)` on walls with `u >= 0`, no windows or window average on `u = -1` walls (floor lines in meters there, none for landmark / dark), `window_width_m` / `WindowWidthM` removed; the facade expects `api_version` 1.x and refuses every 0.x library. Checked on the synthetic city and the Vilnius tiles (castle, tower, ruin, cathedral bell tower windowless; windows whole at corners; R2-only view has no grid).
+- **W3 Rust half done, `api_version` 1.0:** corners and runs, window-column `u`, floor `v`, `u = -1` + meters on windowless and all R2 walls (`mesher.rs` `emit_polygon`, `ring_runs`, `is_corner`; `LodParams::windows` is false at R2); contract section 7 rewritten; golden hashes regenerated (UV change only). 
+- **W4 done (2026-10-27, host side plus one Rust default):** `lit_share` tables, colours and the floodlight are read from `world_profile()`, `WorldView.SetTime` writes the interpolated shares to both building materials, the landmark floodlight is in the shader, and two additions beyond the first spec (window average fade and window / sprite cross-fade, weaker and cooler average; see "W4 additions" below). Open: only the "Later" list and a measured frame-time comparison (acceptance 5).
+
+The sections "Today" and "What others do" describe the state before W1.
 
 ## Today
 
@@ -130,7 +138,7 @@ One material for all building tiles, plus the existing `LOD_DITHER` variant. Per
 ivec2 cell = ivec2(floor(UV));                                 // window id: column, floor (both in window units)
 vec2  f    = fract(UV);                                        // position inside the cell
 float in_window = float(all(greaterThan(f, vec2(0.2, 0.25))) && all(lessThan(f, vec2(0.8, 0.8))));
-uint  s    = uint(seed * 16777216.0);                          // COLOR.g is 24-bit exact
+uint  s    = byte(COLOR.g) | byte(COLOR.b) << 8 | byte(COLOR.a) << 16;   // byte(x) = uint(x * 255 + 0.5), see below
 float share = clamp(window_share[profile] * building_factor(s), 0.0, 1.0);   // building_factor: 0.6..1.4
 float h1 = hash01(s, cell), h2 = hash01(s ^ 0x9E3779B9u, cell);              // integer hash (PCG-style), see below
 float lit  = step(h1, share);                                  // monotone in share: windows go off in a fixed order
@@ -140,6 +148,8 @@ float w    = smoothstep(0.25, 0.75, max(fwidth(UV.x), fwidth(UV.y)));        // 
 EMISSION = profile_color[profile] * mix(glow, avg, w) * window_emission * emission_level * simworld_night_factor;
 ```
 
+- **W4 change to the `avg` line:** the shown average is `share * avg_gain` (0.16, not 0.33), desaturated and cooler, and it fades to zero between 900 and 2000 m of view depth while the light sprites fade in over the same range ("W4 additions"). The floodlight below also multiplies by `emission_level`, so its threshold margin follows `NightLook.EmissionLevel`: with the default `strength` 1.2 the brightest channel of the base is 1.2 x `EmissionLevel` against the glow threshold of 0.82 x, the brightest window 0.75 x (`default.json` needs no change).
+- **Seed (corrected):** `COLOR.g` is **not** 24-bit exact on the host. Rust computes the seed with 24 bits, but Godot stores vertex COLOR as 8 bits per channel, so the shader sees `g` quantized to 1/255 (256 seeds). The shader therefore builds a 24-bit seed from the bytes of `g`, `b` (floor height) and `a` (roof height) of the same building. Determinism holds because the same tile always yields the same bytes; two buildings with equal `g`, `b` and `a` bytes share a window pattern, which is accepted. ([contract.md](contract.md) section 7.)
 - **Hash:** integer only. `hash01(seed, cell)` is a PCG/xxhash-style `uint` mix of `(seed, cell.x, cell.y)` scaled to 0..1. A `sin`-based float hash is not reproducible across GPUs and precisions, and acceptance 3 and the determinism rule need the same window lit everywhere.
 - **Hour → share on the CPU:** `TilePool.SetWindowShares(float[8])` interpolates each profile's 24-value `lit_share` table at the current hour and sets `uniform float window_share[8]` on **both** `_buildingMaterial` and `_buildingFadeMaterial`. `WorldView.SetTime` calls it when the hour has moved by more than 0.01 h, not every frame. Global uniforms cannot be arrays, so this is a material uniform; the one place that writes both materials is the only guard against them drifting apart. Index = profile id; ids 3, 5 and 7 are always 0. The shader does no time math and does not read `simworld_hour`.
 - **Bloom (decided):** windows do **not** bloom. `window_emission` = 0.65, so a window emits 0.55–0.75 × `EmissionLevel`, below the glow threshold of 0.82 × `EmissionLevel`; sprites and floodlights stay above it. Without this every window up close would bloom (0.85–1.15 × `EmissionLevel`) and the bloom would vanish exactly at the distance blend, where the average drops to ~0.3. `window_emission` is a material uniform for tuning; `floodlight.strength` is set so the landmark base does bloom.
@@ -223,16 +233,44 @@ Every change updates `docs/contract.md`, `API_MAJOR`/`API_MINOR`, `CHANGELOG.md`
 8. No window grid on R2 blocks (fly at 3 km with R0/R1 forced off in the settings panel) and none on the underside of a raised part.
 9. Windows do not bloom; the base of a floodlit landmark does.
 
+W4 verification (2026-10-27): 3 and 9 checked on the bench (`--window-selftest` for the hour tables on both materials, 301 steps 12:00 -> 03:00, plus screenshots at 18, 21, 00 and 03 h whose lit windows are subsets of each other and whose mean brightness falls monotonically 23.4 -> 22.8 -> 19.7 -> 18.9; windows show no halo, floodlit bases do). 5 was tried but is not decided: the uncapped frame time at 3840 x 2160 was 3.70-4.71 ms for the new shader and 3.70-5.60 ms for `building_day`, run on a shared dev Mac with other Godot instances open, so the +/- 1 ms noise hides a 0.3 ms difference (Metal reports no GPU timestamp through `RenderingServer`). 6: building triangle and vertex data unchanged. 1, 2, 4, 7 and 8 rest on the W3 checks and the screenshots above (no shimmer seen; the grid fades into the average without a visible line).
+
 ## Phases
 
 | Phase | Work | Contract | Owner |
 |---|---|---|---|
-| W1 | Shader only: grid from the existing meter UV (fixed 3 m columns), integer hash, `global uniform float simworld_night_factor`, hard-coded shares, `window_emission` 0.65, distance blend. Shows the look; corners are cut, castles still lit, R2 shows a grid. Edit the copy Godot loads (see "Today") | none | godot-csharp-integrator |
-| W2 | Tile schema (`historic`, `man_made`, `windows`, state attributes), profiles `landmark` / `dark` with kind moves, overrides, `dark_states`, slender heuristic with its two guards, lights consistency; rebuild tiles | profile + ids 6/7 | rust-world-streamer |
-| W3 | Corners and runs, window-unit `u` and floor-unit `v`, `u = -1` + meters on windowless, R2 and cap rules in `mesher.rs`; shader switches to `floor` / `fract(UV)`, `abs(normal.y)` | wall UV | both |
-| W4 | `lit_share` tables in the profile, `TilePool.SetWindowShares` on both materials, `floodlight` keys and gradient, tuning by eye | profile keys | both |
+| W1 (done) | Shader only: grid from the existing meter UV (fixed 3 m columns), integer hash, `global uniform float simworld_night_factor`, hard-coded shares, `window_emission` 0.65, distance blend. Shows the look; corners are cut, castles still lit, R2 shows a grid. Edit the copy Godot loads (see "Today") | none | godot-csharp-integrator |
+| W2 (done) | Tile schema (`historic`, `man_made`, `windows`, state attributes), profiles `landmark` / `dark` with kind moves, overrides, `dark_states`, slender heuristic with its two guards, lights consistency; rebuild tiles | profile + ids 6/7 | rust-world-streamer |
+| W3 (done) | Corners and runs, window-unit `u` and floor-unit `v`, `u = -1` + meters on windowless, R2 and cap rules in `mesher.rs`; shader switches to `floor` / `fract(UV)`, `abs(normal.y)` | wall UV | both |
+| W4 (done) | `lit_share` tables read from the profile, `WorldView.SetTime` -> `TilePool.SetWindowShares` on both materials, `floodlight` keys and gradient, tuning by eye; plus the window average fade and window / sprite cross-fade ("W4 additions") | profile default `lights.min_ring` 2 -> 1 (inside profile_version 4) | both |
 
 W2 and W3 ship together as the `api_version` 1.0 change. P5 (one addon folder) finishes before W1.
+
+## W4 additions (2026-10-27, requested after the first night screenshots)
+
+Built and measured on the Vilnius tiles, 22:00, camera 450 m AGL pitch -28 (`--cam-alt=450 --cam-pitch=-28`).
+
+**What produced the tan far field.** Not R2 (R2 walls are windowless, `u = -1`, and carry no average). It was the window **average** (`avg = share * 0.33`, blended in by `w` where a cell is about one pixel) on the side walls of **R0/R1 tiles**: walls seen at a grazing angle have a large `fwidth(UV.x)`, so `w` reaches 1 at 400-1000 m and the whole wall glowed in the profile colour. R1 reaches farther than the band edge says, because the cover selects whole tiles by the distance to their nearest point and a z15 tile is about 0.7 km wide: with the default 2.5 km edge R1 walls show out to about 3.2 km, and with `bands.r1_edge_m=650` the windowed walls still reach about 1.3-1.5 km (checked by colouring windowed walls red and windowless ones blue). With the emission switched off the tan disappears completely.
+
+**A. Average fades to zero with distance, sprites take over.**
+- `building_windows.gdshader`: `avg *= 1 - smoothstep(avg_fade_start_m, avg_fade_end_m, v_depth)`. Only the average fades; individual windows stay while they are resolvable.
+- `light_sprite.gdshader`: `blend = smoothstep(blend_start_m, blend_end_m, view depth)`; sprites are scaled by it and the quad is collapsed below 0.2 % (no fill cost for the invisible ones). The sprites are therefore invisible where windows carry the building and carry it fully beyond `blend_end_m`.
+- One pair of numbers drives both: `WorldRenderSettings.WindowSpriteBlendStartM` / `WindowSpriteBlendEndM` (900 / 2000 m of view depth; end below the R1/R2 border at 2.5 km, start above the far corner of R0 tiles at about 0.9 km) is written to the building material (`avg_fade_*`) and the sprite material (`blend_*`), so the two cannot drift apart. R2 and R3 sprites start beyond the end and are unaffected.
+- Sprites need to exist on R1 tiles: **`lights.min_ring` default 2 -> 1** (R1..R3), done inside profile_version 4, which is still unreleased. Cost: +12.8 k light points at the view above (226 k vs 214 k, +6 %, about 0.8 MB), +27 draw calls (one light MultiMesh per R1 tile), R1 upload 0.40 -> 0.63 ms average per tile. Building triangle counts (687,043) and vertex data are unchanged (acceptance 6). Golden hashes: only the two R1 tiles changed. `min_ring` = 2 restores the old set (R1 windows then fade to nothing with no sprites); 0 adds sprites to R0.
+
+**B. Weaker, cooler average.** `avg = share * avg_gain` (0.16 instead of the full window area 0.33), colour = profile colour desaturated by 55 % and multiplied by (0.88, 0.96, 1.08). Near-field windows (`glow`) keep their colour untouched. All four are material uniforms and `WorldRenderSettings` exports (`WindowAvgGain`, `WindowAvgDesaturate`, `WindowAvgTint`).
+
+**Result (mean RGB of the strip y 235-300, 1152 x 648, 22:00):** before (33.9, 32.7, 33.6); average emission switched off (9.6, 14.0, 24.2); after (18.3, 20.4, 26.1). Old code with every building in R2 (no windows, `--set=bands.r0_edge_m=50 --set=bands.r1_edge_m=60`) was not re-measured; with the new code it gives (12.1, 14.7, 21.6). The far field now reads as dark blocks with light points, no tan walls.
+
+## Review 2026-10-28
+
+Open findings after W4. The two GPU-side risks (the `discard` in the dither variant on TBDR, now capped by `fades.max_active`; draw calls) are tracked in [spec-night-rendering.md](spec-night-rendering.md), "Review 2026-10-28: iPhone risks"; here only what touches the windows.
+
+| # | Problem | Why it matters | What to do |
+|---|---------|----------------|------------|
+| 2 | Draw calls from `lights.min_ring` 2 -> 1 | +27 draw calls at the W4 view (one light MultiMesh per R1 tile), on top of the other sprite sets per tile, against the 300 budget | Merge sprite MultiMeshes per parent tile or per R3 layer (night-rendering spec); until then `--set=lights.min_ring=2` is the fallback |
+| 3 | Acceptance 5 (≤ 0.3 ms) not measured | ±1 ms noise on the shared Mac; Metal has no GPU timestamps through `RenderingServer` (see "W4 verification") | Xcode GPU Frame Capture or Instruments on a fixed scene; on the iPhone once the export exists. Acceptance 5 stays open until then |
+| 4 | Seed collisions | With 8 bits per COLOR channel the shader's seed is `g` + floor height `b` + roof height `a`. Identical standard blocks (5 floors, 15 m) share `b` and `a`, so only `g` tells them apart: 256 patterns. Up close a repeating window pattern may show | Accept for now. If it shows, add the wall's world position (e.g. the run's first vertex, passed through or hashed into `u`'s column base) to the hash |
 
 ## Later
 

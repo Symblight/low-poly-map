@@ -1,18 +1,22 @@
 shader_type spatial;
-// Flat ground (M5): landuse / park / water areas and road strips, one mesh per R0..R2 tile, one shared material.
+// Flat ground (M5): landuse / park / water areas and road strips, one mesh per tile (R3 since api 1.3), one shared material.
 // Mobile-renderer compatible: no Forward+ only features. Opaque, no transparency.
 //
 // Vertex COLOR encoding (from Rust):
-//   r = class / 16 (0 grass/park, 1 forest, 2 water, 3 residential, 4 commercial, 5 industrial, 6 other landuse, 8 road)
-//   g = lit (1 for lit=yes roads, else 0); carried for later (street lamps, cars) and not used for shading: roads do not glow
-//   b = road class / 8 (0 none, 1 motorway, 2 primary, 3 secondary, 4 tertiary, 5 residential, 6 other)
+//   r = class / 16 (0 grass/park, 1 forest, 2 water, 3 residential, 4 commercial, 5 industrial, 6 other landuse, 7 aeroway (seed world, api 1.7), 8 road)
+//   g = roads: lit (1 for lit=yes roads, else 0); carried for later (street lamps, cars) and not used for shading: roads do not glow.
+//       areas (api 1.7): countryside tint level / 8 on class 0 and 1 (0 for archive and synthetic-city areas); see seed_palette.gdshaderinc
+//   b = roads: road class / 8 (0 none, 1 motorway, 2 primary, 3 secondary, 4 tertiary, 5 residential, 6 other)
+//       areas (api 1.7): class 7 aeroway sub-kind / 8 (0 airfield grass, 1 runway paved, 2 runway grass, 3 taxiway, 4 apron); 0 otherwise
 //   a = 1
+// Roads are told apart by r == 8/16 BEFORE g or b are read (g and b mean something else on areas).
 // The mesh is flat, but the shading normal is rebuilt from screen derivatives and forced to face up, so it does not
 // depend on triangle winding (cull_disabled) and keeps working when a DEM later makes the ground non-flat.
 render_mode cull_disabled, diffuse_burley, specular_schlick_ggx;
 
 #include "lod_dither.gdshaderinc"
 #include "earth_curve.gdshaderinc"
+#include "seed_palette.gdshaderinc"
 
 // Overall subtle darkening so the ground sits below the buildings in brightness.
 uniform float darken : hint_range(0.0, 1.0) = 0.88;
@@ -21,7 +25,8 @@ uniform float darken : hint_range(0.0, 1.0) = 0.88;
 // at range (floors of buildings, ground classes against each other). Kept tiny so building bases are not covered.
 uniform float depth_bias_per_m : hint_range(0.0, 0.0005) = 0.00002;
 uniform float depth_bias_max_m = 3.0;
-// Roads no longer glow, so the ground does not read simworld_night_factor today; imagery (M7) will dim the ground with it.
+// Roads no longer glow; the ground reads simworld_night_factor only to take the glare off water at night (a flat shaded sea mirrors the moon as a huge blob).
+global uniform float simworld_night_factor;
 
 varying float v_depth;
 
@@ -64,6 +69,10 @@ void fragment() {
 	bool is_road = cls == 8;
 
 	vec3 base = palette(cls);
+	// Seed world (api 1.7): airport surfaces by sub-kind, countryside tint on grass / forest areas. Never on roads (cls 8, g = lit).
+	bool is_aero = cls == 7;
+	if (is_aero) base = seed_aeroway_color(road_class);
+	else if (cls <= 1) base = seed_tint(base, cls, int(floor(COLOR.g * 8.0 + 0.5)));
 	// Motorways / primary roads a hair lighter than side streets (road class 1 = motorway ... 6 = other).
 	if (is_road) base += vec3(0.03) * clamp(float(4 - road_class), 0.0, 3.0) * 0.5;
 	vec3 albedo = srgb_to_linear(base) * darken;
@@ -76,6 +85,6 @@ void fragment() {
 
 	bool is_water = cls == 2;
 	ALBEDO = albedo;
-	ROUGHNESS = is_water ? 0.18 : (is_road ? 0.75 : 0.92);
-	SPECULAR = is_water ? 0.8 : 0.25;
+	ROUGHNESS = is_water ? 0.18 : ((is_road || (is_aero && road_class != 0 && road_class != 2)) ? 0.75 : 0.92);
+	SPECULAR = is_water ? mix(0.8, 0.12, simworld_night_factor) : 0.25;
 }

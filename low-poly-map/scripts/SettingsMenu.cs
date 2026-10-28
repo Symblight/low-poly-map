@@ -8,7 +8,8 @@ namespace LowPolyMap;
 /// <summary>
 /// F3-toggled settings panel (bottom-left; hidden at startup, launch arg <c>--settings-open</c> shows it): flight speed
 /// (live, two-way with <see cref="FreeFlyCamera.Speed"/>), the four band edges (how far each LOD ring of 3D buildings reaches)
-/// and the per-ring minimum building height. Edges and heights are profile values the library reads at configure time, so
+/// the per-ring minimum building height and, with a terrain-capable library (api 1.5), the terrain layer (enable toggle and hills amplitude
+/// apply with the world restart, the detail slider is live through set_terrain_detail without a teleport). Edges and heights are profile values the library reads at configure time, so
 /// they are applied by <see cref="WorldView.ApplyProfileOverrides"/> (world restart at the camera position): with the
 /// auto-apply box on, 0.6 s after the last change, otherwise with the Apply button. A rejected profile keeps the previous world
 /// running, shows the library's error in red and reverts the sliders. Controls never take keyboard focus (only the speed
@@ -50,12 +51,31 @@ public partial class SettingsMenu : PanelContainer
     public string LastError { get; private set; } = "";
     /// <summary>True when the library's profile has the buildings.rN.min_height_m keys (profile_version 2).</summary>
     public bool HasMinHeight { get; private set; }
-    /// <summary>Finest band that carries light sprites as shown on the panel (0..3; library default 2) and as applied.</summary>
+    /// <summary>Finest band that carries light sprites as shown on the panel (0..3; library default 1) and as applied.</summary>
     public int LightMinRing => _lightRing;
     public int AppliedLightMinRing => _appliedLightRing;
     /// <summary>True when the library's profile has lights.min_ring (profile_version 3).</summary>
     public bool HasLightMinRing { get; private set; }
 
+    /// <summary>True when the library has the terrain layer (api 1.5) and its profile has the terrain section.</summary>
+    public bool HasTerrain { get; private set; }
+    /// <summary>Terrain layer switch and hills amplitude (m) as shown on the panel and as applied.</summary>
+    public bool TerrainOn => _terrainOn;
+    public bool AppliedTerrainOn => _appliedTerrainOn;
+    public double TerrainAmplitude => _terrainAmp;
+    public double AppliedTerrainAmplitude => _appliedTerrainAmp;
+    /// <summary>set_terrain_detail scale as shown on the panel (live).</summary>
+    public double TerrainDetailScale => _terrainDetail;
+
+    private const double TerrainAmpMax = 3000.0, TerrainAmpDefault = 160.0, TerrainDetailMin = 0.25;
+    private bool _terrainOn, _appliedTerrainOn;
+    private double _terrainAmp = TerrainAmpDefault, _appliedTerrainAmp = TerrainAmpDefault;
+    private double _terrainDetail = 1.0, _terrainDetailMax = 2.0;
+    private bool _detailDirty;
+    private double _detailTimer;
+    private CheckBox _terrainCheck = null!;
+    private HSlider _ampSlider = null!, _detailSlider = null!;
+    private SpinBox _ampBox = null!, _detailBox = null!;
     private readonly double[] _edges = new double[4];
     private readonly double[] _appliedEdges = new double[4];
     private readonly double[] _minH = new double[3];
@@ -132,13 +152,26 @@ public partial class SettingsMenu : PanelContainer
             _minBox[i].ValueChanged += v => { if (!_syncing) SetMinHeight(ring, v); };
         }
 
-        // -- light sprites in the near field (stopgap until the window shader)
-        AddHeading(col, "Light sprites (no windows yet)", ResetLights);
+        // -- light sprites: finest band that carries them (windows and sprites cross-fade over the WorldRenderSettings blend range)
+        AddHeading(col, "Light sprites", ResetLights);
         (_ringSlider, _ringBox) = AddRow(col, "Lights from band", 0, 3, 1, 0, 3, 1, "");
         _ringBox.Prefix = "R";
-        _ringBox.TooltipText = "Finest band with light sprites: R3 = only far away, R2 = default, R1 = from 0.6 km, R0 = everywhere";
+        _ringBox.TooltipText = "Finest band with light sprites: R3 = only far away, R2 = R2/R3 (R1 windows then fade to nothing), R1 = default (sprites fade in over the windows between 0.9 and 2 km), R0 = everywhere";
         _ringSlider.ValueChanged += v => { if (!_syncing) SetLightMinRing((int)v); };
         _ringBox.ValueChanged += v => { if (!_syncing) SetLightMinRing((int)v); };
+
+        // -- terrain (api 1.5): layer switch + hills amplitude restart the world like the ranges; detail is live
+        AddHeading(col, "Terrain (procedural hills)", ResetTerrain);
+        _terrainCheck = new CheckBox { Text = "terrain layer (restarts the world)", FocusMode = FocusModeEnum.None, TooltipText = "Draw the procedural terrain tiles (layers: terrain + profile terrain.enabled)" };
+        _terrainCheck.Toggled += on => { if (!_syncing) SetTerrainOn(on); };
+        col.AddChild(_terrainCheck);
+        (_ampSlider, _ampBox) = AddRow(col, "Hills amplitude", 0, TerrainAmpMax, 10, 0, TerrainAmpMax, 10, " m");
+        _ampSlider.ValueChanged += v => { if (!_syncing) SetTerrainAmplitude(v); };
+        _ampBox.ValueChanged += v => { if (!_syncing) SetTerrainAmplitude(v); };
+        (_detailSlider, _detailBox) = AddRow(col, "Detail (error x)", TerrainDetailMin, 2.0, 0.05, TerrainDetailMin, 8.0, 0.05, "x");
+        _detailBox.TooltipText = "set_terrain_detail: multiplies the terrain error per band (smaller = more triangles); live, no restart";
+        _detailSlider.ValueChanged += v => { if (!_syncing) SetTerrainDetail(v); };
+        _detailBox.ValueChanged += v => { if (!_syncing) SetTerrainDetail(v); };
 
         // -- apply
         var applyRow = new HBoxContainer();
@@ -167,6 +200,9 @@ public partial class SettingsMenu : PanelContainer
         if (!HasMinHeight)
             for (int i = 0; i < 3; i++) { _minSlider[i].Editable = false; _minBox[i].Editable = false; }
         _ringSlider.Editable = _ringBox.Editable = HasLightMinRing;
+        _terrainCheck.Disabled = !HasTerrain;
+        _ampSlider.Editable = _ampBox.Editable = HasTerrain;
+        _detailSlider.Editable = _detailBox.Editable = HasTerrain && _appliedTerrainOn;
         RefreshStatus();
 
         if (System.Linq.Enumerable.Contains(OS.GetCmdlineUserArgs(), "--settings-selftest")) RunSelfTest();
@@ -237,6 +273,13 @@ public partial class SettingsMenu : PanelContainer
         }
         _ringSlider.SetValueNoSignal(_lightRing);
         _ringBox.SetValueNoSignal(_lightRing);
+        _terrainCheck.SetPressedNoSignal(_terrainOn);
+        _ampSlider.SetValueNoSignal(_terrainAmp);
+        _ampBox.SetValueNoSignal(_terrainAmp);
+        _detailSlider.MaxValue = _terrainDetailMax;
+        _detailSlider.SetValueNoSignal(System.Math.Min(_terrainDetail, _terrainDetailMax));
+        _detailBox.MaxValue = _terrainDetailMax;
+        _detailBox.SetValueNoSignal(_terrainDetail);
         _syncing = false;
     }
 
@@ -308,6 +351,50 @@ public partial class SettingsMenu : PanelContainer
 
     public void ResetLights() => SetLightMinRing(LightRingDefault);
 
+    /// <summary>Terrain layer on / off; applied with the world restart (Apply). Needs a terrain-capable library.</summary>
+    public void SetTerrainOn(bool on)
+    {
+        if (!HasTerrain || _terrainOn == on) return;
+        _terrainOn = on;
+        SyncWidgets();
+        MarkDirty();
+    }
+
+    /// <summary>Hills amplitude in metres (profile terrain.amplitude_m, 0..3000); applied with the world restart.</summary>
+    public void SetTerrainAmplitude(double metres)
+    {
+        if (!HasTerrain) return;
+        metres = System.Math.Clamp(metres, 0.0, TerrainAmpMax);
+        if (_terrainAmp == metres) return;
+        _terrainAmp = metres;
+        SyncWidgets();
+        MarkDirty();
+    }
+
+    /// <summary>set_terrain_detail, live: re-meshes the held terrain tiles under the same keys (no restart); debounced 0.3 s while the slider moves.</summary>
+    public void SetTerrainDetail(double scale)
+    {
+        if (!HasTerrain) return;
+        scale = System.Math.Clamp(scale, TerrainDetailMin, _terrainDetailMax);
+        if (_terrainDetail == scale) return;
+        _terrainDetail = scale;
+        _detailDirty = true;
+        _detailTimer = 0.3;
+        SyncWidgets();
+    }
+
+    public void ResetTerrain()
+    {
+        if (!HasTerrain) return;
+        _terrainOn = false;
+        _terrainAmp = TerrainAmpDefault;
+        _terrainDetail = 1.0;
+        _detailDirty = true;
+        _detailTimer = 0.0;
+        SyncWidgets();
+        MarkDirty();
+    }
+
     public void ResetRange()
     {
         for (int i = 0; i < 4; i++) _edges[i] = EdgeDefaults[i];
@@ -362,6 +449,21 @@ public partial class SettingsMenu : PanelContainer
                     else HasMinHeight = false;
             }
         }
+        HasTerrain = false;
+        _terrainOn = Bridge?.TerrainActive ?? false;
+        _terrainAmp = TerrainAmpDefault;
+        _terrainDetailMax = 2.0;
+        if (profile != null && Bridge != null && Bridge.Streamer.HasTerrainLayer
+            && profile.TryGetValue("terrain", out var tv) && tv.VariantType == Variant.Type.Dictionary)
+        {
+            var t = tv.AsGodotDictionary();
+            HasTerrain = true;
+            if (t.TryGetValue("amplitude_m", out var amp)) _terrainAmp = System.Math.Clamp(amp.AsDouble(), 0.0, TerrainAmpMax);
+            if (t.TryGetValue("detail_scale_max", out var dm)) _terrainDetailMax = System.Math.Max(dm.AsDouble(), 1.0);
+            _terrainDetail = System.Math.Clamp(Bridge.TerrainDetail, TerrainDetailMin, _terrainDetailMax);
+        }
+        _appliedTerrainOn = _terrainOn;
+        _appliedTerrainAmp = _terrainAmp;
         System.Array.Copy(_edges, _appliedEdges, 4);
         System.Array.Copy(_minH, _appliedMinH, 3);
         _appliedLightRing = _lightRing;
@@ -384,9 +486,11 @@ public partial class SettingsMenu : PanelContainer
             o["buildings"] = b;
         }
         if (HasLightMinRing) o["lights"] = new Godot.Collections.Dictionary { ["min_ring"] = _lightRing };
+        if (HasTerrain) o["terrain"] = new Godot.Collections.Dictionary { ["enabled"] = _terrainOn, ["amplitude_m"] = _terrainAmp };
         _dirty = false;
         ApplyInFlight = true;
-        Bridge.ApplyProfileOverrides(o);
+        // The terrain layer flag travels with the request: the view sends / drops the layers option and keeps its old flags if the profile is rejected.
+        Bridge.ApplyProfileOverrides(o, HasTerrain ? _terrainOn : null);
         RefreshStatus();
     }
 
@@ -407,6 +511,8 @@ public partial class SettingsMenu : PanelContainer
             System.Array.Copy(_appliedEdges, _edges, 4);
             System.Array.Copy(_appliedMinH, _minH, 3);
             _lightRing = _appliedLightRing;
+            _terrainOn = _appliedTerrainOn;
+            _terrainAmp = _appliedTerrainAmp;
             _dirty = false;
             _error.Text = "REJECTED: " + error;
             _error.Visible = true;
@@ -424,6 +530,20 @@ public partial class SettingsMenu : PanelContainer
 
     public override void _Process(double delta)
     {
+        if (_detailDirty && Bridge != null)
+        {
+            _detailTimer -= delta;
+            if (_detailTimer <= 0)
+            {
+                _detailDirty = false;
+                if (Bridge.TerrainActive)
+                {
+                    double eff = Bridge.SetTerrainDetail(_terrainDetail);
+                    if (!double.IsNaN(eff)) _terrainDetail = eff; // the library clamps (and ignores non-finite values)
+                    SyncWidgets();
+                }
+            }
+        }
         if (_dirty && AutoApply && !ApplyInFlight)
         {
             _dirtyTimer -= delta;
@@ -447,7 +567,15 @@ public partial class SettingsMenu : PanelContainer
             _statsTimer = 0.25;
             int q = 0, l = 0;
             for (int i = 0; i < StreamerStats.Rings; i++) { q += _stats.Queued[i] + _stats.Fetching[i] + _stats.Meshing[i]; l += _stats.Loaded[i]; }
-            _tiles.Text = $"tiles loaded {l}, queued {q}";
+            string terrain = "";
+            if (_stats.HasTerrain)
+            {
+                int tq = 0, tl = 0;
+                for (int i = 0; i < _stats.TerrainRings; i++) { tq += _stats.TerrainQueued[i] + _stats.TerrainFetching[i] + _stats.TerrainMeshing[i]; tl += _stats.TerrainLoaded[i]; }
+                terrain = $", terrain loaded {tl}, queued {tq}, {_stats.TerrainTris:N0} tris";
+            }
+            _tiles.Text = $"tiles loaded {l}, queued {q}{terrain}";
+            _detailSlider.Editable = _detailBox.Editable = HasTerrain && Bridge.TerrainActive;
             RefreshStatus();
         }
     }
@@ -474,10 +602,18 @@ public partial class SettingsMenu : PanelContainer
         string Ring(int[] a) => $"{a[0]}/{a[1]}/{a[2]}/{a[3]}";
         var busy = new int[4];
         for (int i = 0; i < 4; i++) busy[i] = _stats.Queued[i] + _stats.Fetching[i] + _stats.Meshing[i];
-        return $"queued+fetching+meshing R0..R3 {Ring(busy)}, loaded {Ring(_stats.Loaded)}, cover {b.Cover.Loaded}, tile roots {b.TileRootCount} (in use {b.PoolCreated - b.PoolFree})";
+        string terrain = "";
+        if (b.TerrainActive)
+        {
+            int tb = 0;
+            for (int i = 0; i < _stats.TerrainRings; i++) tb += _stats.TerrainQueued[i] + _stats.TerrainFetching[i] + _stats.TerrainMeshing[i];
+            terrain = $", terrain busy {tb}, library holds {TerrainLoadedTotal()}, host cover {b.TerrainCover.Loaded} (pool in use {b.TerrainPoolCreated - b.TerrainPoolFree})";
+        }
+        return $"queued+fetching+meshing R0..R3 {Ring(busy)}, loaded {Ring(_stats.Loaded)}, cover {b.Cover.Loaded}, tile roots {b.TileRootCount} (in use {b.PoolCreated - b.PoolFree}){terrain}";
     }
 
     private int LoadedTotal() { int n = 0; foreach (var v in _stats.Loaded) n += v; return n; }
+    private int TerrainLoadedTotal() { int n = 0; for (int i = 0; i < _stats.TerrainRings; i++) n += _stats.TerrainLoaded[i]; return n; }
 
     /// <summary>Idle = nothing queued, fetching or meshing for 1.5 s in a row and no reconfigure pending (finished tiles can still wait for their poll_ready).</summary>
     private async Task<bool> WaitIdle(double timeoutS)
@@ -488,6 +624,7 @@ public partial class SettingsMenu : PanelContainer
             Bridge!.Streamer.DebugStats(_stats);
             int busy = 0;
             for (int i = 0; i < 4; i++) busy += _stats.Queued[i] + _stats.Fetching[i] + _stats.Meshing[i];
+            for (int i = 0; i < _stats.TerrainRings; i++) busy += _stats.TerrainQueued[i] + _stats.TerrainFetching[i] + _stats.TerrainMeshing[i];
             if (busy != 0 || Bridge.ReconfigurePending || ApplyInFlight) { calmSince = 0; return false; }
             if (calmSince == 0) calmSince = Time.GetTicksMsec();
             return Time.GetTicksMsec() - calmSince >= 1500;
@@ -512,7 +649,7 @@ public partial class SettingsMenu : PanelContainer
         if (bridge == null || cam == null || !bridge.WorldRunning) { fails.Add("bridge/camera missing or world not running: " + bridge?.ConfigureError); return; }
         AutoApply = false;
         int atEventLoaded = -1;
-        bridge.Reconfigured += (_, _) => atEventLoaded = bridge.Cover.Loaded;
+        bridge.Reconfigured += (_, _) => atEventLoaded = bridge.TotalLoaded; // both layers
 
         if (!await WaitFor(() => bridge.ReadyTotal > 0, 90)) { fails.Add("no tile arrived within 90 s"); return; }
         await Delay(3.0);
@@ -597,6 +734,15 @@ public partial class SettingsMenu : PanelContainer
             if (bridge.PoolCreated - bridge.PoolFree != bridge.Cover.Loaded) fails.Add($"apply {k}: pool in use {bridge.PoolCreated - bridge.PoolFree} != cover {bridge.Cover.Loaded}");
             if (bridge.TileRootCount != bridge.PoolCreated) fails.Add($"apply {k}: tile roots {bridge.TileRootCount} != pool created {bridge.PoolCreated}");
             if (bridge.Cover.Loaded == 0) fails.Add($"apply {k}: nothing loaded after the restart");
+            if (bridge.TerrainActive)
+            {
+                // The terrain layer is torn down and rebuilt with every restart too: nothing leaks, the host holds what the library delivered.
+                await WaitFor(() => { bridge.Streamer.DebugStats(_stats); return TerrainLoadedTotal() == bridge.TerrainCover.Loaded; }, 5);
+                bridge.Streamer.DebugStats(_stats);
+                if (TerrainLoadedTotal() != bridge.TerrainCover.Loaded) fails.Add($"apply {k}: library holds {TerrainLoadedTotal()} terrain tiles, host cover {bridge.TerrainCover.Loaded}");
+                if (bridge.TerrainPoolCreated - bridge.TerrainPoolFree != bridge.TerrainCover.Loaded) fails.Add($"apply {k}: terrain pool in use {bridge.TerrainPoolCreated - bridge.TerrainPoolFree} != cover {bridge.TerrainCover.Loaded}");
+                if (bridge.TerrainCover.Loaded == 0) fails.Add($"apply {k}: no terrain tile after the restart");
+            }
             if (k == 1) rootsWarm = bridge.TileRootCount;
             if (a) loadedA = bridge.Cover.Loaded; else loadedB = bridge.Cover.Loaded;
         }
@@ -615,6 +761,7 @@ public partial class SettingsMenu : PanelContainer
             + $"tiles held {loadedBefore} -> {bridge.Cover.Loaded} ({bridge.UnloadedTotal - unloadedBefore} unloaded meanwhile by normal streaming), library origin unchanged: {_stats.OriginLat == originLat && _stats.OriginLon == originLon}");
         if (LastApplyOk || LastError.Length == 0) fails.Add("rejection test: an out-of-range edge was not rejected with an error text");
         if (bridge.ReconfigureCount != countBefore) fails.Add("rejection test: counted as a reconfigure");
+        if (bridge.TerrainActive && bridge.TerrainCover.Loaded == 0) fails.Add("rejection test: the terrain layer was dropped");
         if (bridge.UnloadedTotal - unloadedBefore > loadedBefore / 3 || bridge.Cover.Loaded < loadedBefore / 2) fails.Add($"rejection test: the world was dropped ({loadedBefore} -> {bridge.Cover.Loaded} tiles); the previous world must keep running");
         if (_stats.OriginLat != originLat || _stats.OriginLon != originLon) fails.Add("rejection test: library origin changed");
         if (cam.GlobalPosition != posBefore) fails.Add("rejection test: camera moved");

@@ -14,7 +14,13 @@
 //!
 //! Local frame = host axes: x = east, y = up, z = -north, meters relative to the current origin.
 //! Heights: local y = meters above MSL (the world is flat in local space; the terrain is at
-//! `ground_height`, 0 until a DEM exists).
+//! `ground_height_at`: the procedural terrain when the host requested the layer `terrain` and the
+//! profile enables it, else 0).
+//!
+//! Layers (api 1.5): with the terrain active (host layer `terrain` + profile `terrain.enabled`) a
+//! second [`Scheduler`] runs the terrain-mesh quadtree; its keys are [`LayerKey`]s with the
+//! `t/` prefix, delivered through the same `pop_ready` / `drain_fades` / `drain_unload` in one
+//! merged order (fresh before re-deliveries, then slant distance from the camera).
 //!
 //! Lifecycle (api 0.7): several `World`s may run side by side (no process-global state); each
 //! cache folder is held by one world through [`crate::lock::FolderLock`]; `shutdown` stops a
@@ -26,11 +32,13 @@ use std::time::{Duration, Instant};
 use crate::diag::{thread_cpu_us, Diagnostics, Log, WarnLimiter};
 use crate::fetch::{DiskCache, FetchParams};
 use crate::geo::{Frame, LocalSpace, TileKey, MERCATOR_MAX_LAT};
+use crate::latency::Latency;
 use crate::lock::{canonical_dir, FolderLock, LockError};
 use crate::mesher::MeshData;
 use crate::profile::Profile;
-use crate::rings::RING_COUNT;
-use crate::scheduler::Scheduler;
+use crate::rings::{LayerKey, LayerKind, MAX_RINGS, RING_COUNT};
+use crate::scheduler::{CpuStats, ReadyTile, Scheduler};
+use crate::terrain::Terrain;
 use crate::status::{Health, Status, StatusState, MSG_NOT_CONFIGURED, MSG_SHUT_DOWN};
 use crate::worker::{Job, Worker, WorkerMsg};
 
@@ -66,7 +74,134 @@ pub struct WorldOptions {
     pub profile_overrides: Option<serde_json::Value>,
     /// Replaces the diagnostics switches when set.
     pub diagnostics: Option<Diagnostics>,
+    /// Layers the host draws (`configure_world` option `layers`, api 1.4): `None` = `["world"]`.
+    /// Known names: `world` (the vector world, always on) and `terrain` (procedural relief;
+    /// active only together with the profile's `terrain.enabled`). An unknown name is an error.
+    pub layers: Option<Vec<String>>,
+    /// Centre `(lat, lon)` of the terrain's flat zone (`configure_world` option `terrain_center`,
+    /// api 1.6): `None` = the world origin. A host that reconfigures with a new origin (a
+    /// teleport) passes the same centre to keep the relief where it was.
+    pub terrain_center: Option<[f64; 2]>,
+    /// World seed manifest (`configure_world` option `seed_world`, api 1.7): path of a
+    /// `world.json` (`docs/spec-world-seed.md`). `None` / empty = no seed world. Requires an
+    /// empty `tile_url`, the layer `terrain` with `terrain.enabled`, and `terrain.flat_radius_m` =
+    /// `terrain.flat_blend_m` = 0.
+    pub seed_world: Option<String>,
+    /// Reads the manifest and the files it names (resolved paths: relative paths are joined to
+    /// the manifest's folder). `None` = the file system (Rust hosts, tests, CLI); the Godot
+    /// binding reads through `FileAccess` (`res://`, `user://`).
+    pub seed_reader: Option<SeedFileReader>,
 }
+
+/// Host file reader for the seed world's files (see [`WorldOptions::seed_reader`]).
+#[derive(Clone)]
+pub struct SeedFileReader(pub Arc<crate::seed::world::SeedReader>);
+
+impl std::fmt::Debug for SeedFileReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SeedFileReader")
+    }
+}
+
+impl PartialEq for SeedFileReader {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// One runway end of [`AirportInfo`] (contract `airports()`, api 1.7).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunwayEndInfo {
+    /// Designator of this end (`"08"`, `"26L"`).
+    pub ident: String,
+    /// Physical end (WGS84) and its local position (`y` = `ground_height_at` there).
+    pub lat: f64,
+    pub lon: f64,
+    pub position: [f64; 3],
+    /// Landing threshold (the end moved inward by the displaced threshold).
+    pub threshold_lat: f64,
+    pub threshold_lon: f64,
+    pub threshold_position: [f64; 3],
+    pub displaced_threshold_m: f64,
+    /// Aiming point of the touchdown zone: 300 m past the threshold (a quarter of the landing
+    /// distance on shorter runways).
+    pub touchdown_position: [f64; 3],
+    /// True heading of a landing on this end (degrees, 0 = north, clockwise).
+    pub heading_deg: f64,
+}
+
+/// One runway of [`AirportInfo`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunwayInfo {
+    /// `"<le>/<he>"`.
+    pub designator: String,
+    pub le: RunwayEndInfo,
+    pub he: RunwayEndInfo,
+    pub length_m: f64,
+    pub width_m: f64,
+    /// Surface as in the airport file, and whether the generator reads it as paved.
+    pub surface: String,
+    pub paved: bool,
+    pub lighted: bool,
+    /// An end was missing in the file: placed at the reference point along the heading.
+    pub approximate: bool,
+    /// Lights of this runway (local; `y` = ground + `seed.airport.lights.height_m`) and their
+    /// colors (rgb, a = intensity): the points of the tiles' `airport_lights`.
+    pub lights: Vec<[f64; 3]>,
+    pub light_colors: Vec<[f32; 4]>,
+}
+
+/// One airport of a seed world (contract `airports()`, api 1.7).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AirportInfo {
+    pub ident: String,
+    pub name: String,
+    /// OurAirports type (`large_airport`, `medium_airport`, `small_airport`).
+    pub kind: String,
+    /// Reference point (WGS84) and its local position (`y` = `ground_height_at`).
+    pub lat: f64,
+    pub lon: f64,
+    pub position: [f64; 3],
+    /// From the airport file; informational (the terrain decides every height).
+    pub elevation_ft: Option<f64>,
+    pub runways: Vec<RunwayInfo>,
+}
+
+/// One city of [`SeedInfo`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeedCityInfo {
+    pub id: String,
+    pub name: String,
+    pub lat: f64,
+    pub lon: f64,
+    pub radius_km: f64,
+    pub version: i64,
+    /// `"synthetic"` (S1 has no real sources; S5 adds `"real:<url>"`, `"synthetic (missing)"`).
+    pub source: String,
+    pub airports: Vec<String>,
+}
+
+/// Contract `seed_world_info()` (api 1.7).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeedInfo {
+    pub manifest: String,
+    pub generator_version: u32,
+    pub phases: Vec<String>,
+    pub world_version: i64,
+    pub world_seed: String,
+    pub cities: Vec<SeedCityInfo>,
+    pub airports: usize,
+    pub water_polygons: usize,
+    pub warnings: Vec<String>,
+    pub stats: crate::seed::world::SeedStats,
+}
+
+/// Layer names `configure_world` accepts in `layers`.
+pub const KNOWN_LAYERS: &[&str] = &["world", "terrain"];
+
+/// Warning logged once per configure when the profile enables the terrain but the host did not
+/// request the layer.
+pub const TERRAIN_IGNORED_WARNING: &str = "terrain.enabled ignored: host did not request layer \"terrain\"";
 
 /// Result of [`World::configure_world`].
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -78,20 +213,53 @@ pub struct ConfigureResult {
     pub attributions: Vec<String>,
 }
 
+/// An empty mesh (the `terrain` of vector tiles).
+static EMPTY_MESH: MeshData = MeshData { positions: Vec::new(), normals: Vec::new(), colors: Vec::new(), uvs: Vec::new(), indices: Vec::new() };
+
+/// Lower bound of `set_terrain_detail`.
+pub const TERRAIN_DETAIL_MIN: f64 = 0.25;
+
 /// One finished tile, borrowed for the duration of the `pop_ready` callback.
 pub struct ReadyTileView<'a> {
+    /// `World` (vector tile, key `z/x/y`) or `Terrain` (terrain tile, key `t/z/x/y`).
+    pub layer: LayerKind,
     pub key: TileKey,
+    /// Vector: 0..3 (`16 - z`); terrain: index in `terrain.bands` (`near_zoom - z`).
     pub ring: usize,
     /// Tile root in the current local frame (x east, y up, z -north; y is 0).
     pub origin: [f64; 3],
     /// Building mesh relative to `origin` (empty for R3 and empty tiles).
     pub mesh: &'a MeshData,
-    /// Ground mesh relative to `origin` (empty for R3 and tiles without ground features).
+    /// Ground mesh relative to `origin` (empty for tiles without ground features).
     pub ground: &'a MeshData,
     /// Light sprite positions relative to `origin` (R2/R3 only).
     pub lights: &'a [[f32; 3]],
     /// One rgba per light (rgb = color, a = intensity weight).
     pub light_colors: &'a [[f32; 4]],
+    /// Street lamp positions relative to `origin` (bands `lights.street.min_ring..=3`).
+    pub street_lights: &'a [[f32; 3]],
+    /// One rgba per street lamp (rgb = `lights.street.color`, a = intensity weight).
+    pub street_light_colors: &'a [[f32; 4]],
+    /// Aircraft warning beacons relative to `origin` (bands `lights.beacons.min_ring..=3`).
+    pub beacon_lights: &'a [[f32; 3]],
+    /// One rgba per beacon (rgb = color, a = blink phase 0..1 of its building).
+    pub beacon_light_colors: &'a [[f32; 4]],
+    /// Airport lights of a seed world relative to `origin` (api 1.7; empty elsewhere).
+    pub airport_lights: &'a [[f32; 3]],
+    /// One rgba per airport light (rgb = color, a = intensity weight).
+    pub airport_light_colors: &'a [[f32; 4]],
+    /// Terrain tiles: VERTEX + INDEX (+ NORMAL with smooth shading) relative to `origin`; empty
+    /// for vector tiles.
+    pub terrain: &'a MeshData,
+    /// Terrain tiles: lowest / highest surface vertex (m above MSL); 0 for vector tiles.
+    pub h_min: f64,
+    pub h_max: f64,
+}
+
+impl ReadyTileView<'_> {
+    pub fn layer_key(&self) -> LayerKey {
+        LayerKey { layer: self.layer, key: self.key }
+    }
 }
 
 /// Counters for a debug overlay.
@@ -106,6 +274,18 @@ pub struct WorldStats {
     /// WGS84 position of the *current* local origin (moves with re-centering).
     pub origin_lat: f64,
     pub origin_lon: f64,
+    /// Terrain layer (0 rings when it is not active): per-ring counters as above and the
+    /// triangles of every terrain tile the host holds.
+    pub terrain_rings: usize,
+    pub terrain_queued: [i32; MAX_RINGS],
+    pub terrain_fetching: [i32; MAX_RINGS],
+    pub terrain_meshing: [i32; MAX_RINGS],
+    pub terrain_loaded: [i32; MAX_RINGS],
+    pub terrain_tris: u64,
+}
+
+fn first4(a: [i32; MAX_RINGS]) -> [i32; RING_COUNT] {
+    std::array::from_fn(|i| a[i])
 }
 
 pub struct World {
@@ -125,13 +305,19 @@ pub struct World {
     local: LocalSpace,
     pending_shift: [f64; 3],
     scheduler: Option<Scheduler>,
+    /// The terrain-mesh layer (only while the terrain is active).
+    terrain_sched: Option<Scheduler>,
     worker: Option<Worker>,
 
     jobs: Vec<Job>,
-    unload_buf: Vec<TileKey>,
-    fade_buf: Vec<(TileKey, f32)>,
+    unload_buf: Vec<LayerKey>,
+    fade_buf: Vec<(LayerKey, f32)>,
+    key_tmp: Vec<TileKey>,
+    fade_tmp: Vec<(TileKey, f32)>,
     /// Tiles the host still holds from a previous `configure`.
-    stale_unloads: Vec<TileKey>,
+    stale_unloads: Vec<LayerKey>,
+    /// `set_terrain_detail` scale (kept across configures, clamped to the profile's range).
+    terrain_detail: f64,
 
     /// Light-mode re-deliveries handed out since the last `update_camera`.
     redelivered_this_frame: usize,
@@ -143,7 +329,20 @@ pub struct World {
     health: Health,
     /// State and message last returned by `take_status_change`.
     reported: (StatusState, String),
+    /// Last streaming latency report in the profile log (every [`LATENCY_LOG_EVERY`]).
+    latency_logged: Instant,
+    /// Terrain of the current configuration (flat unless the host requested the layer and the
+    /// profile enables it). `ground_height_at`, geodetic AGL, the cover and every job use it.
+    terrain: Terrain,
+    /// The seed world of the current configuration (api 1.7).
+    seed: Option<Arc<crate::seed::SeedWorld>>,
+    /// The last loaded seed world, kept across configures (and a failed or seed-less one): a
+    /// reconfigure with the same files and profile keys reuses it instead of rebuilding.
+    seed_cache: Option<Arc<crate::seed::SeedWorld>>,
 }
+
+/// With `diagnostics.profile` on, the streaming latency table is logged this often.
+pub const LATENCY_LOG_EVERY: Duration = Duration::from_secs(10);
 
 impl World {
     /// An unconfigured world: every call is a no-op until `configure`.
@@ -157,19 +356,27 @@ impl World {
             origin_lat: 0.0,
             origin_lon: 0.0,
             frame: None,
+            terrain: Terrain::flat(),
             local: LocalSpace::default(),
             pending_shift: [0.0; 3],
             scheduler: None,
+            terrain_sched: None,
             worker: None,
             jobs: Vec::new(),
             unload_buf: Vec::new(),
             fade_buf: Vec::new(),
+            key_tmp: Vec::new(),
+            fade_tmp: Vec::new(),
             stale_unloads: Vec::new(),
+            terrain_detail: 1.0,
             redelivered_this_frame: 0,
             warn_limiter: WarnLimiter::default(),
             folder_lock: None,
             health: Health::idle(MSG_NOT_CONFIGURED),
             reported: (StatusState::Ok, MSG_NOT_CONFIGURED.to_string()),
+            latency_logged: Instant::now(),
+            seed: None,
+            seed_cache: None,
         }
     }
 
@@ -192,6 +399,12 @@ impl World {
         &self.attributions
     }
 
+    /// Stage latencies of the last fresh deliveries per band (`None` before configure and after
+    /// `shutdown`; a re-configure starts empty).
+    pub fn latency(&self) -> Option<&Latency> {
+        self.scheduler.as_ref().map(|s| s.latency())
+    }
+
     /// Whether a configuration is running (false before configure and after `shutdown`).
     pub fn is_running(&self) -> bool {
         self.scheduler.is_some()
@@ -204,7 +417,9 @@ impl World {
 
     /// Data-source health (contract `status()`).
     pub fn status(&self) -> Status {
-        self.health.status_at(Instant::now())
+        let mut s = self.health.status_at(Instant::now());
+        s.terrain_active = self.terrain.is_active();
+        s
     }
 
     /// The status, if its state or message changed since the last call (the host emits
@@ -225,6 +440,7 @@ impl World {
     /// Apply worker results (cheap: moves boxes around). Bounded per call.
     fn drain_worker(&mut self) {
         let (Some(worker), Some(sched)) = (&self.worker, &mut self.scheduler) else { return };
+        let mut tsched = self.terrain_sched.as_mut();
         let now = Instant::now();
         let mut warns: Vec<String> = Vec::new();
         for _ in 0..256 {
@@ -240,6 +456,14 @@ impl World {
                     self.log.error(&format!("WorldStreamer: {s}"));
                     self.health.set_fatal(&s);
                 }
+                m @ WorkerMsg::TerrainBuilt { .. } => {
+                    if let WorkerMsg::TerrainBuilt { result: Err(e), .. } = &m {
+                        self.health.record_decode_failure(e, now);
+                    }
+                    if let Some(t) = tsched.as_deref_mut() {
+                        warns.extend(t.handle(m, now));
+                    }
+                }
                 m => {
                     match &m {
                         WorkerMsg::Fetched { result, .. } => self.health.record_fetch(result, now),
@@ -253,6 +477,31 @@ impl World {
         for w in warns {
             self.warn(&w);
         }
+    }
+
+    /// Both layers' new jobs in one order for the shared worker pool (FIFO): nearest to the
+    /// camera first, so the terrain's jobs do not queue behind the vector world's backlog.
+    /// Each layer already lists its jobs that way; this merges the two lists (stable).
+    fn order_jobs(&mut self) {
+        let (Some(w), Some(t)) = (&self.scheduler, &self.terrain_sched) else { return };
+        if self.jobs.len() < 2 {
+            return;
+        }
+        self.jobs.sort_by(|a, b| {
+            let d = |j: &Job| match *j {
+                Job::Terrain { key, .. } => t.camera_distance(key),
+                Job::Fetch { key, .. } | Job::Decode { key, .. } => w.camera_distance(key),
+            };
+            d(a).total_cmp(&d(b))
+        });
+    }
+
+    /// Abort the fetches the vector scheduler orphaned (the terrain layer has no fetch stage).
+    fn cancel_orphans(&mut self) {
+        let (Some(s), Some(w)) = (&mut self.scheduler, &self.worker) else { return };
+        let mut ids = Vec::new();
+        s.drain_cancelled(&mut ids);
+        w.cancel(&ids);
     }
 
     fn submit_jobs(&mut self) {
@@ -277,8 +526,9 @@ impl World {
         });
     }
 
-    /// Check options and resolve the profile without touching the running world.
-    fn prepare(&self, o: &WorldOptions) -> Result<Profile, String> {
+    /// Check options, resolve the profile and load the seed world (if any) without touching the
+    /// running world.
+    fn prepare(&self, o: &WorldOptions) -> Result<(Profile, Option<Arc<crate::seed::SeedWorld>>), String> {
         if !(o.origin_lat.is_finite() && o.origin_lat.abs() <= MERCATOR_MAX_LAT) {
             return Err(format!("origin_lat = {} is out of range [-{MERCATOR_MAX_LAT:.4}, {MERCATOR_MAX_LAT:.4}]", o.origin_lat));
         }
@@ -304,7 +554,59 @@ impl World {
             }
             _ => None,
         };
-        crate::profile::resolve(file, o.profile_overrides.as_ref(), &*self.log)
+        if let Some([lat, lon]) = o.terrain_center {
+            if !(lat.is_finite() && lat.abs() <= MERCATOR_MAX_LAT && lon.is_finite() && lon.abs() <= 180.0) {
+                return Err(format!(
+                    "terrain_center = ({lat}, {lon}) is out of range (latitude within +-{MERCATOR_MAX_LAT:.4}, longitude within +-180)"
+                ));
+            }
+        }
+        if let Some(layers) = &o.layers {
+            if let Some(bad) = layers.iter().find(|l| !KNOWN_LAYERS.contains(&l.as_str())) {
+                return Err(format!("layers: unknown layer \"{bad}\" (known: {})", KNOWN_LAYERS.join(", ")));
+            }
+        }
+        let profile = crate::profile::resolve(file, o.profile_overrides.as_ref(), &*self.log)?;
+        let seed = match o.seed_world.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+            None => None,
+            Some(path) => Some(self.prepare_seed(o, path, &profile)?),
+        };
+        Ok((profile, seed))
+    }
+
+    /// The seed world rules of `configure_world` (contract 3.1, `docs/spec-world-seed.md` 9.1),
+    /// then the load (or the cached world when nothing changed).
+    fn prepare_seed(&self, o: &WorldOptions, path: &str, profile: &Profile) -> Result<Arc<crate::seed::SeedWorld>, String> {
+        let url = o.tile_url.trim();
+        if !url.is_empty() {
+            return Err(format!("seed_world: tile_url must be empty (a seed world generates every tile), got `{url}`"));
+        }
+        if !o.layers.as_ref().is_some_and(|l| l.iter().any(|x| x == "terrain")) {
+            return Err("seed_world: needs the terrain layer: pass layers [\"world\", \"terrain\"]".into());
+        }
+        let t = &profile.terrain;
+        if !t.enabled {
+            return Err("seed_world: needs terrain.enabled = true in the world profile".into());
+        }
+        for (k, v) in [("flat_radius_m", t.flat_radius_m), ("flat_blend_m", t.flat_blend_m)] {
+            if v != 0.0 {
+                return Err(format!(
+                    "seed_world: terrain.{k} = {v} must be 0 (the flat zone follows the configure origin; a seed world levels only its runways)"
+                ));
+            }
+        }
+        let field = Terrain::from_profile(profile, o.origin_lat, o.origin_lon);
+        let fs_reader = |p: &str| -> Result<String, String> {
+            if p.starts_with("res://") || p.starts_with("user://") {
+                return Err(format!("{p}: res:// and user:// paths need the host's file reader"));
+            }
+            std::fs::read_to_string(p).map_err(|e| e.to_string())
+        };
+        let reader: &crate::seed::world::SeedReader = match &o.seed_reader {
+            Some(r) => &*r.0,
+            None => &fs_reader,
+        };
+        crate::seed::SeedWorld::load(path, reader, profile, &field, self.seed_cache.as_ref())
     }
 
     /// Set world origin, data source, world profile and diagnostics (contract
@@ -318,12 +620,14 @@ impl World {
             w.log.error(&format!("WorldStreamer: configure_world failed: {e}"));
             ConfigureResult { ok: false, error: e, attributions: w.attributions.clone() }
         };
-        let profile = match self.prepare(&o) {
+        let (profile, seed) = match self.prepare(&o) {
             Ok(p) => p,
             Err(e) => return fail(self, e),
         };
-        // Cache folder lock, synchronously and before anything changes or opens.
-        let lock = match self.plan_lock(&o) {
+        // Cache folder lock, synchronously and before anything changes or opens. A seed world
+        // takes it when a real city source could become active (a city file with `real.url`).
+        let seed_urls = seed.as_ref().is_some_and(|s| s.cities().iter().any(|c| c.real.as_ref().is_some_and(|r| r.url.is_some())));
+        let lock = match self.plan_lock(&o, seed_urls) {
             Ok(l) => l,
             Err(e) => return fail(self, e),
         };
@@ -349,14 +653,46 @@ impl World {
         self.frame = Some(frame);
         self.local = LocalSpace::default();
         self.pending_shift = [0.0; 3];
+        let wants_terrain = o.layers.as_ref().is_some_and(|l| l.iter().any(|x| x == "terrain"));
+        // Validation warnings once per load (a reused world logged them already).
+        let fresh_seed = seed.as_ref().is_some_and(|s| !self.seed_cache.as_ref().is_some_and(|c| Arc::ptr_eq(c, s)));
+        if let Some(s) = &seed {
+            self.seed_cache = Some(s.clone());
+        }
+        self.seed = seed;
+        self.terrain = if wants_terrain && self.profile.terrain.enabled {
+            let [c_lat, c_lon] = o.terrain_center.unwrap_or([origin_lat, origin_lon]);
+            let t = Terrain::from_profile(&self.profile, c_lat, c_lon);
+            match &self.seed {
+                Some(s) => t.with_seed(s.terrain.clone()),
+                None => t,
+            }
+        } else {
+            if self.profile.terrain.enabled {
+                self.log.warn(&format!("WorldStreamer: {TERRAIN_IGNORED_WARNING}"));
+            }
+            Terrain::flat()
+        };
 
-        self.attributions = if url.is_empty() { Vec::new() } else { vec![OSM_ATTRIBUTION.to_string()] };
+        self.attributions = match &self.seed {
+            Some(s) => s.attributions.clone(),
+            None if url.is_empty() => Vec::new(),
+            None => vec![OSM_ATTRIBUTION.to_string()],
+        };
         let hold = Duration::from_secs_f64(self.profile.streaming.retry_max_s + 5.0);
         self.health = Health::running(hold);
         let mut error = String::new();
         match Worker::with_cache(frame, &url, cache_dir, self.profile.clone(), reuse) {
-            Ok(w) => {
-                self.scheduler = Some(Scheduler::new(frame, w.is_synthetic(), self.profile.clone()));
+            Ok(mut w) => {
+                w.set_terrain(self.terrain.clone());
+                w.set_seed(self.seed.clone());
+                self.scheduler = Some(Scheduler::new(frame, w.is_synthetic(), self.profile.clone()).with_terrain(self.terrain.clone()));
+                if self.terrain.is_active() {
+                    self.terrain_detail = self.clamp_detail(self.terrain_detail);
+                    let mut t = Scheduler::new_terrain(frame, self.profile.clone(), self.terrain.clone());
+                    t.set_detail(self.terrain_detail);
+                    self.terrain_sched = Some(t);
+                }
                 self.worker = Some(w);
             }
             Err(e) => {
@@ -364,9 +700,37 @@ impl World {
                 self.log.error(&format!("WorldStreamer: {error}"));
                 self.health.set_fatal(&error);
                 self.folder_lock = None;
+                // A fatal world has no relief: `ground_height_at` answers 0 like a world without terrain.
+                self.terrain = Terrain::flat();
+                self.seed = None;
             }
         }
-        let source = if url.is_empty() { "synthetic city".to_string() } else { url };
+        let source = match &self.seed {
+            Some(s) => format!(
+                "seed world {} ({} cities, {} airports, {} water polygons, loaded in {:.0} ms)",
+                s.manifest,
+                s.cities().len(),
+                s.airports.len(),
+                s.files.water.polygons.len(),
+                s.stats.build_ms
+            ),
+            None if url.is_empty() => "synthetic city".to_string(),
+            None => url,
+        };
+        if let Some(s) = self.seed.as_ref().filter(|s| fresh_seed && !s.warnings.is_empty()) {
+            // At most a few lines: the full list is in `seed_world_info()["warnings"]`.
+            const SHOWN: usize = 5;
+            for w in s.warnings.iter().take(SHOWN) {
+                self.log.warn(&format!("WorldStreamer: seed world: {w}"));
+            }
+            if s.warnings.len() > SHOWN {
+                self.log.warn(&format!(
+                    "WorldStreamer: seed world: {} more warnings (seed_world_info().warnings lists all {})",
+                    s.warnings.len() - SHOWN,
+                    s.warnings.len()
+                ));
+            }
+        }
         self.log.info(&format!(
             "WorldStreamer configured origin=({:.6}, {:.6}) source={} cache_dir={} [{}]",
             origin_lat, origin_lon, source, cache_dir, self.version
@@ -394,8 +758,8 @@ impl World {
     /// folder), take a new one, or none (synthetic city / no `cache_dir`). Errors when another
     /// world or process holds the folder. Other I/O problems (read-only volume, no lock support)
     /// are logged and the world runs without a lock (the cache itself will likely be disabled).
-    fn plan_lock(&self, o: &WorldOptions) -> Result<LockPlan, String> {
-        if o.tile_url.trim().is_empty() || o.cache_dir.is_empty() {
+    fn plan_lock(&self, o: &WorldOptions, seed_urls: bool) -> Result<LockPlan, String> {
+        if (o.tile_url.trim().is_empty() && !seed_urls) || o.cache_dir.is_empty() {
             return Ok(LockPlan::None);
         }
         let dir = match canonical_dir(std::path::Path::new(&o.cache_dir)) {
@@ -430,9 +794,13 @@ impl World {
     fn stop_running(&mut self, next: Option<(&str, &str, u64)>) -> (bool, Option<Arc<DiskCache>>) {
         // The host keeps whatever we handed out before: unload it with the next drain_unload.
         if let Some(s) = &self.scheduler {
-            self.stale_unloads.extend(s.delivered_keys());
+            self.stale_unloads.extend(s.delivered_keys().into_iter().map(LayerKey::world));
+        }
+        if let Some(t) = &self.terrain_sched {
+            self.stale_unloads.extend(t.delivered_keys().into_iter().map(LayerKey::terrain));
         }
         self.scheduler = None;
+        self.terrain_sched = None;
         self.jobs.clear();
         self.pending_shift = [0.0; 3];
         let Some(w) = self.worker.take() else { return (true, None) };
@@ -460,6 +828,9 @@ impl World {
         let (done, _) = self.stop_running(None);
         self.folder_lock = None;
         self.frame = None;
+        self.terrain = Terrain::flat();
+        self.seed = None;
+        self.seed_cache = None;
         self.local = LocalSpace::default();
         self.origin_lat = 0.0;
         self.origin_lon = 0.0;
@@ -497,7 +868,7 @@ impl World {
             return Err(e);
         }
         let Some(p) = self.geodetic_to_local(lat, lon, alt_msl_m) else { return Ok(None) };
-        let agl = alt_msl_m - crate::geo::ground_height(lat, lon);
+        let agl = alt_msl_m - self.terrain.height(lat, lon);
         let vel = [vel_ned[1], -vel_ned[2], -vel_ned[0]];
         Ok(self.update_camera(p, vel, agl))
     }
@@ -547,7 +918,7 @@ impl World {
 
         // Floating origin: translate (never rotate) the local frame onto the camera.
         let mut shift = None;
-        if x.hypot(z) > self.profile.origin.recenter_distance_m {
+        if crate::math::hypot(x, z) > self.profile.origin.recenter_distance_m {
             self.local.offset_e += x;
             self.local.offset_n -= z;
             self.pending_shift[0] += x;
@@ -556,10 +927,18 @@ impl World {
         }
 
         let now = Instant::now();
+        // `fades.max_active` counts the swaps of both layers.
         if let Some(s) = &mut self.scheduler {
+            s.set_fades_elsewhere(self.terrain_sched.as_ref().map_or(0, |t| t.active_fades()));
             s.update(cam, vel, now, &mut self.jobs);
         }
+        if let Some(t) = &mut self.terrain_sched {
+            t.set_fades_elsewhere(self.scheduler.as_ref().map_or(0, |s| s.active_fades()));
+            t.update(cam, vel, now, &mut self.jobs);
+        }
         let t_updated = Instant::now();
+        self.cancel_orphans();
+        self.order_jobs();
         self.submit_jobs();
         if profile {
             let us = |a: Instant, b: Instant| b.duration_since(a).as_micros();
@@ -574,12 +953,24 @@ impl World {
                     us(t_updated, end)
                 ));
             }
+            if end.duration_since(self.latency_logged) >= LATENCY_LOG_EVERY {
+                self.latency_logged = end;
+                if let Some(l) = self.latency() {
+                    self.log.info(&format!("WorldStreamer profile: {}", l.report()));
+                }
+                if let Some(t) = &self.terrain_sched {
+                    self.log.info(&format!("WorldStreamer profile: {}", t.cpu_stats().report("terrain", t.layer().rings())));
+                }
+            }
         }
         shift
     }
 
     /// Hand at most `max` finished tiles to `f`, in priority order. Returns how many were
     /// handed out. The host converts each tile inside `f` (its time counts in the profile line).
+    /// With the terrain layer, both layers share the budget in one order: fresh tiles before
+    /// re-deliveries, then strictly by slant distance from the camera (ties: vector world);
+    /// re-deliveries of both layers share the per-frame limit.
     pub fn pop_ready(&mut self, max: usize, mut f: impl FnMut(ReadyTileView<'_>)) -> usize {
         let t_start = Instant::now();
         self.drain_worker();
@@ -588,26 +979,33 @@ impl World {
         let local = self.local;
         let per_frame = self.profile.streaming.redeliveries_per_frame as usize;
         let Some(sched) = self.scheduler.as_mut() else { return 0 };
+        let mut tsched = self.terrain_sched.as_mut();
         let mut n = 0;
         while n < max {
-            // Light-mode re-deliveries are rate-limited per frame, not per call.
-            let Some(t) = sched.pop_ready(self.redelivered_this_frame < per_frame) else { break };
+            // Re-deliveries are rate-limited per frame, not per call.
+            let allow = self.redelivered_this_frame < per_frame;
+            let w = sched.best_ready(allow);
+            let t = tsched.as_deref_mut().and_then(|s| s.best_ready(allow));
+            let pick_terrain = terrain_first(w.map(|(_, r, d)| (r, d)), t.map(|(_, r, d)| (r, d)));
+            let tile = if pick_terrain {
+                let (k, re, _) = t.expect("picked");
+                let elsewhere = sched.active_fades();
+                tsched.as_deref_mut().and_then(|s| {
+                    s.set_fades_elsewhere(elsewhere);
+                    s.take_ready(k, re)
+                })
+            } else {
+                let Some((k, re, _)) = w else { break };
+                sched.set_fades_elsewhere(tsched.as_deref().map_or(0, |s| s.active_fades()));
+                sched.take_ready(k, re)
+            };
+            let Some(t) = tile else { break };
             n += 1;
             if t.redelivery {
                 self.redelivered_this_frame += 1;
             }
-            tris += t.mesh.triangle_count() + t.ground.triangle_count();
-            let [ox, oz] = local.to_local(t.center[0], t.center[1]);
-            let (lp, lc) = t.light_arrays();
-            f(ReadyTileView {
-                key: t.key,
-                ring: t.ring,
-                origin: [ox, 0.0, oz],
-                mesh: &t.mesh,
-                ground: &t.ground,
-                lights: lp,
-                light_colors: lc,
-            });
+            tris += t.mesh.triangle_count() + t.ground.triangle_count() + t.terrain.as_ref().map_or(0, |x| x.triangle_count());
+            f(view_of(&t, local));
             // The tile's flat buffers (a handful of Vecs) are freed here; cheap.
         }
         if self.diag.profile {
@@ -624,16 +1022,22 @@ impl World {
                 ));
             }
         }
+        // A delivery can drop a refined parent whose re-fetch was in flight (`try_drop`).
+        self.cancel_orphans();
         n
     }
 
     /// Tile keys the host must remove (including tiles left over from a previous `configure`).
     /// The slice is valid until the next call.
-    pub fn drain_unload(&mut self) -> &[TileKey] {
+    pub fn drain_unload(&mut self) -> &[LayerKey] {
         self.unload_buf.clear();
         self.unload_buf.append(&mut self.stale_unloads);
-        if let Some(s) = &mut self.scheduler {
-            s.drain_unload(&mut self.unload_buf);
+        for (s, layer) in [(&mut self.scheduler, LayerKind::World), (&mut self.terrain_sched, LayerKind::Terrain)] {
+            if let Some(s) = s {
+                self.key_tmp.clear();
+                s.drain_unload(&mut self.key_tmp);
+                self.unload_buf.extend(self.key_tmp.iter().map(|&key| LayerKey { layer, key }));
+            }
         }
         &self.unload_buf
     }
@@ -643,10 +1047,14 @@ impl World {
     /// Finished fades report their final values once (incoming 1.0; outgoing 0.0, then unloaded
     /// by this frame's `drain_unload`). Finals come first; a later entry for the same key wins.
     /// The slice is valid until the next call.
-    pub fn drain_fades(&mut self) -> &[(TileKey, f32)] {
+    pub fn drain_fades(&mut self) -> &[(LayerKey, f32)] {
         self.fade_buf.clear();
-        if let Some(s) = &mut self.scheduler {
-            s.drain_fades(&mut self.fade_buf);
+        for (s, layer) in [(&mut self.scheduler, LayerKind::World), (&mut self.terrain_sched, LayerKind::Terrain)] {
+            if let Some(s) = s {
+                self.fade_tmp.clear();
+                s.drain_fades(&mut self.fade_tmp);
+                self.fade_buf.extend(self.fade_tmp.iter().map(|&(key, f)| (LayerKey { layer, key }, f)));
+            }
         }
         &self.fade_buf
     }
@@ -665,19 +1073,62 @@ impl World {
             Some(f) if self.local != LocalSpace::default() => f.lat_lon(self.local.offset_e, self.local.offset_n),
             _ => (self.origin_lat, self.origin_lon),
         };
+        let ts = self.terrain_sched.as_ref().map(|t| (t.layer().rings(), t.stats()));
+        let (terrain_rings, tst) = ts.unwrap_or_default();
         WorldStats {
-            queued: st.queued,
-            fetching: st.fetching,
-            meshing: st.meshing,
-            loaded: st.loaded,
+            queued: first4(st.queued),
+            fetching: first4(st.fetching),
+            meshing: first4(st.meshing),
+            loaded: first4(st.loaded),
             cache_mb,
             origin_lat,
             origin_lon,
+            terrain_rings,
+            terrain_queued: tst.queued,
+            terrain_fetching: tst.fetching,
+            terrain_meshing: tst.meshing,
+            terrain_loaded: tst.loaded,
+            terrain_tris: tst.tris,
         }
     }
 
-    /// Terrain height (m) under a point in current local x/z meters: `geo::ground_height` at the
-    /// point's lat/lon (through the current floating origin). 0 until a DEM spike; a few µs.
+    fn clamp_detail(&self, scale: f64) -> f64 {
+        scale.clamp(TERRAIN_DETAIL_MIN, self.profile.terrain.detail_scale_max.max(TERRAIN_DETAIL_MIN))
+    }
+
+    /// Contract `set_terrain_detail(scale)` (api 1.5): multiply every terrain band's
+    /// `max_error_m` by `scale`, clamped to `[0.25, terrain.detail_scale_max]` (1 = the profile).
+    /// Held terrain tiles are re-meshed and re-delivered under the same keys, nearest first, at
+    /// the re-delivery rate; the vector world is untouched. The scale is kept across
+    /// `configure_world` (re-clamped to the new profile). Non-finite input is ignored. Returns
+    /// the scale in effect.
+    pub fn set_terrain_detail(&mut self, scale: f64) -> f64 {
+        if scale.is_finite() {
+            self.terrain_detail = self.clamp_detail(scale);
+            if let Some(t) = &mut self.terrain_sched {
+                t.set_detail(self.terrain_detail);
+            }
+        }
+        self.terrain_detail
+    }
+
+    /// The terrain detail scale in effect (see [`World::set_terrain_detail`]).
+    pub fn terrain_detail(&self) -> f64 {
+        self.terrain_detail
+    }
+
+    /// Whether the terrain-mesh layer runs (terrain active and configured).
+    pub fn terrain_layer_active(&self) -> bool {
+        self.terrain_sched.is_some()
+    }
+
+    /// Worker CPU per terrain ring since configure (`None` without the terrain layer).
+    pub fn terrain_cpu(&self) -> Option<&CpuStats> {
+        self.terrain_sched.as_ref().map(|t| t.cpu_stats())
+    }
+
+    /// Terrain height (m) under a point in current local x/z meters: `Terrain::height` at the
+    /// point's lat/lon (through the current floating origin). 0 with the terrain off (the default); a few µs.
     pub fn ground_height_at(&self, local_x: f64, local_z: f64) -> f64 {
         let Some(f) = &self.frame else { return 0.0 };
         if !local_x.is_finite() || !local_z.is_finite() {
@@ -685,15 +1136,143 @@ impl World {
         }
         let [e, n] = self.local.to_enu(local_x, local_z);
         let (lat, lon) = f.lat_lon(e, n);
-        crate::geo::ground_height(lat, lon)
+        self.terrain.height(lat, lon)
+    }
+
+    /// The terrain of the current configuration (flat when off, before configure and after
+    /// `shutdown`). A copy can be sampled from any thread.
+    pub fn terrain(&self) -> &Terrain {
+        &self.terrain
+    }
+
+    /// The seed world of the current configuration (api 1.7).
+    pub fn seed_world(&self) -> Option<&Arc<crate::seed::SeedWorld>> {
+        self.seed.as_ref()
+    }
+
+    /// Where the tiles of a layer come from (`debug_tiles` `source`, api 1.7): vector tiles
+    /// `"seed"` (seed world), `"archive"` (`tile_url`) or `"synthetic"` (the offline city);
+    /// terrain tiles `"terrain"`. S5 adds `"real:<city>"` per z13 tile.
+    pub fn tile_source(&self, layer: LayerKind) -> &'static str {
+        match layer {
+            LayerKind::Terrain => "terrain",
+            LayerKind::World if self.seed.is_some() => "seed",
+            LayerKind::World if self.worker.as_ref().is_some_and(|w| w.is_synthetic()) => "synthetic",
+            LayerKind::World => "archive",
+        }
+    }
+
+    /// Contract `airports()` (api 1.7): every airport of the seed world with its runways, in the
+    /// current local frame (call again after an origin shift). Empty without a seed world.
+    pub fn airports(&self) -> Vec<AirportInfo> {
+        let Some(s) = &self.seed else { return Vec::new() };
+        let h_light = s.params.airport.lights.height_m;
+        let local = |lat: f64, lon: f64, up: f64| -> [f64; 3] {
+            let h = self.terrain.height(lat, lon) + up;
+            self.geodetic_to_local(lat, lon, h).unwrap_or([0.0; 3])
+        };
+        s.airports
+            .iter()
+            .map(|g| {
+                let runways = g
+                    .runways
+                    .iter()
+                    .enumerate()
+                    .map(|(ri, r)| {
+                        let end = |ident: &str, ll: (f64, f64), thr_s: f64, toward: f64, disp: f64, heading: f64| {
+                            let (tlat, tlon) = g.frame.ll(r.at(thr_s, 0.0));
+                            let land = (r.he_thr_s - r.le_thr_s).abs();
+                            let td = 300.0f64.min(land * 0.25);
+                            let (dlat, dlon) = g.frame.ll(r.at(thr_s + toward * td, 0.0));
+                            RunwayEndInfo {
+                                ident: ident.to_string(),
+                                lat: ll.0,
+                                lon: ll.1,
+                                position: local(ll.0, ll.1, 0.0),
+                                threshold_lat: tlat,
+                                threshold_lon: tlon,
+                                threshold_position: local(tlat, tlon, 0.0),
+                                displaced_threshold_m: disp,
+                                touchdown_position: local(dlat, dlon, 0.0),
+                                heading_deg: heading,
+                            }
+                        };
+                        let back = (r.heading_deg + 180.0) % 360.0;
+                        let lights: Vec<&crate::seed::airport::AirportLight> = g.lights.iter().filter(|l| l.runway == ri).collect();
+                        RunwayInfo {
+                            designator: r.key.clone(),
+                            le: end(&r.le, r.le_ll, r.le_thr_s, 1.0, r.le_thr_s, r.heading_deg),
+                            he: end(&r.he, r.he_ll, r.he_thr_s, -1.0, r.length_m - r.he_thr_s, back),
+                            length_m: r.length_m,
+                            width_m: r.width_m,
+                            surface: r.surface.clone(),
+                            paved: r.paved,
+                            lighted: r.lighted,
+                            approximate: r.approximate,
+                            lights: lights
+                                .iter()
+                                .map(|l| {
+                                    let (lat, lon) = g.frame.ll(l.p);
+                                    local(lat, lon, h_light)
+                                })
+                                .collect(),
+                            light_colors: lights.iter().map(|l| l.color).collect(),
+                        }
+                    })
+                    .collect();
+                AirportInfo {
+                    ident: g.ident.clone(),
+                    name: g.name.clone(),
+                    kind: g.kind.clone(),
+                    lat: g.lat,
+                    lon: g.lon,
+                    position: local(g.lat, g.lon, 0.0),
+                    elevation_ft: g.elevation_ft,
+                    runways,
+                }
+            })
+            .collect()
+    }
+
+    /// Contract `seed_world_info()` (api 1.7); `None` without a seed world.
+    pub fn seed_world_info(&self) -> Option<SeedInfo> {
+        let s = self.seed.as_ref()?;
+        Some(SeedInfo {
+            manifest: s.manifest.clone(),
+            generator_version: crate::seed::SEED_GEN_VERSION,
+            phases: crate::seed::SEED_PHASES.iter().map(|p| p.to_string()).collect(),
+            world_version: s.files.manifest.world_version,
+            world_seed: s.files.manifest.world_seed.clone(),
+            cities: s
+                .cities()
+                .iter()
+                .map(|c| SeedCityInfo {
+                    id: c.id.clone(),
+                    name: c.name.clone(),
+                    lat: c.center.lat,
+                    lon: c.center.lon,
+                    radius_km: c.radius_km,
+                    version: c.version,
+                    source: "synthetic".into(),
+                    airports: c.airports.clone(),
+                })
+                .collect(),
+            airports: s.airports.len(),
+            water_polygons: s.files.water.polygons.len(),
+            warnings: s.warnings.clone(),
+            stats: s.stats,
+        })
     }
 
     /// Visit every tracked tile: key, ring, state name, rect `[x0, z0, x1, z1]` in current local
     /// x/z meters.
-    pub fn debug_tiles(&self, mut f: impl FnMut(TileKey, usize, &'static str, [f64; 4])) {
-        let Some(s) = &self.scheduler else { return };
+    pub fn debug_tiles(&self, mut f: impl FnMut(LayerKey, usize, &'static str, [f64; 4])) {
         let local = self.local;
-        s.for_each_tile(|key, ring, state, rect| f(key, ring, state, local.rect_to_local(rect)));
+        for (s, layer) in [(&self.scheduler, LayerKind::World), (&self.terrain_sched, LayerKind::Terrain)] {
+            if let Some(s) = s {
+                s.for_each_tile(|key, ring, state, rect| f(LayerKey { layer, key }, ring, state, local.rect_to_local(rect)));
+            }
+        }
     }
 }
 
@@ -719,4 +1298,48 @@ fn check_geodetic(lat: f64, lon: f64, alt: f64) -> Result<(), String> {
         return Err(format!("alt_msl_m = {alt} is not finite"));
     }
     Ok(())
+}
+
+/// Cross-layer delivery order (`docs/spec-terrain.md` 5.1) between the best candidate of each
+/// layer, `(re-delivery?, slant distance from the camera)`: fresh before re-deliveries, then the
+/// nearer; ties go to the vector world.
+/// True = hand out the terrain candidate first.
+pub(crate) fn terrain_first(world: Option<(bool, f64)>, terrain: Option<(bool, f64)>) -> bool {
+    match (world, terrain) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some((wr, wd)), Some((tr, td))) => (tr, td) < (wr, wd),
+    }
+}
+
+/// A scheduler tile as the host view (origin in the current local frame).
+fn view_of(t: &ReadyTile, local: LocalSpace) -> ReadyTileView<'_> {
+    let [ox, oz] = local.to_local(t.center[0], t.center[1]);
+    let (lp, lc) = t.light_arrays();
+    let (sp, sc) = t.street_light_arrays();
+    let (bp, bc) = t.beacon_arrays();
+    let (ap, ac) = t.airport_arrays();
+    let (terrain, h_min, h_max) = match &t.terrain {
+        Some(x) => (&x.mesh, x.h_min as f64, x.h_max as f64),
+        None => (&EMPTY_MESH, 0.0, 0.0),
+    };
+    ReadyTileView {
+        layer: t.layer,
+        key: t.key,
+        ring: t.ring,
+        origin: [ox, 0.0, oz],
+        mesh: &t.mesh,
+        ground: &t.ground,
+        lights: lp,
+        light_colors: lc,
+        street_lights: sp,
+        street_light_colors: sc,
+        beacon_lights: bp,
+        beacon_light_colors: bc,
+        airport_lights: ap,
+        airport_light_colors: ac,
+        terrain,
+        h_min,
+        h_max,
+    }
 }

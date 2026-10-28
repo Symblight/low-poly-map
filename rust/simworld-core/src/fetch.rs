@@ -91,6 +91,8 @@ pub enum FetchErrorKind {
     Contract,
     /// One tile request failed (or anything else).
     Tile,
+    /// Aborted because the scheduler no longer wants the tile (`Worker::cancel`); not a failure.
+    Cancelled,
 }
 
 /// A failed fetch: what kind of failure and the message that is logged.

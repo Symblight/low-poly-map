@@ -72,7 +72,7 @@ At Vilnius latitude, a z16 tile is about 350 m wide and a z14 tile about 1.4 km.
 | R1 | z15 | 0.6–2.5 km | Boxes, merged per tile, window shader |
 | R2 | z14 | 2.5–7 km | One merged mesh per tile, emissive per building, no windows |
 | R3 | z13 | 7–25 km | Light sprites only, blurred |
-| — | — | > 25 km | Nothing; fog and horizon glow |
+| — | — | > 25 km | Nothing; fog and horizon glow (superseded: the terrain layer, `docs/spec-terrain.md`, reaches 130 km; with a world seed it carries land and sea, `docs/spec-world-seed.md` section 5.5) |
 
 **What you see by altitude (above ground)**
 

@@ -1,0 +1,7 @@
+"id","airport_ref","airport_ident","length_ft","width_ft","surface","lighted","closed","le_ident","le_latitude_deg","le_longitude_deg","le_elevation_ft","le_heading_degT","le_displaced_threshold_ft","he_ident","he_latitude_deg","he_longitude_deg","he_elevation_ft","he_heading_degT","he_displaced_threshold_ft"
+240001,2591,"EETN",11417,148,"ASP",1,0,"08",59.4119,24.7820,123,77,,"26",59.4170,24.8770,131,257,
+240002,4250,"EVRA",10499,148,"CON",1,0,"18",56.9341,23.9584,36,180,,"36",56.9054,23.9790,36,0,
+240003,2779,"EYKA",10663,148,"ASP",1,0,"08",54.9627,24.0646,253,81,0,"26",54.965,24.105,256,261,
+240004,2781,"EYPA",6562,148,"ASP",1,0,"01",55.9611,21.0931,33,15,,"19",55.9852,21.1018,33,195,
+240005,2785,"EYVI",8251,164,"ASP",1,0,"01",54.6237,25.2785,646,14,,"19",54.6446,25.293,646,194,
+240006,300001,"LT-0003",1968,98,"GRS",0,0,"09",,,,,,"27",,,,,

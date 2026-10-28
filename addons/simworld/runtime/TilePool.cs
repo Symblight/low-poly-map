@@ -5,9 +5,9 @@ namespace SimWorld;
 
 /// <summary>
 /// The pooled node set that represents one streamed tile: a building MeshInstance3D, a ground MeshInstance3D
-/// and a light MultiMeshInstance3D, all children of one root (so one Visible flag and one origin shift cover them).
+/// and two light MultiMeshInstance3Ds (building lights, street lamps), all children of one root (so one Visible flag and one origin shift cover them).
 /// </summary>
-public sealed class TileNodes
+public class TileNodes
 {
     public Node3D Root = null!;
     public MeshInstance3D MeshInstance = null!;
@@ -20,8 +20,26 @@ public sealed class TileNodes
     public MultiMesh LightsMm = null!;
     /// <summary>Reused MultiMesh buffer (transform 12 floats + color 4 floats per instance).</summary>
     public float[] Buffer = System.Array.Empty<float>();
+    /// <summary>Street lamps (api 1.1): same sprite shader, its own material without the window cross-fade.</summary>
+    public MultiMeshInstance3D StreetLights = null!;
+    public MultiMesh StreetLightsMm = null!;
+    /// <summary>Light pools on the ground under the lamps: a second instance of <see cref="StreetLightsMm"/> (no extra upload).</summary>
+    public MultiMeshInstance3D StreetPools = null!;
+    /// <summary>Aircraft warning beacons (api 1.2), own blinking material.</summary>
+    public MultiMeshInstance3D Beacons = null!;
+    public MultiMesh BeaconsMm = null!;
+    public float[] BeaconBuffer = System.Array.Empty<float>();
+    public int BeaconCount;
+    public float[] StreetBuffer = System.Array.Empty<float>();
+    /// <summary>Airport lights of a seed world (api 1.7): the sprite shader with fixed colours, shown at every distance, always on at night.</summary>
+    public MultiMeshInstance3D AirportLights = null!;
+    public MultiMesh AirportLightsMm = null!;
+    public float[] AirportBuffer = System.Array.Empty<float>();
+    public int AirportLightCount;
 
     public string Key = "";
+    /// <summary>Time of the first upload under this key (ms since start); churn diagnostics.</summary>
+    public ulong LoadedMs;
     public long Packed;
     public int Ring;
     public bool HasMesh;
@@ -29,6 +47,7 @@ public sealed class TileNodes
     public bool HasGround;
     public int GroundTris;
     public int LightCount;
+    public int StreetLightCount;
     /// <summary>True when any light carries a cluster weight (alpha above a single light's 0.125).</summary>
     public bool Clustered;
 
@@ -62,6 +81,14 @@ public sealed class TilePool
     private readonly Stack<TileNodes> _free = new();
     private readonly Mesh _lightMesh;
     private readonly ShaderMaterial _lightMaterial;
+    private readonly Mesh _streetLightMesh;
+    private readonly ShaderMaterial _streetLightMaterial;
+    private readonly ShaderMaterial _streetPoolMaterial;
+    private readonly Mesh _airportLightMesh;
+    private readonly ShaderMaterial _airportLightMaterial;
+    private readonly float _airportReferenceWeight;
+    private readonly Mesh _beaconMesh;
+    private readonly ShaderMaterial _beaconMaterial;
     private readonly ShaderMaterial _buildingMaterial;
     private readonly ShaderMaterial _groundMaterial;
     // Dithering variants of the two opaque materials: the same shader source compiled with LOD_DITHER, so the discard
@@ -84,13 +111,17 @@ public sealed class TilePool
     public ShaderMaterial BuildingFadeMaterial => _buildingFadeMaterial;
     public ShaderMaterial GroundFadeMaterial => _groundFadeMaterial;
     public ShaderMaterial LightMaterial => _lightMaterial;
+    public ShaderMaterial StreetLightMaterial => _streetLightMaterial;
+    public ShaderMaterial StreetPoolMaterial => _streetPoolMaterial;
+    public ShaderMaterial BeaconMaterial => _beaconMaterial;
+    public ShaderMaterial AirportLightMaterial => _airportLightMaterial;
     public ShaderMaterial GroundMaterial => _groundMaterial;
 
     /// <summary>
     /// Copy of <paramref name="path"/>'s shader with <c>#define LOD_DITHER</c> inserted after the shader_type line. The copy has no
     /// path of its own, so relative <c>#include</c>s are made absolute against the original's folder.
     /// </summary>
-    private static Shader LoadDitherVariant(string path)
+    internal static Shader LoadDitherVariant(string path)
     {
         var src = GD.Load<Shader>(path);
         var dir = path.Substring(0, path.LastIndexOf('/'));
@@ -116,18 +147,120 @@ public sealed class TilePool
         _lightMaterial.SetShaderParameter("dot_tex", GD.Load<Texture2D>(textures + "/light_dot_32.png"));
         settings.ApplyToLights(_lightMaterial);
         _lightMesh = new QuadMesh { Size = Vector2.One, Material = _lightMaterial };
+        _streetLightMaterial = new ShaderMaterial { Shader = _lightMaterial.Shader };
+        _streetLightMaterial.SetShaderParameter("dot_tex", _lightMaterial.GetShaderParameter("dot_tex"));
+        settings.ApplyToStreetLights(_streetLightMaterial);
+        _streetLightMesh = new QuadMesh { Size = Vector2.One, Material = _streetLightMaterial };
+        _airportReferenceWeight = System.Math.Max(settings.AirportLightReferenceWeight, 0.001f);
+        _airportLightMaterial = new ShaderMaterial { Shader = _lightMaterial.Shader };
+        _airportLightMaterial.SetShaderParameter("dot_tex", _lightMaterial.GetShaderParameter("dot_tex"));
+        settings.ApplyToAirportLights(_airportLightMaterial);
+        _airportLightMesh = new QuadMesh { Size = Vector2.One, Material = _airportLightMaterial };
+        _streetPoolMaterial = new ShaderMaterial { Shader = GD.Load<Shader>(shaders + "/street_light_pool.gdshader") };
+        settings.ApplyToStreetPools(_streetPoolMaterial);
+        _beaconMaterial = new ShaderMaterial { Shader = GD.Load<Shader>(shaders + "/beacon_light.gdshader") };
+        _beaconMaterial.SetShaderParameter("dot_tex", _lightMaterial.GetShaderParameter("dot_tex"));
+        settings.ApplyToBeacons(_beaconMaterial);
+        _beaconMesh = new QuadMesh { Size = Vector2.One, Material = _beaconMaterial };
 
         // One shared material for every building mesh of every tile (opaque, no discard).
-        _buildingMaterial = new ShaderMaterial { Shader = GD.Load<Shader>(shaders + "/building_day.gdshader") };
-        _buildingFadeMaterial = new ShaderMaterial { Shader = LoadDitherVariant(shaders + "/building_day.gdshader") };
+        _buildingMaterial = new ShaderMaterial { Shader = GD.Load<Shader>(shaders + "/building_windows.gdshader") };
+        _buildingFadeMaterial = new ShaderMaterial { Shader = LoadDitherVariant(shaders + "/building_windows.gdshader") };
         settings.ApplyToBuilding(_buildingMaterial);
         settings.ApplyToBuilding(_buildingFadeMaterial);
+        SetWindowShares(FallbackWindowShares);
+        SetProfileColors(DefaultProfileColors);
 
         // One shared material for every ground mesh (palette decoded from vertex COLOR).
         _groundMaterial = new ShaderMaterial { Shader = GD.Load<Shader>(shaders + "/ground.gdshader") };
         _groundFadeMaterial = new ShaderMaterial { Shader = LoadDitherVariant(shaders + "/ground.gdshader") };
         settings.ApplyToGround(_groundMaterial);
         settings.ApplyToGround(_groundFadeMaterial);
+    }
+
+    /// <summary>
+    /// Sets <c>emission_level</c> (the HDR level a lit window / sprite reaches, <see cref="NightLook.EmissionLevel"/>) on both building
+    /// materials, which must never drift apart. Windows emit <c>window_emission</c> (0.65) times this, under the glow threshold.
+    /// </summary>
+    public void SetEmissionLevel(float level)
+    {
+        _buildingMaterial.SetShaderParameter("emission_level", level);
+        _buildingFadeMaterial.SetShaderParameter("emission_level", level);
+    }
+
+    /// <summary>The environment's depth fog curve on the light sprites, which are additive and fog themselves (fog_disabled).</summary>
+    public void SetLightFog(float beginM, float endM, float curve)
+    {
+        foreach (var m in new[] { _lightMaterial, _streetLightMaterial, _streetPoolMaterial, _beaconMaterial, _airportLightMaterial })
+        {
+            m.SetShaderParameter("fog_begin_m", beginM);
+            m.SetShaderParameter("fog_end_m", endM);
+            m.SetShaderParameter("fog_curve", curve);
+        }
+    }
+
+    /// <summary>Street lamp height above the ground (<c>lights.street.height_m</c>): the light pools sit this far below each lamp.</summary>
+    public void SetStreetLampHeight(float heightM) => _streetPoolMaterial.SetShaderParameter("lamp_height_m", heightM);
+
+    /// <summary>Pixel footprint per metre of view depth on both sprite materials (see <c>px_per_depth</c> in light_sprite.gdshader).</summary>
+    public void SetSpritePxPerDepth(float k)
+    {
+        _lightMaterial.SetShaderParameter("px_per_depth", k);
+        _streetLightMaterial.SetShaderParameter("px_per_depth", k);
+        _beaconMaterial.SetShaderParameter("px_per_depth", k);
+        _airportLightMaterial.SetShaderParameter("px_per_depth", k);
+    }
+
+    /// <summary>
+    /// Fallback shares of lit windows per profile id, used until a world profile with <c>lit_share</c> tables has been read (W4:
+    /// <see cref="WorldView"/> replaces them with the interpolated hourly tables), e.g. with a library that has no profile.
+    /// </summary>
+    public static readonly float[] FallbackWindowShares = { 0.40f, 0.30f, 0.60f, 0f, 0.30f, 0f, 0f, 0f };
+    /// <summary>Fallback window colours per profile id (linear): residential 2700 K, office cool, retail white, industrial sodium, civic warm, unknown, landmark, dark.</summary>
+    private static readonly Vector3[] DefaultProfileColors =
+    {
+        new(1.0f, 0.655f, 0.341f), new(0.86f, 0.9f, 1.0f), new(1.0f, 0.98f, 0.95f), new(1.0f, 0.55f, 0.15f),
+        new(1.0f, 0.706f, 0.42f), new(1.0f, 0.8f, 0.55f), new(1.0f, 0.75f, 0.45f), new(0f, 0f, 0f),
+    };
+
+    /// <summary>
+    /// Lit-window share (0..1) per light profile id 0..7 at the current hour, on both building materials (W4 calls this when the hour
+    /// moves; <paramref name="shares"/> must have 8 entries). Ids without windows stay 0.
+    /// </summary>
+    public void SetWindowShares(float[] shares)
+    {
+        Variant a = shares; // PackedFloat32Array
+        _buildingMaterial.SetShaderParameter("window_share", a);
+        _buildingFadeMaterial.SetShaderParameter("window_share", a);
+    }
+
+    /// <summary>The <c>window_share</c> values currently on the plain (or the dithering) building material (tests: both must be equal).</summary>
+    public float[] ReadWindowShares(bool fadeMaterial)
+    {
+        var v = (fadeMaterial ? _buildingFadeMaterial : _buildingMaterial).GetShaderParameter("window_share");
+        return v.VariantType == Variant.Type.PackedFloat32Array ? v.AsFloat32Array() : System.Array.Empty<float>();
+    }
+
+    /// <summary>
+    /// Landmark floodlight (profile 6): colour, strength (x <c>emission_level</c>, so the base blooms) and the height in metres over which
+    /// it fades out up the wall, on both building materials. Values come from <c>lights.profiles.landmark</c> (W4).
+    /// </summary>
+    public void SetFloodlight(Vector3 color, float strength, float fadeHeightM)
+    {
+        foreach (var m in new[] { _buildingMaterial, _buildingFadeMaterial })
+        {
+            m.SetShaderParameter("floodlight_color", color);
+            m.SetShaderParameter("floodlight_strength", strength);
+            m.SetShaderParameter("floodlight_fade_height_m", fadeHeightM);
+        }
+    }
+
+    /// <summary>Window colour (linear) per light profile id 0..7, on both building materials (8 entries).</summary>
+    public void SetProfileColors(Vector3[] colors)
+    {
+        Variant a = colors; // PackedVector3Array
+        _buildingMaterial.SetShaderParameter("profile_color", a);
+        _buildingFadeMaterial.SetShaderParameter("profile_color", a);
     }
 
     /// <summary>Creates <paramref name="count"/> hidden node sets up front to avoid first-use hitches.</summary>
@@ -174,25 +307,43 @@ public sealed class TilePool
         _free.Push(t);
     }
 
-    private TileNodes Create()
+    private static (MultiMeshInstance3D, MultiMesh) CreateSprites(string name, Mesh quad, ShaderMaterial material)
     {
         var mm = new MultiMesh
         {
             TransformFormat = MultiMesh.TransformFormatEnum.Transform3D,
             UseColors = true,
-            Mesh = _lightMesh,
+            Mesh = quad,
         };
         mm.InstanceCount = 0; // after format/colors are set
         var mmi = new MultiMeshInstance3D
         {
-            Name = "Lights",
+            Name = name,
             Multimesh = mm,
             // Also as override so the per-instance fade_mul uniform is found on the MultiMesh instance.
-            MaterialOverride = _lightMaterial,
+            MaterialOverride = material,
             CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
             Visible = false,
             // The billboard is expanded in the vertex shader; keep distant sprites out of any frustum-edge pop.
             ExtraCullMargin = 200f + CurveCullMargin,
+        };
+        return (mmi, mm);
+    }
+
+    private TileNodes Create()
+    {
+        var (mmi, mm) = CreateSprites("Lights", _lightMesh, _lightMaterial);
+        var (smi, smm) = CreateSprites("StreetLights", _streetLightMesh, _streetLightMaterial);
+        var (bmi, bmm) = CreateSprites("Beacons", _beaconMesh, _beaconMaterial);
+        var (ami, amm) = CreateSprites("AirportLights", _airportLightMesh, _airportLightMaterial);
+        var pools = new MultiMeshInstance3D
+        {
+            Name = "StreetPools",
+            Multimesh = smm,
+            MaterialOverride = _streetPoolMaterial,
+            CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
+            Visible = false,
+            ExtraCullMargin = 50f + CurveCullMargin, // the disc reaches below and around the lamp's AABB
         };
         var am = new ArrayMesh();
         var mi = new MeshInstance3D
@@ -218,8 +369,17 @@ public sealed class TilePool
         root.AddChild(mi);
         root.AddChild(gi);
         root.AddChild(mmi);
+        root.AddChild(smi);
+        root.AddChild(pools);
+        root.AddChild(bmi);
+        root.AddChild(ami);
         _container.AddChild(root);
-        return new TileNodes { Root = root, MeshInstance = mi, Mesh = am, GroundInstance = gi, GroundMesh = gm, Lights = mmi, LightsMm = mm };
+        return new TileNodes
+        {
+            Root = root, MeshInstance = mi, Mesh = am, GroundInstance = gi, GroundMesh = gm, Lights = mmi, LightsMm = mm,
+            StreetLights = smi, StreetLightsMm = smm, StreetPools = pools, Beacons = bmi, BeaconsMm = bmm,
+            AirportLights = ami, AirportLightsMm = amm,
+        };
     }
 
     /// <summary>
@@ -242,6 +402,10 @@ public sealed class TilePool
         t.MeshInstance.SetInstanceShaderParameter(PFade, fade);
         t.GroundInstance.SetInstanceShaderParameter(PFade, fade);
         t.Lights.SetInstanceShaderParameter(PFadeMul, fade);
+        t.StreetLights.SetInstanceShaderParameter(PFadeMul, fade);
+        t.StreetPools.SetInstanceShaderParameter(PFadeMul, fade);
+        t.Beacons.SetInstanceShaderParameter(PFadeMul, fade);
+        t.AirportLights.SetInstanceShaderParameter(PFadeMul, fade);
     }
 
     /// <summary>Back to the opaque materials (no discard) once a tile left its transition, or when it is released.</summary>
@@ -251,6 +415,10 @@ public sealed class TilePool
         t.MeshInstance.MaterialOverride = _buildingMaterial;
         t.GroundInstance.MaterialOverride = _groundMaterial;
         t.Lights.SetInstanceShaderParameter(PFadeMul, 1f);
+        t.StreetLights.SetInstanceShaderParameter(PFadeMul, 1f);
+        t.StreetPools.SetInstanceShaderParameter(PFadeMul, 1f);
+        t.Beacons.SetInstanceShaderParameter(PFadeMul, 1f);
+        t.AirportLights.SetInstanceShaderParameter(PFadeMul, 1f);
         t.FadeMaterialActive = false;
     }
 
@@ -276,6 +444,16 @@ public sealed class TilePool
         t.Lights.Visible = false;
         t.LightCount = 0;
         t.Clustered = false;
+        t.StreetLightsMm.VisibleInstanceCount = 0;
+        t.StreetLights.Visible = false;
+        t.StreetPools.Visible = false;
+        t.StreetLightCount = 0;
+        t.BeaconsMm.VisibleInstanceCount = 0;
+        t.Beacons.Visible = false;
+        t.BeaconCount = 0;
+        t.AirportLightsMm.VisibleInstanceCount = 0;
+        t.AirportLights.Visible = false;
+        t.AirportLightCount = 0;
     }
 
     /// <summary>
@@ -296,7 +474,7 @@ public sealed class TilePool
 
     /// <summary>
     /// Uploads the ground mesh (Mesh.ARRAY_MAX layout: VERTEX, NORMAL, COLOR, INDEX) into the tile's reused ground
-    /// ArrayMesh. Null = no ground (R3 / empty tile): the instance is hidden. Visibility of the whole tile is the
+    /// ArrayMesh. Null = no ground (empty tile; R3 before api 1.3): the instance is hidden. Visibility of the whole tile is the
     /// root's, so ground swaps exactly with the buildings.
     /// </summary>
     public void SetGround(TileNodes t, Godot.Collections.Array? arrays)
@@ -317,23 +495,53 @@ public sealed class TilePool
     /// </summary>
     public void SetLights(TileNodes t, Vector3[] lights, Color[] colors)
     {
-        var mm = t.LightsMm;
+        t.LightCount = lights.Length;
+        t.Clustered = Fill(t.Lights, t.LightsMm, ref t.Buffer, lights, colors);
+    }
+
+    /// <summary>Fills the tile's street lamp MultiMesh (api 1.1), same layout as <see cref="SetLights"/>.</summary>
+    public void SetStreetLights(TileNodes t, Vector3[] lights, Color[] colors)
+    {
+        t.StreetLightCount = lights.Length;
+        Fill(t.StreetLights, t.StreetLightsMm, ref t.StreetBuffer, lights, colors);
+        t.StreetPools.Visible = t.StreetLights.Visible;
+    }
+
+    /// <summary>Fills the tile's beacon MultiMesh (api 1.2); colour alpha is the blink phase, passed through untouched.</summary>
+    public void SetBeacons(TileNodes t, Vector3[] lights, Color[] colors)
+    {
+        t.BeaconCount = lights.Length;
+        Fill(t.Beacons, t.BeaconsMm, ref t.BeaconBuffer, lights, colors, rawAlpha: true);
+    }
+
+    /// <summary>
+    /// Fills the tile's airport light MultiMesh (api 1.7). Rust sends the fixed colour (blue / white / green / red) and the intensity weight in the
+    /// alpha (<c>seed.airport.lights.intensity</c>, 0.35); the sprite shader would read an alpha above 0.125 as a cluster, so the buffer carries
+    /// alpha 0.125 (a single light) and the weight scales the colour instead (weight / reference weight, 1 at the default).
+    /// </summary>
+    public void SetAirportLights(TileNodes t, Vector3[] lights, Color[] colors)
+    {
+        t.AirportLightCount = lights.Length;
+        Fill(t.AirportLights, t.AirportLightsMm, ref t.AirportBuffer, lights, colors, airportWeight: _airportReferenceWeight);
+    }
+
+    /// <summary>Uploads one sprite set; returns true when any light carries a cluster weight.</summary>
+    private static bool Fill(MultiMeshInstance3D mmi, MultiMesh mm, ref float[] buffer, Vector3[] lights, Color[] colors, bool rawAlpha = false, float airportWeight = 0f)
+    {
         int n = lights.Length;
-        t.LightCount = n;
-        t.Clustered = false;
         if (n == 0)
         {
             mm.VisibleInstanceCount = 0;
-            t.Lights.Visible = false;
-            return;
+            mmi.Visible = false;
+            return false;
         }
 
         int cap = (n + CapacityStep - 1) / CapacityStep * CapacityStep;
         if (mm.InstanceCount != cap) mm.InstanceCount = cap;
         int len = cap * FloatsPerInstance;
-        if (t.Buffer.Length != len) t.Buffer = new float[len];
+        if (buffer.Length != len) buffer = new float[len];
 
-        var buf = t.Buffer;
+        var buf = buffer;
         int nc = colors.Length;
         bool clustered = false;
         for (int i = 0, o = 0; i < n; i++, o += FloatsPerInstance)
@@ -345,7 +553,13 @@ public sealed class TilePool
             if (i < nc)
             {
                 var c = colors[i];
-                float a = DebugLightAlpha >= 0f ? DebugLightAlpha : c.A;
+                if (airportWeight > 0f)
+                {
+                    float k = c.A / airportWeight;
+                    buf[o + 12] = c.R * k; buf[o + 13] = c.G * k; buf[o + 14] = c.B * k; buf[o + 15] = 0.125f;
+                    continue;
+                }
+                float a = DebugLightAlpha >= 0f && !rawAlpha ? DebugLightAlpha : c.A;
                 buf[o + 12] = c.R; buf[o + 13] = c.G; buf[o + 14] = c.B; buf[o + 15] = a;
                 if (a > ClusterAlpha) clustered = true;
             }
@@ -356,7 +570,7 @@ public sealed class TilePool
         }
         mm.Buffer = buf;
         mm.VisibleInstanceCount = n;
-        t.Lights.Visible = true;
-        t.Clustered = clustered;
+        mmi.Visible = true;
+        return clustered;
     }
 }

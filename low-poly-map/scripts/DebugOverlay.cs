@@ -202,6 +202,7 @@ public partial class DebugOverlay : Control
             sb.Append("source: ").Append(Bridge.TileSource);
             if (Bridge.BandsText.Length > 0) sb.Append("  ").Append(Bridge.BandsText);
             sb.Append('\n');
+            if (Bridge.SeedWorldActive) AppendSeedLine(sb);
             if (Bridge.ConfigureError.Length > 0)
                 sb.Append("WORLD NOT CONFIGURED: ").Append(Bridge.ConfigureError).Append('\n');
             else if (!Bridge.Status.IsOk)
@@ -225,6 +226,13 @@ public partial class DebugOverlay : Control
             AppendRings(sb, "fetching", _stats.Fetching);
             AppendRings(sb, "meshing ", _stats.Meshing);
             AppendRings(sb, "loaded  ", _stats.Loaded);
+            if (_stats.HasTerrain)
+            {
+                AppendRings(sb, "terrain queued  ", _stats.TerrainQueued, _stats.TerrainRings, "T");
+                AppendRings(sb, "terrain meshing ", _stats.TerrainMeshing, _stats.TerrainRings, "T");
+                AppendRings(sb, "terrain loaded  ", _stats.TerrainLoaded, _stats.TerrainRings, "T");
+                sb.Append("terrain tris ").Append(_stats.TerrainTris.ToString("N0")).Append("  detail x").Append(_stats.TerrainDetail.ToString("0.##")).Append('\n');
+            }
             sb.Append("cache ").Append(_stats.CacheMb.ToString("0.0")).Append(" MB\n");
         }
 
@@ -245,6 +253,27 @@ public partial class DebugOverlay : Control
             sb.Append("ground meshes ").Append(c.GroundTilesVisible).Append(" visible / ").Append(c.GroundTilesLoaded)
               .Append(" loaded (= draw calls, of ").Append(DrawCallBudget).Append(" cap)  tris ")
               .Append(c.GroundTrianglesVisible.ToString("N0")).Append(" / ").Append(c.GroundTrianglesLoaded.ToString("N0")).Append('\n');
+            if (Bridge.TerrainActive)
+            {
+                var tc = Bridge.TerrainCover;
+                int drawn = Camera != null ? Bridge.CountTerrainInFrustum(Camera, out int byRule, out long drawnTris) : 0;
+                int visTotal = 0;
+                foreach (var v in tc.VisibleByRing) visTotal += v;
+                sb.Append("terrain meshes ").Append(tc.Loaded).Append(" held, ").Append(visTotal).Append(" visible by rule (T");
+                for (int r = 0; r < tc.VisibleByRing.Length; r++) sb.Append(r > 0 ? "/" : "").Append(tc.VisibleByRing[r]);
+                sb.Append("), ").Append(drawn).Append(" in frustum (= terrain draw calls, of ").Append(DrawCallBudget).Append(" cap)  tris ")
+                  .Append(tc.TrianglesVisible.ToString("N0")).Append(" visible / ").Append(tc.TrianglesLoaded.ToString("N0")).Append(" held  fading ").Append(tc.FadingTiles)
+                  .Append("  replaced ").Append(Bridge.TerrainReplacedTotal).Append('\n');
+                sb.Append("terrain upload ms (last/max/avg) per ring:");
+                for (int r = 0; r < tc.Rings; r++)
+                {
+                    int n = Bridge.TerrainUploadCount[r];
+                    if (n == 0) continue;
+                    sb.Append("  T").Append(r).Append(' ').Append((Bridge.TerrainUploadUsLast[r] / 1000.0).ToString("0.0")).Append('/').Append((Bridge.TerrainUploadUsMax[r] / 1000.0).ToString("0.0"))
+                      .Append('/').Append((Bridge.TerrainUploadUsSum[r] / 1000.0 / n).ToString("0.0"));
+                }
+                sb.Append('\n');
+            }
             if (Render != null)
                 sb.Append("render: tonemap ").Append(Render.Tonemap).Append(" [T]  exposure x").Append(Render.ExposureNow.ToString("0.00"))
                   .Append(Render.ExternalView ? "" : " (off)").Append(" [X]  glow thr ").Append(Render.GlowThresholdNow.ToString("0.00"))
@@ -270,6 +299,8 @@ public partial class DebugOverlay : Control
                   .Append("  avg ").Append((Bridge.TileUploadUsSum[r] / 1000.0 / n).ToString("0.00"))
                   .Append("  n ").Append(n).Append('\n');
             }
+            if (_haveStats && _stats.Latency.Count > 0)
+                sb.Append("streaming latency ms p50/p95/max (n), last 128 tiles per band (swap = coarse tile standing in):\n").Append(_stats.LatencyText());
         }
 
         if (Camera != null)
@@ -277,7 +308,7 @@ public partial class DebugOverlay : Control
             sb.Append("cam alt ").Append(Camera.AltitudeAgl.ToString("0")).Append(" m AGL (ground ")
               .Append((Bridge?.CameraGroundHeight ?? 0.0).ToString("0.0")).Append(" m)  speed ")
               .Append(Camera.Velocity.Length().ToString("0")).Append('/').Append(Camera.Speed.ToString("0"))
-              .Append(" m/s").Append(Camera.Autopilot ? " [AUTOPILOT]" : "").Append(Camera.ClimbRate > 0f ? " [CLIMB " + Camera.ClimbRate.ToString("0") + " m/s]" : "").Append("  pos ").Append(_camPos.X.ToString("0")).Append(", ").Append(_camPos.Z.ToString("0")).Append('\n');
+              .Append(" m/s").Append(Camera.AltitudeAgl < 0 && Bridge != null && Bridge.TerrainActive ? "  [UNDER THE TERRAIN: back faces are culled]" : "").Append(Camera.Autopilot ? " [AUTOPILOT]" : "").Append(Camera.ClimbRate > 0f ? " [CLIMB " + Camera.ClimbRate.ToString("0") + " m/s]" : "").Append("  pos ").Append(_camPos.X.ToString("0")).Append(", ").Append(_camPos.Z.ToString("0")).Append('\n');
         }
 
         if (streamer != null && streamer.IsAvailable)
@@ -290,10 +321,46 @@ public partial class DebugOverlay : Control
             sb.Append('\n').Append(string.Join(" | ", Bridge.Attributions));
     }
 
-    private static void AppendRings(StringBuilder sb, string name, int[] v)
+    /// <summary>World seed (api 1.7): generator and phases, the data source of the finest vector tile under the camera, airports near, load warnings.</summary>
+    private void AppendSeedLine(StringBuilder sb)
+    {
+        var info = Bridge!.SeedInfo;
+        if (info == null) { sb.Append("seed: no seed_world_info()\n"); return; }
+        string under = "-";
+        if (Camera != null)
+        {
+            var p = Camera.GlobalPosition;
+            int bestRing = 99;
+            for (int i = 0; i < _tiles.Count; i++)
+            {
+                var t = _tiles[i];
+                if (t.Terrain || t.Ring >= bestRing || t.State != TileState.Ready) continue;
+                if (p.X < t.Min.X || p.X > t.Max.X || p.Z < t.Min.Y || p.Z > t.Max.Y) continue;
+                bestRing = t.Ring;
+                under = $"{t.Source} (R{t.Ring} {t.Key})";
+            }
+        }
+        string near = "-";
+        double bestD = double.MaxValue;
+        if (Camera != null)
+            foreach (var a in Bridge.Airports)
+            {
+                double dx = a.Position.X - Camera.GlobalPosition.X, dz = a.Position.Z - Camera.GlobalPosition.Z;
+                double d = System.Math.Sqrt(dx * dx + dz * dz);
+                if (d < bestD) { bestD = d; near = $"{a.Ident} {d / 1000.0:0.0} km"; }
+            }
+        var m = Bridge.Markings;
+        sb.Append("seed: ").Append(under).Append("  generator v").Append(info.GeneratorVersion).Append(" phases ").Append(string.Join("/", info.Phases))
+          .Append("  airports ").Append(info.Airports).Append(" (nearest ").Append(near).Append(")  markings ").Append(m?.DrawnAirports ?? 0).Append(" airports ").Append(m?.Quads ?? 0).Append(" quads")
+          .Append("  warnings ").Append(info.Warnings.Length).Append('\n');
+        for (int i = 0; i < info.Warnings.Length && i < 3; i++) sb.Append("  seed warning: ").Append(info.Warnings[i]).Append('\n');
+    }
+
+    private static void AppendRings(StringBuilder sb, string name, int[] v, int count = -1, string prefix = "R")
     {
         sb.Append(name);
-        for (int i = 0; i < v.Length; i++) sb.Append("  R").Append(i).Append(' ').Append(v[i]);
+        if (count < 0 || count > v.Length) count = v.Length;
+        for (int i = 0; i < count; i++) sb.Append("  ").Append(prefix).Append(i).Append(' ').Append(v[i]);
         sb.Append('\n');
     }
 
@@ -341,7 +408,7 @@ public partial class DebugOverlay : Control
             for (int i = 0; i < _tiles.Count; i++)
             {
                 var t = _tiles[i];
-                if (t.Ring != ring) continue;
+                if (t.Terrain || t.Ring != ring) continue; // terrain tiles (api 1.5) live in their own tile map and are 22 km wide: not on this minimap
                 int vis = cover != null && t.Packed != 0 ? cover.StateOf(t.Packed) : -1;
                 bool isVisible = vis == (int)TileCover.Vis.Visible;
                 if (!isVisible && !_showHidden) continue;

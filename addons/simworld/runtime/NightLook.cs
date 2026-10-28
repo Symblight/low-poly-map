@@ -8,7 +8,7 @@ namespace SimWorld;
 /// - Glow threshold sits just below the emission of lit windows and light sprites at night
 ///   (<see cref="EmissionLevel"/> * <see cref="ThresholdBelowEmission"/>) and out of reach of sunlit surfaces by day
 ///   (<see cref="DayThreshold"/>); glow intensity rises with altitude so the light carpet blooms at cruise.
-/// - Fog: depth fog plus a thin ground-haze height fog.
+/// - Fog: depth fog plus a thin ground-haze height fog; with the terrain layer on, a day-time variant that reaches the far terrain bands.
 /// What stays with the host: exposure and tone map, the sun or moon node, sky and ambient colors, the choice of environment.
 /// Mobile-renderer features only. Call <see cref="ApplyStatic"/> once, then <see cref="Update"/> every frame (or whenever the clock or altitude changes).
 /// </summary>
@@ -30,6 +30,9 @@ public partial class NightLook : Resource
     [Export] public float GlowIntensityCruise { get; set; } = 1.4f;
     [Export] public float GlowAltLowM { get; set; } = 300f;
     [Export] public float GlowAltHighM { get; set; } = 10000f;
+    /// <summary>Glow threshold at cruise (night), reached over <see cref="GlowAltLowM"/>..<see cref="GlowAltHighM"/>: from altitude the distant,
+    /// dimmed light carpet blooms too (the aerial-photo glow); low down the threshold stays just above the windows.</summary>
+    [Export] public float ThresholdCruise { get; set; } = 0.35f;
 
     // ---- fog ------------------------------------------------------------------------------------
     /// <summary>Depth fog is pow(smoothstep(begin, end, slant distance), curve): ~5 % at the R1/R2 border (2.5 km), ~80 % at 7 km.</summary>
@@ -40,6 +43,16 @@ public partial class NightLook : Resource
     /// <summary>Height fog (per fragment height, not per ray): fragments below this world y get 1 - exp(-(h - y) * density).</summary>
     [Export] public float HazeTopM { get; set; } = 150f;
     [Export] public float HazeDensity { get; set; } = 0.0006f;
+
+    /// <summary>
+    /// Day-time depth fog while the terrain layer runs (api 1.5; the fog above would hide everything past 9 km): fog begins at
+    /// <see cref="TerrainDayFogBeginM"/> and is complete at <see cref="TerrainDayFogEndShare"/> x the terrain reach, so the far facets (bands T3 / T4,
+    /// 25..130 km) read as haze. At night the fog above applies unchanged (night spec: far blocks dissolve, sprites fog by hand with the same curve);
+    /// in between both are mixed by the night factor. Terrain off: <see cref="Update"/> leaves the fog exactly as <see cref="ApplyStatic"/> set it.
+    /// </summary>
+    [Export] public float TerrainDayFogBeginM { get; set; } = 2500f;
+    [Export(PropertyHint.Range, "0.3,1,0.01")] public float TerrainDayFogEndShare { get; set; } = 0.95f;
+    [Export] public float TerrainDayFogCurve { get; set; } = 1.7f;
 
     /// <summary>Values written by the last <see cref="Update"/>, for debug overlays.</summary>
     public float GlowThresholdNow { get; private set; }
@@ -61,6 +74,7 @@ public partial class NightLook : Resource
         env.SetGlowLevel(0, 0.6f); // 1/2 resolution
         env.SetGlowLevel(1, 1.0f); // 1/4
         env.SetGlowLevel(2, 0.8f); // 1/8
+        env.SetGlowLevel(3, 0.5f); // 1/16: the wide haze around the light carpet
 
         env.FogEnabled = true;
         env.FogMode = Godot.Environment.FogModeEnum.Depth;
@@ -77,10 +91,24 @@ public partial class NightLook : Resource
     }
 
     /// <summary>Per frame: glow threshold from the night factor and glow intensity from the altitude above ground.</summary>
-    public void Update(Godot.Environment env, float nightFactor, float altitudeAgl)
+    public void Update(Godot.Environment env, float nightFactor, float altitudeAgl, float terrainReachM = 0f)
     {
+        if (terrainReachM > 0f)
+        {
+            float dayEnd = Mathf.Max(terrainReachM * TerrainDayFogEndShare, TerrainDayFogBeginM + 1000f);
+            env.FogDepthBegin = Mathf.Lerp(TerrainDayFogBeginM, FogBeginM, nightFactor);
+            env.FogDepthEnd = Mathf.Lerp(dayEnd, FogEndM, nightFactor);
+            env.FogDepthCurve = Mathf.Lerp(TerrainDayFogCurve, FogCurve, nightFactor);
+        }
+        else
+        {
+            env.FogDepthBegin = FogBeginM;
+            env.FogDepthEnd = FogEndM;
+            env.FogDepthCurve = FogCurve;
+        }
         float altK = Mathf.SmoothStep(GlowAltLowM, GlowAltHighM, altitudeAgl);
-        GlowThresholdNow = Mathf.Lerp(DayThreshold, EmissionLevel * ThresholdBelowEmission, nightFactor);
+        float nightThreshold = Mathf.Lerp(EmissionLevel * ThresholdBelowEmission, EmissionLevel * ThresholdCruise, altK);
+        GlowThresholdNow = Mathf.Lerp(DayThreshold, nightThreshold, nightFactor);
         GlowIntensityNow = Mathf.Lerp(GlowIntensityGround, GlowIntensityCruise, altK);
         env.GlowHdrThreshold = GlowThresholdNow;
         env.GlowIntensity = GlowIntensityNow;

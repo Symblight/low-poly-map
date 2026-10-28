@@ -1,0 +1,22 @@
+{
+  "format": 1,
+  "world_version": 1,
+  "world_seed": "bench-two-cities",
+  "water": "water.json",
+  "airports": {
+    "file": "airports.json",
+    "types": ["large_airport", "medium_airport", "small_airport"],
+    "include": [],
+    "exclude": [],
+    "overrides": {
+      "EYPA": {
+        "runways": {
+          "01/19": { "le_lat": 55.9628424, "le_lon": 21.0896732, "he_lat": 55.9833478, "he_lon": 21.0979302,
+                     "length_ft": 7679 }
+        }
+      }
+    }
+  },
+  "cities": ["cities/vilnius.json", "cities/kaunas.json"],
+  "roads": "roads.json"
+}

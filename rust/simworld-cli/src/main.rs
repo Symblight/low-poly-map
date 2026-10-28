@@ -8,8 +8,13 @@
 //! * `default-profile`: print the compiled-in default world profile as JSON (the source of
 //!   `addons/simworld/profiles/default.json`).
 //!
+//! * `seed airports | water | validate` (docs/spec-world-seed.md section 3.2, phase S0): the seed
+//!   world's offline content tools (module `seed`).
+//!
 //! Fly scripts, cache bake, tile dumps and benches arrive in phase P6 of
 //! docs/spec-library-packaging.md.
+
+mod seed;
 
 use std::process::ExitCode;
 
@@ -35,10 +40,12 @@ fn usage() -> String {
         "simworld-cli {} (simworld-core {}, world profile version {})\n\
          usage:\n  simworld-cli validate-profile <file.json>   check a world profile (exit 0 = OK)\n  \
          simworld-cli default-profile                print the default world profile\n\
+         {}\n\
          planned (P6): fly, bake, tile, bench",
         env!("CARGO_PKG_VERSION"),
         simworld_core::VERSION,
-        simworld_core::PROFILE_VERSION
+        simworld_core::PROFILE_VERSION,
+        seed::USAGE
     )
 }
 
@@ -60,6 +67,14 @@ fn main() -> ExitCode {
             println!("{json}");
             ExitCode::SUCCESS
         }
+        ["seed", ..] => match seed::run(&args[1..]) {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => ExitCode::FAILURE,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        },
         ["--version"] | ["-V"] => {
             println!("{}", usage().lines().next().unwrap_or_default());
             ExitCode::SUCCESS

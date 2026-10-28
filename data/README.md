@@ -25,8 +25,15 @@ Nothing is merged and small features are not dropped (`min_size: 0`), so every b
 | | | `levels` | `building:levels` parsed (double); omitted if missing |
 | | | `min_height` | `min_height` parsed, default `0` |
 | | | `colour` | `building:colour` as is; omitted if missing |
+| | | `historic` | raw `historic` value (`castle`, `ruins`, `city_gate`, ...); omitted if missing |
+| | | `man_made` | raw `man_made` value (`tower`, `chimney`, `water_tower`, ...); omitted if missing |
+| | | `windows` | bool from `windows=yes/no`, else `window=yes/no`; other values (`many`, ...) and missing tags: omitted |
+| | | `ruins`, `disused` | `true` when `ruins=yes` / `disused=yes`; omitted otherwise |
+| | | `abandoned` | `true` when any `abandoned:building=*` is present; omitted otherwise |
 | `landuse` | polygon | `id`, `kind` | `kind` = the most specific of `landuse`, `leisure` (park, garden, playground, pitch, golf_course, nature_reserve, recreation_ground), `natural` (water, wood, grassland, scrub, wetland) or `riverbank` (`waterway=riverbank`). Rust uses these polygons for the kind and levels fallbacks (point-in-polygon) and, since Milestone 5, for the flat ground mesh (parks, forest, water). A schema can't do spatial joins. |
 | `roads` | line | `id`, `kind`, `lit` | `kind` = `highway`; `lit` as is. Roads from motorway down to tertiary (plus their `_link` roads) start at z13; all other roads start at z14. |
+
+The six optional `buildings` attributes (night windows, `docs/spec-night-windows.md`) feed the Rust light-profile resolution (`landmark` / `dark` profiles, `buildings.dark_states` in the world profile); the tables stay in the world profile, so tuning them needs no tile rebuild. Archives built before them still work (every attribute counts as absent). In the Vilnius extract (z16, owned buildings) they are rare: 82 `historic`, 74 `ruins`, 5 `disused`, 2 `abandoned`, ~250 `man_made` (mostly `storage_tank`), no `windows`/`window`.
 
 The MVT feature id (not the `id` attribute) is planetiler's encoding, `osm_id * 10 + type` (2 = way, 3 = relation).
 Buildings that cross a tile edge appear in each tile they touch, with the same `id`. The mesher should give each one to a single tile (for example the tile that holds its centroid) when it places light points.
@@ -34,7 +41,7 @@ Buildings that cross a tile edge appear in each tile they touch, with the same `
 
 ## Output (Lithuania extract of 2026-10-26)
 
-`out/vilnius.pmtiles`: **59 MB**, 30,607 addressed tiles.
+`out/vilnius.pmtiles`: **59 MB**, 30,607 addressed tiles. (Rebuilt 2026-10-27 with the night-window attributes: 63.9 MB / 61 MiB on disk, 23 kB more than the build before it; the table below is from the first build.)
 
 | Zoom | Tiles | Total (gz) | Avg (gz) | Max (gz) |
 |------|-------|------------|----------|----------|

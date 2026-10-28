@@ -36,6 +36,10 @@ crossbeam-channel = "0.5.17"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
 
+# Transcendentals (sin, cos, ln, atan2, hypot ...) through pure-Rust libm: bit-identical on every
+# platform, unlike the platform maths library behind f64::sin (src/math.rs, spec-world-seed 7).
+libm = "0.2.16"
+
 # Containers / hashing.
 ahash = "0.8.12"
 

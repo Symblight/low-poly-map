@@ -56,7 +56,7 @@ mod tests {
             assert!(doc.contains(&format!("`{name}(")), "#[func] {name} is missing from docs/contract.md");
             n += 1;
         }
-        assert_eq!(n, 18, "WorldStreamer #[func] count changed: update docs/contract.md and this test");
+        assert_eq!(n, 21, "WorldStreamer #[func] count changed: update docs/contract.md and this test");
     }
 
     /// Every `#[signal]` of `WorldStreamer` is documented in `docs/contract.md` (as

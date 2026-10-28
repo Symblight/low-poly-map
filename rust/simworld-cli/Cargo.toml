@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "SimWorld headless runner (validate-profile, default-profile; fly scripts, cache bake, tile dumps and benches arrive in P6)"
+description = "SimWorld headless runner (validate-profile, default-profile, seed airports/water/validate; fly scripts, cache bake, tile dumps and benches arrive in P6)"
 
 [[bin]]
 name = "simworld-cli"
@@ -12,4 +12,4 @@ path = "src/main.rs"
 
 [dependencies]
 simworld-core = { path = "../simworld-core" }
-serde_json = "1.0.154"
+serde_json = { version = "1.0.154", features = ["float_roundtrip"] }

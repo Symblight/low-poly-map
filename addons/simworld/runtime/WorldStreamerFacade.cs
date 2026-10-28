@@ -13,9 +13,13 @@ public struct DebugTile
     /// <summary>Packed key (see <see cref="TileKey"/>), 0 when the key could not be parsed.</summary>
     public long Packed;
     public int Ring;
+    /// <summary>True for a terrain-layer tile (key "t/z/x/y", api 1.5); <see cref="Packed"/> is then a key of the terrain tile map.</summary>
+    public bool Terrain;
     public TileState State;
     public Vector2 Min;
     public Vector2 Max;
+    /// <summary>Where the tile's data comes from (api 1.7): "seed", "archive", "synthetic" or "terrain"; empty on an older library.</summary>
+    public string Source;
 }
 
 /// <summary>
@@ -25,10 +29,25 @@ public struct DebugTile
 public struct ReadyTile
 {
     public string Key;
+    /// <summary>True for a terrain-layer entry (api 1.5: layer "terrain", key "t/z/x/y"); false for the vector layer.</summary>
+    public bool IsTerrain;
+    /// <summary>Terrain mesh Array (VERTEX, INDEX, optional NORMAL), relative to <see cref="Origin"/>; null when absent. Terrain entries only.</summary>
+    public Godot.Collections.Array? Terrain;
+    /// <summary>Lowest / highest surface vertex (m above MSL) of a terrain tile.</summary>
+    public float HMin, HMax;
     public int Ring;
     public Vector3 Origin;
     public Vector3[] Lights;
     public Color[] LightColors;
+    /// <summary>Street lamps (api 1.1; empty from an older library), relative to <see cref="Origin"/>; drawn at every distance.</summary>
+    public Vector3[] StreetLights;
+    public Color[] StreetLightColors;
+    /// <summary>Aircraft warning beacons (api 1.2; empty from an older library): rgb = colour, a = blink phase of the building.</summary>
+    public Vector3[] BeaconLights;
+    public Color[] BeaconLightColors;
+    /// <summary>Airport lights of a seed world (api 1.7; empty otherwise), relative to <see cref="Origin"/>: rgb = fixed colour (blue / white / green / red), a = intensity weight.</summary>
+    public Vector3[] AirportLights;
+    public Color[] AirportLightColors;
     public Godot.Collections.Array? Mesh;
     /// <summary>
     /// True when the dictionary carried a "ground" key at all (an empty Array still counts). Lets the uploader tell
@@ -39,6 +58,44 @@ public struct ReadyTile
     public Godot.Collections.Array? Ground;
 }
 
+/// <summary>One end of a runway (api 1.7 <c>airports()</c>). Positions are in the local frame of the call (they follow the floating origin).</summary>
+public sealed record RunwayEnd(string Ident, double Lat, double Lon, Vector3 Position, double ThresholdLat, double ThresholdLon, Vector3 ThresholdPosition,
+    double DisplacedThresholdM, Vector3 TouchdownPosition, double HeadingDeg);
+
+/// <summary>One runway of an airport (api 1.7). <see cref="Lights"/> / <see cref="LightColors"/> are the same points the tiles draw (ground + the light height).</summary>
+public sealed record RunwayInfo(string Designator, RunwayEnd Le, RunwayEnd He, double LengthM, double WidthM, string Surface, bool Paved, bool Lighted,
+    bool Approximate, Vector3[] Lights, Color[] LightColors);
+
+/// <summary>One airport of a seed world (api 1.7 <c>airports()</c>), sorted by ident in the array the facade returns.</summary>
+public sealed record AirportInfo(string Ident, string Name, string Type, double Lat, double Lon, Vector3 Position, double? ElevationFt, RunwayInfo[] Runways)
+{
+    /// <summary>The longest runway (the one a spot or a game would use first); null without runways.</summary>
+    public RunwayInfo? MainRunway
+    {
+        get
+        {
+            RunwayInfo? best = null;
+            foreach (var r in Runways) if (best == null || r.LengthM > best.LengthM) best = r;
+            return best;
+        }
+    }
+}
+
+/// <summary>One city of the seed world manifest (api 1.7 <c>seed_world_info()</c>).</summary>
+public sealed record SeedCityInfo(string Id, string Name, double Lat, double Lon, double RadiusKm, int Version, string Source, string[] Airports);
+
+/// <summary>Summary of the loaded seed world (api 1.7 <c>seed_world_info()</c>); <see cref="Phases"/> lists the built phases ("S0", "S1", ...).</summary>
+public sealed record SeedWorldInfo(string Manifest, int GeneratorVersion, string[] Phases, int WorldVersion, string WorldSeed, SeedCityInfo[] Cities,
+    int Airports, int WaterPolygons, string[] Warnings, string MemoryText, double LoadMs)
+{
+    public bool HasPhase(string phase) => System.Array.IndexOf(Phases, phase) >= 0;
+
+    /// <summary>One line for the startup log and the overlay.</summary>
+    public string Summary =>
+        $"manifest {Manifest}, generator v{GeneratorVersion}, phases [{string.Join(", ", Phases)}], world v{WorldVersion} seed \"{WorldSeed}\", "
+        + $"{Cities.Length} cities, {Airports} airports, {WaterPolygons} water polygons, {Warnings.Length} warnings, {MemoryText}";
+}
+
 /// <summary>Data-source health from status() / the status_changed signal (contract 3.5). Unknown states count as degraded.</summary>
 public sealed class StreamerStatus
 {
@@ -46,6 +103,8 @@ public sealed class StreamerStatus
     public string Message = "";
     public int FailedFetches;
     public string LastError = "";
+    /// <summary>The terrain is active in this configuration (api 1.6; false on an older library, see <see cref="WorldStreamerFacade.HasTerrainActiveFlag"/>).</summary>
+    public bool TerrainActive;
 
     public bool IsOk => State == "ok";
 
@@ -56,6 +115,7 @@ public sealed class StreamerStatus
         if (d.TryGetValue(WorldStreamerFacade.KMessage, out var m)) st.Message = m.AsString();
         if (d.TryGetValue(WorldStreamerFacade.KFailedFetches, out var f)) st.FailedFetches = (int)f.AsInt64();
         if (d.TryGetValue(WorldStreamerFacade.KLastError, out var e)) st.LastError = e.AsString();
+        if (d.TryGetValue(WorldStreamerFacade.KTerrainActive, out var ta)) st.TerrainActive = ta.AsBool();
         return st;
     }
 
@@ -75,6 +135,20 @@ public sealed class ConfigureResult
 public sealed class StreamerStats
 {
     public const int Rings = 4;
+    /// <summary>Capacity of the terrain per-ring arrays (the library sends one entry per terrain.bands item, 5 by default).</summary>
+    public const int TerrainRingsMax = 8;
+    /// <summary>True while the library reports the terrain layer (debug_stats terrain_* keys, api 1.5).</summary>
+    public bool HasTerrain;
+    /// <summary>Entries the library sent for the terrain arrays (= number of terrain rings).</summary>
+    public int TerrainRings;
+    public readonly int[] TerrainQueued = new int[TerrainRingsMax];
+    public readonly int[] TerrainFetching = new int[TerrainRingsMax];
+    public readonly int[] TerrainMeshing = new int[TerrainRingsMax];
+    public readonly int[] TerrainLoaded = new int[TerrainRingsMax];
+    /// <summary>Triangles (surface + skirts) of every terrain tile the host holds, from the library.</summary>
+    public long TerrainTris;
+    /// <summary>The set_terrain_detail scale in effect.</summary>
+    public double TerrainDetail = 1.0;
     public readonly int[] Queued = new int[Rings];
     public readonly int[] Fetching = new int[Rings];
     public readonly int[] Meshing = new int[Rings];
@@ -83,6 +157,37 @@ public sealed class StreamerStats
     public double OriginLat;
     public double OriginLon;
     public string Version = "?";
+    /// <summary>debug_stats()["latency"] (api 1.3): one entry per stage that has samples, in library order. Empty on older libraries.</summary>
+    public readonly List<LatencyStage> Latency = new();
+
+    /// <summary>The latency table as text, one line per stage: "name  R0 p50/p95/max ms (n) | R1 ...". Empty without data.</summary>
+    public string LatencyText()
+    {
+        var sb = new System.Text.StringBuilder();
+        foreach (var st in Latency)
+        {
+            sb.Append(st.Name.PadRight(10));
+            for (int r = 0; r < Rings; r++)
+            {
+                sb.Append(" | R").Append(r).Append(' ');
+                if (st.N[r] == 0) { sb.Append('-'); continue; }
+                sb.Append(st.P50[r].ToString("0")).Append('/').Append(st.P95[r].ToString("0")).Append('/').Append(st.Max[r].ToString("0"))
+                  .Append(" (").Append(st.N[r]).Append(')');
+            }
+            sb.Append('\n');
+        }
+        return sb.ToString();
+    }
+}
+
+/// <summary>One stage of debug_stats()["latency"]: milliseconds by ring over the library's last fresh deliveries.</summary>
+public sealed class LatencyStage
+{
+    public string Name = "";
+    public readonly float[] P50 = new float[StreamerStats.Rings];
+    public readonly float[] P95 = new float[StreamerStats.Rings];
+    public readonly float[] Max = new float[StreamerStats.Rings];
+    public readonly int[] N = new int[StreamerStats.Rings];
 }
 
 /// <summary>
@@ -95,20 +200,20 @@ public sealed class WorldStreamerFacade
 {
     public const string ClassNameText = "WorldStreamer";
 
-    /// <summary>Contract major this facade is written against (docs/contract.md). A different library major is never called into.</summary>
-    public const int ExpectedApiMajor = 0;
-    /// <summary>Lowest contract minor the facade fully supports. Below it, the features in <see cref="FeatureMinors"/> may be missing.</summary>
-    public const int MinApiMinor = 5;
-    /// <summary>Highest contract minor this facade knows (0.6 configure_world / world_profile, 0.7 host API). A library above it gets one info line.</summary>
+    /// <summary>Contract major this facade is written against (docs/contract.md). A different library major is never called into.
+    /// 1.0 is the first breaking change (wall UV in window units, profile ids 6 and 7); every 0.x library is refused.</summary>
+    public const int ExpectedApiMajor = 1;
+    /// <summary>Lowest contract minor of <see cref="ExpectedApiMajor"/> the facade fully supports. 1.0 contains every feature of 0.5-0.7
+    /// (poll_fades, ground_height_at, debug_tiles, configure_world / world_profile, the host API), so nothing is probed.</summary>
+    public const int MinApiMinor = 0;
+    /// <summary>Highest contract minor this facade knows. A library above it gets one info line.</summary>
     public const int LatestKnownMinor = 7;
-
-    /// <summary>Facade features that need a minor above the baseline, with the api minor that introduces each (docs/contract.md).</summary>
-    private static readonly (string Feature, string Method, int Minor)[] FeatureMinors =
-    {
-        ("HasPollFades (dithered LOD fades)", "poll_fades", 5),
-        ("HasGroundHeight (height above ground)", "ground_height_at", 5),
-        ("HasDebugTiles (tile rects in the overlay)", "debug_tiles", 5),
-    };
+    /// <summary>First contract minor of <see cref="ExpectedApiMajor"/> with the terrain layer (layers option, "t/" keys, set_terrain_detail).</summary>
+    public const int TerrainMinApiMinor = 5;
+    /// <summary>First contract minor with the <c>terrain_center</c> option and the status key <c>terrain_active</c> (api 1.6).</summary>
+    public const int TerrainCenterMinApiMinor = 6;
+    /// <summary>First contract minor with the world seed phase S1: <c>seed_world</c> option, <c>airports()</c>, <c>seed_world_info()</c>, airport light keys (api 1.7).</summary>
+    public const int SeedWorldMinApiMinor = 7;
 
     private static readonly StringName ClassNameSn = new(ClassNameText);
     private static readonly StringName MConfigure = new("configure");
@@ -120,6 +225,7 @@ public sealed class WorldStreamerFacade
     private static readonly StringName MDebugStats = new("debug_stats");
     private static readonly StringName MDebugTiles = new("debug_tiles");
     private static readonly StringName MGroundHeightAt = new("ground_height_at");
+    private static readonly StringName MSetTerrainDetail = new("set_terrain_detail");
 
     private static readonly StringName MConfigureWorld = new("configure_world");
     private static readonly StringName MWorldProfile = new("world_profile");
@@ -128,6 +234,8 @@ public sealed class WorldStreamerFacade
     private static readonly StringName MLocalToGeodetic = new("local_to_geodetic");
     private static readonly StringName MAttributions = new("attributions");
     private static readonly StringName MStatus = new("status");
+    private static readonly StringName MAirports = new("airports");
+    private static readonly StringName MSeedWorldInfo = new("seed_world_info");
     private static readonly StringName MShutdown = new("shutdown");
     private static readonly StringName SigOriginShifted = new("origin_shifted");
     private static readonly StringName SigStatusChanged = new("status_changed");
@@ -139,10 +247,27 @@ public sealed class WorldStreamerFacade
     private static readonly StringName KOptOriginLon = new("origin_lon");
     private static readonly StringName KOptTileUrl = new("tile_url");
     private static readonly StringName KOptCacheDir = new("cache_dir");
+    private static readonly StringName KOptLayers = new("layers");
+    private static readonly StringName KLayer = new("layer");
+    private static readonly StringName KTerrain = new("terrain");
+    private static readonly StringName KHMin = new("h_min");
+    private static readonly StringName KHMax = new("h_max");
+    private static readonly StringName KTerrainQueued = new("terrain_queued");
+    private static readonly StringName KTerrainFetching = new("terrain_fetching");
+    private static readonly StringName KTerrainMeshing = new("terrain_meshing");
+    private static readonly StringName KTerrainLoaded = new("terrain_loaded");
+    private static readonly StringName KTerrainTris = new("terrain_tris");
+    private static readonly StringName KTerrainDetail = new("terrain_detail");
     internal static readonly StringName KState = new("state");
     internal static readonly StringName KMessage = new("message");
     internal static readonly StringName KFailedFetches = new("failed_fetches");
     internal static readonly StringName KLastError = new("last_error");
+    internal static readonly StringName KTerrainActive = new("terrain_active");
+    private static readonly StringName KOptTerrainCenter = new("terrain_center");
+    private static readonly StringName KOptSeedWorld = new("seed_world");
+    private static readonly StringName KAirportLights = new("airport_lights");
+    private static readonly StringName KAirportLightColors = new("airport_light_colors");
+    private static readonly StringName KSource = new("source");
 
     private static readonly StringName KKey = new("key");
     private static readonly StringName KOrigin = new("origin");
@@ -150,6 +275,10 @@ public sealed class WorldStreamerFacade
     private static readonly StringName KGround = new("ground");
     private static readonly StringName KLights = new("lights");
     private static readonly StringName KLightColors = new("light_colors");
+    private static readonly StringName KStreetLights = new("street_lights");
+    private static readonly StringName KStreetLightColors = new("street_light_colors");
+    private static readonly StringName KBeaconLights = new("beacon_lights");
+    private static readonly StringName KBeaconLightColors = new("beacon_light_colors");
     private static readonly StringName KRing = new("ring");
     private static readonly StringName KMin = new("min");
     private static readonly StringName KMax = new("max");
@@ -161,6 +290,7 @@ public sealed class WorldStreamerFacade
     private static readonly StringName KOriginLat = new("origin_lat");
     private static readonly StringName KOriginLon = new("origin_lon");
     private static readonly StringName KVersion = new("version");
+    private static readonly StringName KLatency = new("latency");
     private static readonly StringName MApiVersion = new("api_version");
     private static readonly StringName KApiMajor = new("api_major");
     private static readonly StringName KApiMinor = new("api_minor");
@@ -183,7 +313,7 @@ public sealed class WorldStreamerFacade
     public int ApiMajor { get; private set; }
     /// <summary>Contract minor of the loaded library; meaningful only when <see cref="ApiVersionKnown"/>.</summary>
     public int ApiMinor { get; private set; }
-    /// <summary>False for a library that predates api_version (feature probing by method name stays in effect).</summary>
+    /// <summary>False for a library that predates api_version (such a library is refused: it is a 0.x library).</summary>
     public bool ApiVersionKnown { get; private set; }
     /// <summary>One-line description of the resolved version for the startup log.</summary>
     public string ApiVersionText => ApiVersionKnown ? $"{ApiMajor}.{ApiMinor}" : "unknown (library predates api_version)";
@@ -191,13 +321,13 @@ public sealed class WorldStreamerFacade
     /// <summary>Known version that satisfies <see cref="MinApiMinor"/>: the facade features are guaranteed, no probing.</summary>
     private bool VersionGuaranteesFeatures => ApiVersionKnown && ApiMajor == ExpectedApiMajor && ApiMinor >= MinApiMinor;
 
-    /// <summary>Known library version at least 0.<paramref name="minor"/> (never true while the version is unknown or the major differs).</summary>
-    private bool AtLeast(int minor) => ApiVersionKnown && ApiMajor == ExpectedApiMajor && ApiMinor >= minor;
+    /// <summary>Known library of the expected major (never true while the version is unknown or the major differs).</summary>
+    private bool KnownCompatible => ApiVersionKnown && ApiMajor == ExpectedApiMajor;
 
-    /// <summary>configure_world(), world_profile() available (api 0.6+).</summary>
-    public bool HasConfigureWorld => IsAvailable && AtLeast(6);
-    /// <summary>Geodetic input and conversions, signals, attributions, status, shutdown available (api 0.7+).</summary>
-    public bool HasHostApi => IsAvailable && AtLeast(7);
+    /// <summary>configure_world(), world_profile() available (part of api 1.0, introduced in 0.6).</summary>
+    public bool HasConfigureWorld => IsAvailable && KnownCompatible;
+    /// <summary>Geodetic input and conversions, signals, attributions, status, shutdown available (part of api 1.0, introduced in 0.7).</summary>
+    public bool HasHostApi => IsAvailable && KnownCompatible;
 
     /// <summary>The library's origin_shifted signal (api 0.7+), raised during UpdateCamera/UpdateCameraGeodetic. It does not consume TakeOriginShift().</summary>
     public event System.Action<Vector3>? OriginShifted;
@@ -264,8 +394,8 @@ public sealed class WorldStreamerFacade
 
     /// <summary>
     /// Reads the library's contract version once (api_version(), else debug_stats api_major/api_minor, else unknown)
-    /// and applies the policy: major mismatch = unavailable, low minor = warning naming the missing features,
-    /// unknown = one warning and method probing as before, higher minor = one info line.
+    /// and applies the policy: unknown version or a different major (every 0.x library) = unavailable with an error naming the fix,
+    /// a higher minor = one info line.
     /// </summary>
     private void CheckApiVersion()
     {
@@ -298,29 +428,27 @@ public sealed class WorldStreamerFacade
 
         if (!ApiVersionKnown)
         {
-            GD.PushWarning($"[WorldStreamerFacade] the Rust library predates api_version; expected contract {ExpectedApiMajor}.{MinApiMinor}+. "
-                + "Falling back to probing methods by name (poll_fades, ground_height_at, debug_tiles). Rebuild ../rust.");
-            return;
-        }
-
-        if (ApiMajor != ExpectedApiMajor)
-        {
-            Error = $"Rust library api {ApiMajor}.{ApiMinor} has a different major than this facade expects ({ExpectedApiMajor}.x): "
-                + "the contract is breaking across majors, so the library is not used. Update the C# facade or rebuild ../rust at a matching version.";
+            Error = $"the Rust library predates api_version (a 0.x library); this facade needs contract {ExpectedApiMajor}.{MinApiMinor}+ (wall UV in window units). "
+                + "Rebuild ../rust (cargo build) so the library matches the addon.";
             GD.PushError("[WorldStreamerFacade] " + Error);
             node.Free();
             _node = null;
             return;
         }
 
-        if (ApiMinor < MinApiMinor)
+        if (ApiMajor != ExpectedApiMajor)
         {
-            var missing = new System.Text.StringBuilder();
-            foreach (var f in FeatureMinors)
-                if (ApiMinor < f.Minor) missing.Append("\n  - ").Append(f.Feature).Append(": needs ").Append(f.Method).Append(" (api ").Append(ExpectedApiMajor).Append('.').Append(f.Minor).Append(')');
-            GD.PushWarning($"[WorldStreamerFacade] Rust library api {ApiMajor}.{ApiMinor} is older than the required {ExpectedApiMajor}.{MinApiMinor}. Missing facade features:{missing}\n"
-                + "These stay off (probed by method name). Rebuild ../rust.");
+            var hint = ApiMajor < ExpectedApiMajor
+                ? "This is an old library (wall UV in meters, profile ids 0-4): rebuild ../rust (cargo build) or update the addon's bin/ libraries to api 1.0+."
+                : "The library is newer than this addon: update the addon (addons/simworld) to match.";
+            Error = $"Rust library api {ApiMajor}.{ApiMinor} has a different major than this facade expects ({ExpectedApiMajor}.x): "
+                + "the contract is breaking across majors, so the library is not used. " + hint;
+            GD.PushError("[WorldStreamerFacade] " + Error);
+            node.Free();
+            _node = null;
+            return;
         }
+
         if (ApiMinor > LatestKnownMinor)
         {
             GD.Print($"[WorldStreamerFacade] Rust library api {ApiMajor}.{ApiMinor} is newer than the facade's {ExpectedApiMajor}.{LatestKnownMinor}; additive changes only, fine.");
@@ -363,6 +491,40 @@ public sealed class WorldStreamerFacade
             [KOptTileUrl] = tileUrl,
             [KOptCacheDir] = cacheDir,
         };
+
+    /// <summary>
+    /// Adds the host opt-in <c>layers</c> option (api 1.4+): <c>["world", "terrain"]</c> when <paramref name="terrain"/>, else nothing is
+    /// added (the library's default is <c>["world"]</c>, exactly the pre-terrain behaviour). The terrain is active only together with the
+    /// profile key <c>terrain.enabled</c>; passing the layer means "I draw terrain tiles".
+    /// </summary>
+    public static void AddLayers(Dictionary options, bool terrain)
+    {
+        if (terrain) options[KOptLayers] = new string[] { "world", "terrain" };
+        else options.Remove(KOptLayers);
+    }
+
+    /// <summary>Sets (or removes) the <c>terrain_center</c> option [lat, lon] (api 1.6): the centre of the terrain's flat zone, kept across reconfigures.</summary>
+    public static void AddTerrainCenter(Dictionary options, bool set, double lat, double lon)
+    {
+        if (set) options[KOptTerrainCenter] = new double[] { lat, lon };
+        else options.Remove(KOptTerrainCenter);
+    }
+
+    /// <summary>True when the library has <c>terrain_center</c> and <c>status()["terrain_active"]</c> (api 1.6+).</summary>
+    public bool HasTerrainActiveFlag => IsAvailable && KnownCompatible && ApiMinor >= TerrainCenterMinApiMinor;
+
+    /// <summary>True when the library has the terrain layer (api 1.5+): the <c>layers</c> option, "t/" keys and set_terrain_detail.</summary>
+    public bool HasTerrainLayer => IsAvailable && KnownCompatible && ApiMinor >= TerrainMinApiMinor;
+
+    /// <summary>True when the library has the world seed phase S1 (api 1.7): <c>seed_world</c>, <c>airports()</c>, <c>seed_world_info()</c>.</summary>
+    public bool HasSeedWorld => IsAvailable && KnownCompatible && ApiMinor >= SeedWorldMinApiMinor;
+
+    /// <summary>Sets (or removes, for an empty path) the <c>seed_world</c> option (api 1.7): the path of a world.json (<c>res://</c>, <c>user://</c> or an OS path).</summary>
+    public static void AddSeedWorld(Dictionary options, string path)
+    {
+        if (path.Length > 0) options[KOptSeedWorld] = path;
+        else options.Remove(KOptSeedWorld);
+    }
 
     /// <summary>world_profile() (api 0.6+): the resolved world profile (defaults before a configure with a profile). Empty when unavailable.</summary>
     public Dictionary WorldProfile()
@@ -428,6 +590,93 @@ public sealed class WorldStreamerFacade
         _node!.Call(MShutdown);
     }
 
+    // ---- world seed (api 1.7) ---------------------------------------------
+
+    private static readonly AirportInfo[] NoAirports = System.Array.Empty<AirportInfo>();
+
+    /// <summary>
+    /// airports() (api 1.7): the seed world's airports sorted by ident, positions in the CURRENT local frame (call again after an origin shift).
+    /// Empty without a seed world, on an older library or when unavailable. Allocates (parses a few hundred light points): call it on
+    /// configure and on origin shifts, not every frame.
+    /// </summary>
+    public AirportInfo[] Airports()
+    {
+        if (!HasSeedWorld) return NoAirports;
+        var v = _node!.Call(MAirports);
+        if (v.VariantType != Variant.Type.Array) return NoAirports;
+        var arr = v.AsGodotArray();
+        var list = new List<AirportInfo>(arr.Count);
+        foreach (var item in arr)
+        {
+            if (item.VariantType != Variant.Type.Dictionary) continue;
+            var d = item.AsGodotDictionary();
+            var runways = new List<RunwayInfo>();
+            if (d.TryGetValue("runways", out var rv) && rv.VariantType == Variant.Type.Array)
+                foreach (var r in rv.AsGodotArray())
+                    if (r.VariantType == Variant.Type.Dictionary) runways.Add(ParseRunway(r.AsGodotDictionary()));
+            list.Add(new AirportInfo(Str(d, "ident"), Str(d, "name"), Str(d, "type"), Num(d, "lat"), Num(d, "lon"), Vec(d, "position"),
+                d.TryGetValue("elevation_ft", out var el) && (el.VariantType == Variant.Type.Float || el.VariantType == Variant.Type.Int) ? el.AsDouble() : null,
+                runways.ToArray()));
+        }
+        return list.ToArray();
+    }
+
+    private static RunwayInfo ParseRunway(Dictionary d)
+    {
+        return new RunwayInfo(Str(d, "designator"), ParseEnd(d, "le"), ParseEnd(d, "he"), Num(d, "length_m"), Num(d, "width_m"), Str(d, "surface"),
+            Bool(d, "paved"), Bool(d, "lighted"), Bool(d, "approximate"),
+            d.TryGetValue("lights", out var l) && l.VariantType == Variant.Type.PackedVector3Array ? l.AsVector3Array() : System.Array.Empty<Vector3>(),
+            d.TryGetValue("light_colors", out var c) && c.VariantType == Variant.Type.PackedColorArray ? c.AsColorArray() : System.Array.Empty<Color>());
+    }
+
+    private static RunwayEnd ParseEnd(Dictionary runway, string key)
+    {
+        var e = runway.TryGetValue(key, out var v) && v.VariantType == Variant.Type.Dictionary ? v.AsGodotDictionary() : new Dictionary();
+        return new RunwayEnd(Str(e, "ident"), Num(e, "lat"), Num(e, "lon"), Vec(e, "position"), Num(e, "threshold_lat"), Num(e, "threshold_lon"),
+            Vec(e, "threshold_position"), Num(e, "displaced_threshold_m"), Vec(e, "touchdown_position"), Num(e, "heading_deg"));
+    }
+
+    private static string Str(Dictionary d, string k) => d.TryGetValue(k, out var v) && v.VariantType == Variant.Type.String ? v.AsString() : "";
+    private static double Num(Dictionary d, string k) => d.TryGetValue(k, out var v) && (v.VariantType == Variant.Type.Float || v.VariantType == Variant.Type.Int) ? v.AsDouble() : 0.0;
+    private static bool Bool(Dictionary d, string k) => d.TryGetValue(k, out var v) && v.VariantType == Variant.Type.Bool && v.AsBool();
+    private static Vector3 Vec(Dictionary d, string k) => d.TryGetValue(k, out var v) && v.VariantType == Variant.Type.Vector3 ? v.AsVector3() : Vector3.Zero;
+    private static string[] Strs(Dictionary d, string k) => d.TryGetValue(k, out var v)
+        ? v.VariantType == Variant.Type.PackedStringArray ? v.AsStringArray()
+        : v.VariantType == Variant.Type.Array ? System.Linq.Enumerable.ToArray(System.Linq.Enumerable.Select(v.AsGodotArray(), x => x.AsString()))
+        : System.Array.Empty<string>()
+        : System.Array.Empty<string>();
+
+    /// <summary>
+    /// seed_world_info() (api 1.7): generator version, built phases, cities, counts, load-time warnings, memory. Null without a seed world
+    /// (empty dictionary), on an older library or when unavailable.
+    /// </summary>
+    public SeedWorldInfo? SeedInfo()
+    {
+        if (!HasSeedWorld) return null;
+        var v = _node!.Call(MSeedWorldInfo);
+        if (v.VariantType != Variant.Type.Dictionary) return null;
+        var d = v.AsGodotDictionary();
+        if (d.Count == 0) return null;
+        var cities = new List<SeedCityInfo>();
+        if (d.TryGetValue("cities", out var cv) && cv.VariantType == Variant.Type.Array)
+            foreach (var c in cv.AsGodotArray())
+            {
+                if (c.VariantType != Variant.Type.Dictionary) continue;
+                var cd = c.AsGodotDictionary();
+                cities.Add(new SeedCityInfo(Str(cd, "id"), Str(cd, "name"), Num(cd, "lat"), Num(cd, "lon"), Num(cd, "radius_km"), (int)Num(cd, "version"), Str(cd, "source"), Strs(cd, "airports")));
+            }
+        string mem = "";
+        double loadMs = 0;
+        if (d.TryGetValue("memory", out var mv) && mv.VariantType == Variant.Type.Dictionary)
+        {
+            var md = mv.AsGodotDictionary();
+            loadMs = Num(md, "load_ms");
+            mem = $"water index {Num(md, "water_index_mb"):0.##} MB + rasters {Num(md, "water_raster_mb"):0.##} MB, strips {Num(md, "strip_index_kb"):0.#} KB, airports {Num(md, "airports_kb"):0.#} KB, load {loadMs:0} ms";
+        }
+        return new SeedWorldInfo(Str(d, "manifest"), (int)Num(d, "generator_version"), Strs(d, "phases"), (int)Num(d, "world_version"), Str(d, "world_seed"),
+            cities.ToArray(), (int)Num(d, "airports"), (int)Num(d, "water_polygons"), Strs(d, "warnings"), mem, loadMs);
+    }
+
     public void UpdateCamera(Vector3 localPos, Vector3 velocity, double altAglM)
     {
         if (!IsAvailable) return;
@@ -448,12 +697,40 @@ public sealed class WorldStreamerFacade
         tile = default;
         if (!d.TryGetValue(KKey, out var k)) return false;
         tile.Key = k.AsString();
+        tile.IsTerrain = d.TryGetValue(KLayer, out var layer) && layer.VariantType == Variant.Type.String && layer.AsString() == "terrain";
+        if (tile.IsTerrain)
+        {
+            // Terrain entries (api 1.5) carry only the terrain mesh; every vector key is empty.
+            if (d.TryGetValue(KRing, out var tr)) tile.Ring = (int)tr.AsInt64();
+            if (d.TryGetValue(KOrigin, out var to)) tile.Origin = to.AsVector3();
+            tile.Terrain = d.TryGetValue(KTerrain, out var tm) ? AsMeshArrays(tm) : null;
+            if (d.TryGetValue(KHMin, out var h0)) tile.HMin = (float)h0.AsDouble();
+            if (d.TryGetValue(KHMax, out var h1)) tile.HMax = (float)h1.AsDouble();
+            tile.Lights = System.Array.Empty<Vector3>();
+            tile.LightColors = System.Array.Empty<Color>();
+            tile.AirportLights = System.Array.Empty<Vector3>();
+            tile.AirportLightColors = System.Array.Empty<Color>();
+            return true;
+        }
         if (d.TryGetValue(KRing, out var r)) tile.Ring = (int)r.AsInt64();
         if (d.TryGetValue(KOrigin, out var o)) tile.Origin = o.AsVector3();
         tile.Lights = d.TryGetValue(KLights, out var l) && l.VariantType == Variant.Type.PackedVector3Array
             ? l.AsVector3Array() : System.Array.Empty<Vector3>();
         tile.LightColors = d.TryGetValue(KLightColors, out var c) && c.VariantType == Variant.Type.PackedColorArray
             ? c.AsColorArray() : System.Array.Empty<Color>();
+        tile.StreetLights = d.TryGetValue(KStreetLights, out var sl) && sl.VariantType == Variant.Type.PackedVector3Array
+            ? sl.AsVector3Array() : System.Array.Empty<Vector3>();
+        tile.StreetLightColors = d.TryGetValue(KStreetLightColors, out var sc) && sc.VariantType == Variant.Type.PackedColorArray
+            ? sc.AsColorArray() : System.Array.Empty<Color>();
+        tile.BeaconLights = d.TryGetValue(KBeaconLights, out var bl) && bl.VariantType == Variant.Type.PackedVector3Array
+            ? bl.AsVector3Array() : System.Array.Empty<Vector3>();
+        tile.BeaconLightColors = d.TryGetValue(KBeaconLightColors, out var bc) && bc.VariantType == Variant.Type.PackedColorArray
+            ? bc.AsColorArray() : System.Array.Empty<Color>();
+
+        tile.AirportLights = d.TryGetValue(KAirportLights, out var al) && al.VariantType == Variant.Type.PackedVector3Array
+            ? al.AsVector3Array() : System.Array.Empty<Vector3>();
+        tile.AirportLightColors = d.TryGetValue(KAirportLightColors, out var ac) && ac.VariantType == Variant.Type.PackedColorArray
+            ? ac.AsColorArray() : System.Array.Empty<Color>();
 
         tile.Mesh = d.TryGetValue(KMesh, out var m) ? AsMeshArrays(m) : null;
         tile.HasGroundKey = d.TryGetValue(KGround, out var g);
@@ -491,6 +768,22 @@ public sealed class WorldStreamerFacade
         if (!IsAvailable || !HasGroundHeight) return 0.0;
         var v = _node!.Call(MGroundHeightAt, localX, localZ);
         return v.VariantType == Variant.Type.Float ? v.AsDouble() : 0.0;
+    }
+
+    private bool? _hasSetTerrainDetail;
+
+    /// <summary>
+    /// set_terrain_detail(scale) (api 1.5): multiplies every terrain band's max_error_m by the scale (clamped by the library to
+    /// [0.25, terrain.detail_scale_max]); held terrain tiles are re-meshed and re-delivered under the same keys, nothing is unloaded.
+    /// Returns the scale in effect, or NaN when the library lacks the method (older than api 1.5) or is unavailable.
+    /// </summary>
+    public double SetTerrainDetail(double scale)
+    {
+        if (!IsAvailable) return double.NaN;
+        _hasSetTerrainDetail ??= ClassDB.ClassHasMethod(ClassNameSn, MSetTerrainDetail);
+        if (!_hasSetTerrainDetail.Value) return double.NaN;
+        var v = _node!.Call(MSetTerrainDetail, scale);
+        return v.VariantType == Variant.Type.Float ? v.AsDouble() : double.NaN;
     }
 
     private bool? _hasPollFades;
@@ -550,7 +843,53 @@ public sealed class WorldStreamerFacade
         if (d.TryGetValue(KOriginLat, out var la)) into.OriginLat = la.AsDouble();
         if (d.TryGetValue(KOriginLon, out var lo)) into.OriginLon = lo.AsDouble();
         if (d.TryGetValue(KVersion, out var ver)) into.Version = ver.AsString();
+        ReadLatency(d, into.Latency);
+        into.HasTerrain = d.ContainsKey(KTerrainLoaded);
+        System.Array.Clear(into.TerrainQueued); System.Array.Clear(into.TerrainFetching);
+        System.Array.Clear(into.TerrainMeshing); System.Array.Clear(into.TerrainLoaded);
+        into.TerrainRings = 0;
+        into.TerrainTris = 0;
+        if (into.HasTerrain)
+        {
+            ReadRing(d, KTerrainQueued, into.TerrainQueued);
+            ReadRing(d, KTerrainFetching, into.TerrainFetching);
+            ReadRing(d, KTerrainMeshing, into.TerrainMeshing);
+            ReadRing(d, KTerrainLoaded, into.TerrainLoaded);
+            if (d[KTerrainLoaded].VariantType == Variant.Type.PackedInt32Array) into.TerrainRings = System.Math.Min(d[KTerrainLoaded].AsInt32Array().Length, StreamerStats.TerrainRingsMax);
+            if (d.TryGetValue(KTerrainTris, out var tt)) into.TerrainTris = tt.AsInt64();
+            if (d.TryGetValue(KTerrainDetail, out var td)) into.TerrainDetail = td.AsDouble();
+        }
         return true;
+    }
+
+    private static void ReadLatency(Dictionary d, List<LatencyStage> dst)
+    {
+        dst.Clear();
+        if (!d.TryGetValue(KLatency, out var lv) || lv.VariantType != Variant.Type.Dictionary) return;
+        foreach (var kv in lv.AsGodotDictionary())
+        {
+            if (kv.Value.VariantType != Variant.Type.Dictionary) continue;
+            var sd = kv.Value.AsGodotDictionary();
+            var st = new LatencyStage { Name = kv.Key.AsString() };
+            Floats(sd, "p50", st.P50);
+            Floats(sd, "p95", st.P95);
+            Floats(sd, "max", st.Max);
+            if (sd.TryGetValue("n", out var n) && n.VariantType == Variant.Type.PackedInt32Array)
+            {
+                var src = n.AsInt32Array();
+                System.Array.Copy(src, st.N, System.Math.Min(src.Length, st.N.Length));
+            }
+            bool any = false;
+            foreach (var c in st.N) any |= c > 0;
+            if (any) dst.Add(st);
+        }
+    }
+
+    private static void Floats(Dictionary d, string key, float[] dst)
+    {
+        if (!d.TryGetValue(key, out var v) || v.VariantType != Variant.Type.PackedFloat32Array) return;
+        var src = v.AsFloat32Array();
+        System.Array.Copy(src, dst, System.Math.Min(src.Length, dst.Length));
     }
 
     private static void ReadRing(Dictionary d, StringName key, int[] dst)
@@ -587,16 +926,17 @@ public sealed class WorldStreamerFacade
         var arr = v.AsGodotArray<Dictionary>();
         foreach (var d in arr)
         {
-            var t = new DebugTile { State = TileState.Unknown, Key = "" };
+            var t = new DebugTile { State = TileState.Unknown, Key = "", Source = "" };
             if (d.TryGetValue(KKey, out var key))
             {
                 t.Key = key.AsString();
-                if (!TileKey.TryParse(t.Key, out t.Packed)) t.Packed = 0;
+                if (!TileKey.TryParse(t.Key, out t.Packed, out t.Terrain)) t.Packed = 0;
             }
             if (d.TryGetValue(KRing, out var r)) t.Ring = (int)r.AsInt64();
             if (d.TryGetValue(KState, out var st)) t.State = ParseState(st.AsString());
             if (d.TryGetValue(KMin, out var mn)) t.Min = mn.AsVector2();
             if (d.TryGetValue(KMax, out var mx)) t.Max = mx.AsVector2();
+            if (d.TryGetValue(KSource, out var src)) t.Source = src.AsString();
             into.Add(t);
         }
         return into.Count;

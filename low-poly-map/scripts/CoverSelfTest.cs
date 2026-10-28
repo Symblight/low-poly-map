@@ -9,7 +9,9 @@ namespace LowPolyMap;
 /// Launch arg <c>--cover-selftest</c>: simulates a Rust side that obeys the delivery guarantees (refine = 4 children
 /// delivered as a group, parent unloaded only after all 4 children, coarsen = parent re-delivered before its children
 /// are unloaded), with random interleaving, and runs <see cref="TileCover.Verify"/> after every atomic step.
-/// Uses a private TilePool/TileCover, so the live scene is untouched. Prints PASS/FAIL.
+/// Uses a private TilePool/TileCover, so the live scene is untouched. Prints PASS/FAIL. Runs the same simulation twice: on the vector
+/// layer (z13..z16, <see cref="TilePool"/>) and on the terrain layer (api 1.5, z10..z14, five rings, <see cref="TerrainPool"/>), each with its own
+/// <see cref="TileCover"/> and its own root zoom for the sibling rule.
 /// </summary>
 public static class CoverSelfTest
 {
@@ -32,8 +34,23 @@ public static class CoverSelfTest
     {
         var container = new Node3D { Name = "CoverSelfTest" };
         host.AddChild(container);
-        var pool = new TilePool(container);
-        var cover = new TileCover();
+        bool ok = true;
+        {
+            var pool = new TilePool(container);
+            ok &= RunLayer("vector z13..z16", 13, 16, 4660, 2600, (k, ring) => pool.Acquire(TileKey.ToText(k), k, ring), n => pool.Release(n), () => (pool.FreeCount, pool.TotalCreated));
+        }
+        {
+            var pool = new TerrainPool(container);
+            ok &= RunLayer("terrain z10..z14", 10, 14, 583, 325, (k, ring) => pool.Acquire(TileKey.ToTerrainText(k), k, ring), n => pool.Release((TerrainNodes)n), () => (pool.FreeCount, pool.TotalCreated));
+        }
+        container.QueueFree();
+        return ok;
+    }
+
+    private static bool RunLayer(string name, int rootZ, int leafZ, int baseX, int baseY,
+        System.Func<long, int, TileNodes> acquire, System.Action<TileNodes> release, System.Func<(int Free, int Created)> poolState)
+    {
+        var cover = new TileCover(rootZ, leafZ);
         var rng = new RandomNumberGenerator { Seed = 12345 };
         var leaves = new HashSet<long>();      // tiles currently part of the (settled) cover
         var ops = new List<Op>();              // in-flight refine / coarsen operations
@@ -54,14 +71,14 @@ public static class CoverSelfTest
                 replaced++;
                 return;
             }
-            var n = pool.Acquire(TileKey.ToText(k), k, TileKey.RingOf(TileKey.Z(k)));
+            var n = acquire(k, leafZ - TileKey.Z(k));
             n.Root.Position = Vector3.Zero;
             cover.Add(n);
         }
         void Unload(long k)
         {
             var n = cover.Remove(k);
-            if (n != null) pool.Release(n);
+            if (n != null) release(n);
         }
         void Check(string what)
         {
@@ -72,15 +89,15 @@ public static class CoverSelfTest
             if (e > 0)
             {
                 errors += e;
-                GD.PushError($"[CoverSelfTest] after {what}: {e} problem(s)\n{report}");
+                GD.PushError($"[CoverSelfTest] {name} after {what}: {e} problem(s)\n{report}");
             }
             foreach (var t in cover.All) visSeen[(int)t.Vis] = true;
             if (cover.Loaded > maxLoaded) maxLoaded = cover.Loaded;
         }
 
-        // Settled start: a 3x3 block of z13 roots delivered in random order (z13 is visible alone).
+        // Settled start: a 3x3 block of root-zoom tiles delivered in random order (the root zoom is visible alone).
         var roots = new List<long>();
-        for (int dx = 0; dx < 3; dx++) for (int dy = 0; dy < 3; dy++) roots.Add(TileKey.Pack(13, 4660 + dx, 2600 + dy));
+        for (int dx = 0; dx < 3; dx++) for (int dy = 0; dy < 3; dy++) roots.Add(TileKey.Pack(rootZ, baseX + dx, baseY + dy));
         while (roots.Count > 0)
         {
             int i = (int)(rng.Randi() % (uint)roots.Count);
@@ -97,12 +114,12 @@ public static class CoverSelfTest
                 var list = new List<long>(leaves);
                 long k = list[(int)(rng.Randi() % (uint)list.Count)];
                 bool tryRefine = rng.Randf() < 0.55f;
-                if (tryRefine && TileKey.Z(k) < TileKey.LeafZ && !busy.Contains(k))
+                if (tryRefine && TileKey.Z(k) < leafZ && !busy.Contains(k))
                 {
                     busy.Add(k); ops.Add(new Op { Tile = k, Refine = true });
-                    pending.Add(TileKey.Ancestor(k, TileKey.RootZ));
+                    pending.Add(TileKey.Ancestor(k, rootZ));
                 }
-                else if (!tryRefine && TileKey.Z(k) > TileKey.RootZ)
+                else if (!tryRefine && TileKey.Z(k) > rootZ)
                 {
                     long p = TileKey.Parent(k);
                     bool allLeaves = true;
@@ -112,7 +129,7 @@ public static class CoverSelfTest
                         busy.Add(p);
                         for (int q = 0; q < 4; q++) busy.Add(TileKey.Child(p, q));
                         ops.Add(new Op { Tile = p, Refine = false });
-                        pending.Add(TileKey.Ancestor(p, TileKey.RootZ));
+                        pending.Add(TileKey.Ancestor(p, rootZ));
                     }
                 }
             }
@@ -136,7 +153,7 @@ public static class CoverSelfTest
                     Check("refine unload parent " + TileKey.ToText(t));
                 }
                 op.Step++;
-                if (op.Step > 4) { ops.Remove(op); busy.Remove(t); pending.Remove(TileKey.Ancestor(t, TileKey.RootZ)); RecomputePending(pending, ops); }
+                if (op.Step > 4) { ops.Remove(op); busy.Remove(t); pending.Remove(TileKey.Ancestor(t, rootZ)); RecomputePending(pending, ops, rootZ); }
             }
             else
             {
@@ -156,7 +173,7 @@ public static class CoverSelfTest
                 {
                     for (int q = 0; q < 4; q++) { leaves.Remove(TileKey.Child(t, q)); busy.Remove(TileKey.Child(t, q)); }
                     leaves.Add(t);
-                    ops.Remove(op); busy.Remove(t); RecomputePending(pending, ops);
+                    ops.Remove(op); busy.Remove(t); RecomputePending(pending, ops, rootZ);
                 }
             }
         }
@@ -165,20 +182,20 @@ public static class CoverSelfTest
         var all = new List<long>();
         foreach (var t in cover.All) all.Add(t.Packed);
         foreach (long k in all) Unload(k);
-        bool poolOk = pool.FreeCount == pool.TotalCreated && cover.Loaded == 0
+        var (poolFree, poolCreated) = poolState();
+        bool poolOk = poolFree == poolCreated && cover.Loaded == 0
             && cover.HiddenByChildren == 0 && cover.WaitingSiblings == 0 && cover.TrianglesLoaded == 0;
-        if (!poolOk) { errors++; GD.PushError($"[CoverSelfTest] drain: pool free {pool.FreeCount}/{pool.TotalCreated}, loaded {cover.Loaded}, counters {cover.HiddenByChildren}/{cover.WaitingSiblings}"); }
+        if (!poolOk) { errors++; GD.PushError($"[CoverSelfTest] {name} drain: pool free {poolFree}/{poolCreated}, loaded {cover.Loaded}, counters {cover.HiddenByChildren}/{cover.WaitingSiblings}"); }
 
         bool allStates = visSeen[0] && visSeen[1] && visSeen[2];
-        GD.Print($"[CoverSelfTest] {(errors == 0 && allStates ? "PASS" : "FAIL")}: {steps} verified steps, {errors} errors, max {maxLoaded} tiles loaded, "
-            + $"{replaced} in-place re-uploads, pool created {pool.TotalCreated}, states seen visible/hiddenByChildren/waiting = {visSeen[0]}/{visSeen[1]}/{visSeen[2]}");
-        container.QueueFree();
+        GD.Print($"[CoverSelfTest] {name} {(errors == 0 && allStates ? "PASS" : "FAIL")}: {steps} verified steps, {errors} errors, max {maxLoaded} tiles loaded, "
+            + $"{replaced} in-place re-uploads, pool created {poolCreated}, states seen visible/hiddenByChildren/waiting = {visSeen[0]}/{visSeen[1]}/{visSeen[2]}");
         return errors == 0 && allStates;
     }
 
-    private static void RecomputePending(HashSet<long> pending, List<Op> ops)
+    private static void RecomputePending(HashSet<long> pending, List<Op> ops, int rootZ)
     {
         pending.Clear();
-        foreach (var o in ops) pending.Add(TileKey.Ancestor(o.Tile, TileKey.RootZ));
+        foreach (var o in ops) pending.Add(TileKey.Ancestor(o.Tile, rootZ));
     }
 }

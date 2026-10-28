@@ -16,7 +16,7 @@ public interface IWorldCameraSource
     Vector3 Velocity { get; }
     /// <summary>Height above the ground in meters (position y minus the terrain height last reported to <see cref="SetGroundHeight"/>).</summary>
     double AltitudeAgl { get; }
-    /// <summary>The library's terrain height under the camera (ground_height_at; 0 until a DEM exists). Called every frame before the update.</summary>
+    /// <summary>The library's terrain height under the camera (ground_height_at; 0 unless the terrain layer is active). Called every frame before the update.</summary>
     void SetGroundHeight(double groundY);
     /// <summary>
     /// The origin moved: subtract <paramref name="shift"/> from the position (and from anything else attached to the source). Called in

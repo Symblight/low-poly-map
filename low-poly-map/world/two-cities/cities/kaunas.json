@@ -1,0 +1,23 @@
+{
+  "id": "kaunas",
+  "name": "Kaunas",
+  "version": 1,
+  "center": { "lat": 54.8985, "lon": 23.9036 },
+  "radius_km": 6.0,
+  "layout": { "type": "old_center_hex", "cell_size_m": 800 },
+  "max_height_m": 90,
+  "density": 0.6,
+  "airports": ["EYKA"],
+  "districts": [
+    { "type": "old_town", "cells": 2 },
+    { "type": "port", "cells": 1, "near": "water" },
+    { "type": "residential", "share": 0.35 },
+    { "type": "park", "share": 0.08, "near": "water" }
+  ],
+  "fill": { "type": "residential", "style": "houses" },
+  "landmarks": [
+    { "id": "cathedral", "name": "Kaunas Cathedral", "model": "res://world/landmarks/kaunas_cathedral.glb",
+      "lat": 54.8977, "lon": 23.8862, "heading_deg": 12, "footprint_m": [86, 32], "height_m": 46,
+      "clear_m": 15, "ground": "park", "kind": "cathedral", "in_real": "skip" }
+  ]
+}

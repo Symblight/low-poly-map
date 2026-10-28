@@ -1,0 +1,117 @@
+[gd_scene load_steps=16 format=3]
+
+[ext_resource type="Script" path="res://addons/simworld/runtime/WorldView.cs" id="1_bridge"]
+[ext_resource type="Script" path="res://scripts/FreeFlyCamera.cs" id="2_cam"]
+[ext_resource type="Script" path="res://scripts/DebugOverlay.cs" id="3_overlay"]
+[ext_resource type="Script" path="res://scripts/NightRenderController.cs" id="4_night"]
+[ext_resource type="Script" path="res://scripts/TimeOfDay.cs" id="5_tod"]
+[ext_resource type="Script" path="res://scripts/DaylightMenu.cs" id="6_daymenu"]
+[ext_resource type="Shader" path="res://shaders/fallback_ground.gdshader" id="7_fallback"]
+[ext_resource type="Script" path="res://scripts/GeodeticFlightTest.cs" id="8_geotest"]
+[ext_resource type="Script" path="res://scripts/SettingsMenu.cs" id="9_settings"]
+[ext_resource type="Script" path="res://scripts/BenchArgs.cs" id="10_args"]
+
+[sub_resource type="PlaneMesh" id="PlaneMesh_ground"]
+size = Vector2(80000, 80000)
+subdivide_width = 127
+subdivide_depth = 127
+
+[sub_resource type="ShaderMaterial" id="Mat_ground"]
+shader = ExtResource("7_fallback")
+shader_parameter/albedo_color = Color(0.18, 0.22, 0.17, 1)
+shader_parameter/roughness_value = 1.0
+
+[sub_resource type="ProceduralSkyMaterial" id="Sky_mat"]
+
+[sub_resource type="Sky" id="Sky_1"]
+sky_material = SubResource("Sky_mat")
+
+[sub_resource type="Environment" id="Env_1"]
+background_mode = 2
+sky = SubResource("Sky_1")
+ambient_light_source = 3
+ambient_light_color = Color(0.5, 0.55, 0.65, 1)
+ambient_light_energy = 0.6
+fog_enabled = true
+fog_mode = 1
+fog_light_color = Color(0.65, 0.68, 0.74, 1)
+fog_sky_affect = 0.0
+fog_depth_begin = 4000.0
+fog_depth_end = 26000.0
+fog_depth_curve = 1.6
+
+[node name="SeedTwoCities" type="Node3D"]
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="." node_paths=PackedStringArray("Bridge", "Camera", "Sun")]
+environment = SubResource("Env_1")
+script = ExtResource("4_night")
+Bridge = NodePath("../WorldView")
+Camera = NodePath("../FreeFlyCamera")
+Sun = NodePath("../Sun")
+
+[node name="Sun" type="DirectionalLight3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 0.7071, 0.7071, 0, -0.7071, 0.7071, 0, 100, 0)
+shadow_enabled = true
+directional_shadow_mode = 1
+directional_shadow_max_distance = 700.0
+
+[node name="Ground" type="MeshInstance3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.3, 0)
+mesh = SubResource("PlaneMesh_ground")
+cast_shadow = 0
+surface_material_override/0 = SubResource("Mat_ground")
+
+[node name="FreeFlyCamera" type="Camera3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 0.9659, 0.2588, 0, -0.2588, 0.9659, 0, 120, 200)
+near = 0.5
+far = 30000.0
+script = ExtResource("2_cam")
+Speed = 40.0
+
+[node name="WorldView" type="Node3D" parent="." node_paths=PackedStringArray("Camera")]
+script = ExtResource("1_bridge")
+OriginLat = 54.6872
+OriginLon = 25.2797
+TileUrl = ""
+SeedWorld = "res://world/two-cities/world.json"
+CacheDir = ""
+Camera = NodePath("../FreeFlyCamera")
+AutoStart = false
+
+[node name="BenchArgs" type="Node" parent="." node_paths=PackedStringArray("View")]
+script = ExtResource("10_args")
+View = NodePath("../WorldView")
+
+[node name="GeodeticFlightTest" type="Node" parent="." node_paths=PackedStringArray("Bridge", "Camera")]
+script = ExtResource("8_geotest")
+Bridge = NodePath("../WorldView")
+Camera = NodePath("../FreeFlyCamera")
+
+[node name="TimeOfDay" type="Node" parent="." node_paths=PackedStringArray("Bridge", "Sun")]
+script = ExtResource("5_tod")
+Bridge = NodePath("../WorldView")
+Sun = NodePath("../Sun")
+
+[node name="HUD" type="CanvasLayer" parent="."]
+
+[node name="DebugOverlay" type="Control" parent="HUD" node_paths=PackedStringArray("Bridge", "Camera", "Render")]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+script = ExtResource("3_overlay")
+Bridge = NodePath("../../WorldView")
+Camera = NodePath("../../FreeFlyCamera")
+Render = NodePath("../../WorldEnvironment")
+
+[node name="DaylightMenu" type="PanelContainer" parent="HUD" node_paths=PackedStringArray("Clock")]
+script = ExtResource("6_daymenu")
+Clock = NodePath("../../TimeOfDay")
+
+[node name="SettingsMenu" type="PanelContainer" parent="HUD" node_paths=PackedStringArray("Bridge", "Camera")]
+script = ExtResource("9_settings")
+Bridge = NodePath("../../WorldView")
+Camera = NodePath("../../FreeFlyCamera")

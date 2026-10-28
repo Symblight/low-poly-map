@@ -105,6 +105,18 @@ These tasks slot into the spike's "Night" milestone (milestone 6).
 - Today the sibling-swap rule hides a parent the moment all 4 children are present, and `poll_unload` removes it in the same frame. A fade needs both visible at once, which changes contract guarantee 3 and the Godot visibility rule.
 - The scene camera uses far = 32 km and the light sprites fade out at 25 km; the spec says far 30 km.
 
+## Review 2026-10-28: iPhone risks
+
+Open findings from the review of the built fades and night windows. None blocks desktop work; items 1-3 need a device (or Xcode GPU tools) before they can be closed.
+
+| # | Problem | Why it matters | What to do |
+|---|---------|----------------|------------|
+| 1 | The `LOD_DITHER` variant does `discard` | On Apple TBDR GPUs a shader with `discard` turns off hidden surface removal for that draw call. The plain building / ground shader has no discard (`lod_dither.gdshaderinc` is compiled in only while a tile has a `poll_fades` entry below 1), so the cost appears exactly during LOD swaps, and on iPhone, not on the Mac | **Cap built (2026-10-28):** profile `fades.max_active` (default 4) limits the swaps fading at once, vector and terrain layer together (one swap = a coarse tile + its 4 children, i.e. up to 5 dithered meshes per mesh kind). A swap past the cap completes at once without a fade (`docs/contract.md` section 6); waiting was rejected because the uncapped test flight peaks at 15 concurrent swaps, so a queue would grow without bound at 250 m/s. Test flight with cap 4: 72 of 303 swaps (24 %) pop instead of fading. **Still open:** measure on the device, and judge the pops by eye at 250 m/s (`--set=fades.max_active=N` to compare) |
+| 2 | Draw calls grow with the sprite sets | Every tile draws one MultiMesh per sprite set (building lights, street lamps, beacons, airport lights, street light pools). `lights.min_ring` 2 -> 1 alone added +27 draw calls (one light MultiMesh per R1 tile). With the 300 draw-call budget and many R3 tiles this reaches the ceiling quickly | Merge the sprites into one MultiMesh per parent tile, or one per layer for R3 |
+| 3 | The frame-time criterion is not measured | Windows acceptance 5 (≤ 0.3 ms) and the "≤ 1 ms GPU" criterion above drown in ±1 ms noise on a shared Mac, and Metal gives no GPU timestamps through `RenderingServer` | Xcode GPU Frame Capture or Instruments on a fixed scene (`--cam-alt` / `--cam-pitch` / `--cam-xz`, fixed `--time`); on the iPhone as soon as the export exists |
+
+Item 4 of the review (window seed collisions) is in [spec-night-windows.md](spec-night-windows.md), "Review 2026-10-28".
+
 ## Sources
 
 - [GTA V Graphics Study, Part 1: Dissecting a Frame](https://www.adriancourreges.com/blog/2015/11/02/gta-v-graphics-study/)

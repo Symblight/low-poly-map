@@ -1,4 +1,6 @@
-//! Geodesy and tile math. Pure f64, no Godot types.
+//! Geodesy and tile math. Pure f64, no Godot types. Transcendentals go through [`crate::math`]
+//! (pure-Rust `libm`), so tile pixels and ENU positions are bit-identical on every platform
+//! (`docs/spec-world-seed.md` section 7, decided in S0).
 //!
 //! * Web Mercator z/x/y (slippy map) tile math.
 //! * WGS84 lat/lon <-> local ENU (east, north) meters around a fixed world frame origin
@@ -8,6 +10,8 @@
 //!   it never rotates the frame, so already-uploaded tiles stay valid after a shift).
 
 use std::fmt;
+
+use crate::math;
 
 /// WGS84 semi-major axis (m).
 pub const WGS84_A: f64 = 6_378_137.0;
@@ -93,7 +97,7 @@ pub fn lon_to_tile_x(lon: f64, z: u8) -> f64 {
 /// Fractional tile y for a latitude (y grows southwards).
 pub fn lat_to_tile_y(lat: f64, z: u8) -> f64 {
     let lat = lat.clamp(-MERCATOR_MAX_LAT, MERCATOR_MAX_LAT).to_radians();
-    (1.0 - (lat.tan() + 1.0 / lat.cos()).ln() / std::f64::consts::PI) / 2.0 * tiles_at(z)
+    (1.0 - math::ln(math::tan(lat) + 1.0 / math::cos(lat)) / std::f64::consts::PI) / 2.0 * tiles_at(z)
 }
 
 pub fn tile_x_to_lon(x: f64, z: u8) -> f64 {
@@ -102,12 +106,12 @@ pub fn tile_x_to_lon(x: f64, z: u8) -> f64 {
 
 pub fn tile_y_to_lat(y: f64, z: u8) -> f64 {
     let n = std::f64::consts::PI * (1.0 - 2.0 * y / tiles_at(z));
-    n.sinh().atan().to_degrees()
+    math::atan(math::sinh(n)).to_degrees()
 }
 
 /// Ground width (m) of one tile at `lat` and zoom `z`.
 pub fn tile_width_m(lat: f64, z: u8) -> f64 {
-    MERCATOR_CIRCUMFERENCE * lat.to_radians().cos() / tiles_at(z)
+    MERCATOR_CIRCUMFERENCE * math::cos(lat.to_radians()) / tiles_at(z)
 }
 
 /// Tile containing a point.
@@ -116,21 +120,6 @@ pub fn tile_for(lat: f64, lon: f64, z: u8) -> TileKey {
     let x = (lon_to_tile_x(lon, z).floor() as i64).clamp(0, max) as u32;
     let y = (lat_to_tile_y(lat, z).floor() as i64).clamp(0, max) as u32;
     TileKey::new(z, x, y)
-}
-
-// ---------------------------------------------------------------------------------------
-// Terrain hook
-// ---------------------------------------------------------------------------------------
-
-/// Terrain height (m above the ENU ground plane) at a WGS84 point: THE single elevation
-/// function of the crate. Building bases, ground-mesh vertices, light points, the slant-distance
-/// query and `WorldStreamer.ground_height_at` all go through it, so a later DEM spike only swaps
-/// this body. Flat (0) for now. Must stay cheap, pure and deterministic (called per vertex on
-/// worker threads and per tile on the main thread).
-#[inline]
-pub fn ground_height(lat: f64, lon: f64) -> f64 {
-    let _ = (lat, lon);
-    0.0
 }
 
 // ---------------------------------------------------------------------------------------
@@ -168,22 +157,22 @@ pub struct Frame {
 }
 
 fn geodetic_to_ecef(lat: f64, lon: f64, h: f64) -> [f64; 3] {
-    let (sl, cl) = lat.to_radians().sin_cos();
-    let (so, co) = lon.to_radians().sin_cos();
+    let (sl, cl) = math::sin_cos(lat.to_radians());
+    let (so, co) = math::sin_cos(lon.to_radians());
     let n = WGS84_A / (1.0 - e2() * sl * sl).sqrt();
     [(n + h) * cl * co, (n + h) * cl * so, (n * (1.0 - e2()) + h) * sl]
 }
 
 fn ecef_to_geodetic(p: [f64; 3]) -> (f64, f64) {
-    let lon = p[1].atan2(p[0]);
-    let r = p[0].hypot(p[1]);
+    let lon = math::atan2(p[1], p[0]);
+    let r = math::hypot(p[0], p[1]);
     let e2 = e2();
-    let mut lat = p[2].atan2(r * (1.0 - e2));
+    let mut lat = math::atan2(p[2], r * (1.0 - e2));
     for _ in 0..6 {
-        let s = lat.sin();
+        let s = math::sin(lat);
         let n = WGS84_A / (1.0 - e2 * s * s).sqrt();
-        let h = r / lat.cos() - n;
-        lat = p[2].atan2(r * (1.0 - e2 * n / (n + h)));
+        let h = r / math::cos(lat) - n;
+        lat = math::atan2(p[2], r * (1.0 - e2 * n / (n + h)));
     }
     (lat.to_degrees(), lon.to_degrees())
 }
@@ -191,8 +180,8 @@ fn ecef_to_geodetic(p: [f64; 3]) -> (f64, f64) {
 impl Frame {
     pub fn new(lat0: f64, lon0: f64) -> Self {
         let lat0 = lat0.clamp(-MERCATOR_MAX_LAT, MERCATOR_MAX_LAT);
-        let (sin_lat, cos_lat) = lat0.to_radians().sin_cos();
-        let (sin_lon, cos_lon) = lon0.to_radians().sin_cos();
+        let (sin_lat, cos_lat) = math::sin_cos(lat0.to_radians());
+        let (sin_lon, cos_lon) = math::sin_cos(lon0.to_radians());
         Self {
             lat0,
             lon0,
@@ -358,12 +347,6 @@ mod tests {
         assert!(north[1] > 1100.0 && north[0].abs() < 1.0);
         let east = f.enu(VILNIUS.0, VILNIUS.1 + 0.01);
         assert!(east[0] > 600.0 && east[1].abs() < 1.0);
-    }
-
-    #[test]
-    fn terrain_hook_is_flat_for_now() {
-        assert_eq!(ground_height(VILNIUS.0, VILNIUS.1), 0.0);
-        assert_eq!(ground_height(-33.9, 151.2), 0.0);
     }
 
     #[test]

@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://simworld.local/seed/city.schema.json",
+  "title": "SimWorld seed city file (cities/<id>.json)",
+  "description": "One synthetic city (docs/spec-world-seed.md section 4.2): what is where; the profile's seed.styles say how a style looks. Cross-key rules (exactly one of cells / share, rings within the city's ring count, real url xor path, landmark footprint forms) are checked by the loader after this schema.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "center", "radius_km", "layout", "districts", "fill"],
+  "$defs": {
+    "district_type": { "description": "District type.", "type": "string", "enum": ["old_town", "business", "residential", "industrial", "port", "park"] },
+    "near_feature": { "description": "Feature a district wants to be near.", "type": "string", "enum": ["water", "coast", "river", "airport"] },
+    "height": { "description": "Maximum building height, meters.", "type": "number", "minimum": 3, "maximum": 1000 },
+    "density": { "description": "Built footprint share of a block, 0..1.", "type": "number", "minimum": 0, "maximum": 1 },
+    "lit": { "description": "Street lighting share, 0..1 (default per type).", "type": "number", "minimum": 0, "maximum": 1 },
+    "style": { "description": "Street style of the type (section 6.2; default per type): organic, grid, microdistrict, houses, quay, paths.", "type": "string", "enum": ["organic", "grid", "microdistrict", "houses", "quay", "paths"] }
+  },
+  "properties": {
+    "id": { "description": "Stable id, unique in the manifest; part of the city seed (renaming re-rolls the city).", "type": "string", "pattern": "^[a-z0-9_-]+$" },
+    "name": { "description": "Display name.", "type": "string" },
+    "version": { "description": "The author's version of this city; logged.", "type": "integer", "minimum": 0, "maximum": 2147483647 },
+    "variant": { "description": "Part of the city seed: another number = another city with the same description (default 0).", "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
+    "center": {
+      "description": "City centre (old town / ring 0).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lat", "lon"],
+      "properties": {
+        "lat": { "description": "Latitude, degrees.", "type": "number", "minimum": -85, "maximum": 85 },
+        "lon": { "description": "Longitude, degrees.", "type": "number", "minimum": -180, "maximum": 180 }
+      }
+    },
+    "radius_km": { "description": "Footprint radius, km.", "type": "number", "minimum": 0.5, "maximum": 30 },
+    "layout": {
+      "description": "City layout.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "cell_size_m"],
+      "properties": {
+        "type": { "description": "Layout type: old_center_hex, grid (v1); radial, linear (later).", "type": "string", "enum": ["old_center_hex", "grid", "radial", "linear"] },
+        "cell_size_m": { "description": "Hex cell size (centre to centre), meters: the district grain.", "type": "number", "minimum": 300, "maximum": 2000 },
+        "rotation_deg": { "description": "Hex grid rotation, degrees; null = from the city seed.", "type": ["number", "null"], "minimum": -360, "maximum": 360 }
+      }
+    },
+    "max_height_m": { "$ref": "#/$defs/height" },
+    "density": { "$ref": "#/$defs/density" },
+    "airports": { "description": "Airport idents linked to the city (access road, near: airport). Each must exist in the airport file.", "type": "array", "items": { "description": "Ident.", "type": "string", "pattern": "^[A-Za-z0-9_-]+$" } },
+    "districts": {
+      "description": "District placement requests in priority order (section 5.3).",
+      "type": "array",
+      "items": {
+        "description": "One request: exactly one of cells / share.",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type"],
+        "properties": {
+          "type": { "$ref": "#/$defs/district_type" },
+          "style": { "$ref": "#/$defs/style" },
+          "cells": { "description": "Number of cells.", "type": "integer", "minimum": 1, "maximum": 100000 },
+          "share": { "description": "Share of the city's land cells (rounded, at least 1).", "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+          "rings": {
+            "description": "[min, max] ring, inclusive; ring 0 = centre cell.",
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "items": { "description": "Ring.", "type": "integer", "minimum": 0, "maximum": 1000 }
+          },
+          "near": {
+            "description": "Feature (or any of several) the cells must be near.",
+            "anyOf": [
+              { "$ref": "#/$defs/near_feature" },
+              { "description": "Any of these.", "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/near_feature" } }
+            ]
+          },
+          "max_height_m": { "$ref": "#/$defs/height" },
+          "density": { "$ref": "#/$defs/density" },
+          "landmarks": { "description": "Landmark buildings (old town default 1).", "type": "integer", "minimum": 0, "maximum": 100 },
+          "lit": { "$ref": "#/$defs/lit" }
+        }
+      }
+    },
+    "fill": {
+      "description": "District for every land cell no request took.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": { "$ref": "#/$defs/district_type" },
+        "style": { "$ref": "#/$defs/style" },
+        "max_height_m": { "$ref": "#/$defs/height" },
+        "density": { "$ref": "#/$defs/density" },
+        "lit": { "$ref": "#/$defs/lit" }
+      }
+    },
+    "real": {
+      "description": "Real-data source (section 8): exactly one of url (http(s)://...pmtiles) or path (local file, not res://).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "url": { "description": "PMTiles URL.", "type": "string" },
+        "path": { "description": "Local PMTiles file (OS path or user://).", "type": "string" }
+      }
+    },
+    "edits": { "description": "Author edits file (section 8a); absent = the pristine city.", "type": "string", "minLength": 1 },
+    "landmarks": {
+      "description": "Author-made landmark models (section 6.7).",
+      "type": "array",
+      "items": {
+        "description": "One landmark: exactly one of footprint_m / footprint.",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "model", "lat", "lon", "height_m"],
+        "properties": {
+          "id": { "description": "Id, unique in the city.", "type": "string", "pattern": "^[a-z0-9_-]+$" },
+          "name": { "description": "Display name.", "type": "string" },
+          "model": { "description": "res:// path of a .glb, .gltf, .tscn or .scn.", "type": "string" },
+          "lat": { "description": "Latitude of the footprint centre.", "type": "number", "minimum": -85, "maximum": 85 },
+          "lon": { "description": "Longitude of the footprint centre.", "type": "number", "minimum": -180, "maximum": 180 },
+          "heading_deg": { "description": "Heading, degrees clockwise from north.", "type": "number", "minimum": -360, "maximum": 360 },
+          "footprint_m": {
+            "description": "[width, depth] rectangle, centred, rotated by heading_deg.",
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "items": { "description": "Meters.", "type": "number", "exclusiveMinimum": 0, "maximum": 5000 }
+          },
+          "footprint": { "description": "Footprint as a lon/lat ring.", "type": "array", "minItems": 3, "items": { "$ref": "water.schema.json#/$defs/point" } },
+          "height_m": { "description": "Height of the far stand-in, meters.", "type": "number", "exclusiveMinimum": 0, "maximum": 1000 },
+          "clear_m": { "description": "Generated buildings are cleared within the footprint grown by this, meters.", "type": "number", "minimum": 0, "maximum": 1000 },
+          "ground": { "description": "Ground under the landmark.", "type": "string", "enum": ["park", "none"] },
+          "kind": { "description": "Building kind of the stand-in (resolves to the landmark light profile; default tower).", "type": "string" },
+          "in_real": { "description": "With the city's real source active: skip (hide) or replace (drop real buildings under it).", "type": "string", "enum": ["skip", "replace"] }
+        }
+      }
+    }
+  }
+}

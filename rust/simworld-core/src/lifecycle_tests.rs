@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::geo::TileKey;
+use crate::rings::LayerKey;
 use crate::status::{StatusState, MSG_NOT_CONFIGURED, MSG_OFFLINE, MSG_SHUT_DOWN};
 use crate::world::{World, WorldOptions};
 
@@ -40,15 +41,15 @@ fn with_cache(url: &str, dir: &std::path::Path) -> WorldOptions {
 
 /// Fly a static camera at 300 m AGL until `want` tiles were delivered (or 20 s). Returns the
 /// keys held by the host (delivered minus unloaded) and every (key, origin) delivered.
-fn run_until(w: &mut World, want: usize) -> (BTreeSet<TileKey>, Vec<(TileKey, [f64; 3])>) {
+fn run_until(w: &mut World, want: usize) -> (BTreeSet<LayerKey>, Vec<(LayerKey, [f64; 3])>) {
     let mut held = BTreeSet::new();
     let mut delivered = Vec::new();
     let t0 = Instant::now();
     while delivered.len() < want && t0.elapsed() < Duration::from_secs(20) {
         w.update_camera([0.0, 300.0, 0.0], [0.0; 3], 300.0);
         w.pop_ready(64, |t| {
-            held.insert(t.key);
-            delivered.push((t.key, t.origin));
+            held.insert(t.layer_key());
+            delivered.push((t.layer_key(), t.origin));
         });
         let _ = w.drain_fades();
         for k in w.drain_unload() {
@@ -181,7 +182,7 @@ fn teleport_unloads_every_delivered_tile_and_streams_the_new_origin() {
     // Teleport to Kaunas (~90 km away).
     let kaunas = (54.8985, 23.9036);
     assert!(w.configure_world(synthetic(kaunas.0, kaunas.1)).ok);
-    let unloaded: BTreeSet<TileKey> = w.drain_unload().iter().copied().collect();
+    let unloaded: BTreeSet<LayerKey> = w.drain_unload().iter().copied().collect();
     assert_eq!(unloaded, held, "every key the host holds is unloaded");
     assert!(w.drain_unload().is_empty(), "only once");
     assert_eq!(w.take_origin_shift(), [0.0; 3]);
@@ -260,7 +261,7 @@ fn shutdown_makes_the_world_inert_until_configured_again() {
     assert!(w.shutdown());
     assert!(!w.is_running());
     // Tiles the host holds are reported once, then everything is empty.
-    let unloaded: BTreeSet<TileKey> = w.drain_unload().iter().copied().collect();
+    let unloaded: BTreeSet<LayerKey> = w.drain_unload().iter().copied().collect();
     assert_eq!(unloaded, held);
     assert_eq!(w.update_camera([9000.0, 0.0, 0.0], [0.0; 3], 300.0), None);
     assert_eq!(w.update_camera_geodetic(VILNIUS.0, VILNIUS.1, 300.0, [0.0; 3]), Ok(None));
@@ -442,4 +443,416 @@ fn min_height_override_changes_delivered_meshes() {
     assert!(!w.configure_world(WorldOptions { profile_overrides: Some(bad), ..synthetic(VILNIUS.0, VILNIUS.1) }).ok);
     let out_of_range = serde_json::json!({ "buildings": { "r1": { "min_height_m": 501.0 } } });
     assert!(!w.configure_world(WorldOptions { profile_overrides: Some(out_of_range), ..synthetic(VILNIUS.0, VILNIUS.1) }).ok);
+}
+
+// ---- Terrain layer (api 1.5) ------------------------------------------------------------
+
+/// A small terrain layer for World-level tests (zooms 13..14, 7 km reach) with real TINs.
+fn small_terrain(enabled: bool) -> serde_json::Value {
+    serde_json::json!({ "terrain": { "enabled": enabled, "near_zoom": 14, "far_zoom": 13, "bands": [
+        { "edge_m": 2500.0, "max_error_m": 0.5, "max_edge_m": 0.0, "max_triangles": 4096 },
+        { "edge_m": 7000.0, "max_error_m": 1.5, "max_edge_m": 0.0, "max_triangles": 4096 } ] } })
+}
+
+fn terrain_opts(lat: f64, lon: f64, layers: Option<&[&str]>, enabled: bool) -> WorldOptions {
+    WorldOptions {
+        profile_overrides: Some(small_terrain(enabled)),
+        layers: layers.map(|l| l.iter().map(|s| s.to_string()).collect()),
+        ..synthetic(lat, lon)
+    }
+}
+
+/// Host side of one frame in contract order at a static camera (300 m AGL over the origin).
+#[derive(Default)]
+struct Host {
+    held: BTreeSet<LayerKey>,
+    /// Every delivery: (key, already held = re-delivery).
+    deliveries: Vec<(LayerKey, bool)>,
+    unloads: Vec<LayerKey>,
+    fades: Vec<LayerKey>,
+}
+
+impl Host {
+    fn frame(&mut self, w: &mut World) {
+        w.update_camera([0.0, 300.0, 0.0], [0.0; 3], 300.0);
+        let (held, deliveries) = (&mut self.held, &mut self.deliveries);
+        w.pop_ready(4, |t| {
+            let k = t.layer_key();
+            assert_eq!(LayerKey::parse(&k.to_string()), Some(k));
+            match t.layer {
+                crate::rings::LayerKind::Terrain => {
+                    assert!(k.to_string().starts_with("t/"), "{k}");
+                    assert!(t.ring < 2 && t.key.z == 14 - t.ring as u8, "{k}: ring {}", t.ring);
+                    assert!(!t.terrain.is_empty() && t.terrain.normals.is_empty());
+                    assert!(t.mesh.is_empty() && t.ground.is_empty() && t.lights.is_empty() && t.street_lights.is_empty());
+                    assert!(t.h_min <= t.h_max && t.origin[1] == 0.0);
+                }
+                crate::rings::LayerKind::World => {
+                    assert!(t.terrain.is_empty() && !k.to_string().starts_with("t/"));
+                }
+            }
+            deliveries.push((k, !held.insert(k)));
+        });
+        self.fades.extend(w.drain_fades().iter().map(|f| f.0));
+        for k in w.drain_unload() {
+            self.held.remove(k);
+            self.unloads.push(*k);
+        }
+    }
+
+    /// `t/` keys seen in deliveries, unloads and fades.
+    fn terrain_keys(&self) -> usize {
+        let t = |k: &LayerKey| k.layer == crate::rings::LayerKind::Terrain;
+        self.deliveries.iter().filter(|(k, _)| t(k)).count()
+            + self.unloads.iter().filter(|k| t(k)).count()
+            + self.fades.iter().filter(|k| t(k)).count()
+    }
+
+    /// Run until the terrain layer is idle (nothing queued or meshing, no terrain fade and no
+    /// terrain delivery for 40 frames) or 30 s.
+    fn settle_terrain(&mut self, w: &mut World) {
+        let t0 = Instant::now();
+        let mut quiet = 0;
+        while quiet < 40 && t0.elapsed() < Duration::from_secs(30) {
+            let (nd, nf) = (self.deliveries.len(), self.fades.len());
+            self.frame(w);
+            let st = w.stats();
+            let busy = st.terrain_queued.iter().chain(&st.terrain_meshing).any(|&n| n > 0)
+                || self.deliveries[nd..].iter().any(|(k, _)| k.layer == crate::rings::LayerKind::Terrain)
+                || self.fades[nf..].iter().any(|k| k.layer == crate::rings::LayerKind::Terrain);
+            quiet = if busy { 0 } else { quiet + 1 };
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(quiet >= 40, "terrain layer did not settle");
+    }
+}
+
+/// Opt-in: without the host layer (or with the profile off) no `t/` key appears anywhere; with
+/// both, terrain tiles stream with `t/` keys next to the vector world, and a teleport unloads
+/// both layers.
+#[test]
+fn terrain_layer_needs_the_opt_in_and_teleport_unloads_both_layers() {
+    for (layers, enabled) in [(None, true), (Some(&["world", "terrain"][..]), false), (Some(&["world"][..]), true)] {
+        let mut w = world();
+        assert!(w.configure_world(terrain_opts(VILNIUS.0, VILNIUS.1, layers, enabled)).ok);
+        let mut h = Host::default();
+        for _ in 0..150 {
+            h.frame(&mut w);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!h.deliveries.is_empty(), "the vector world streams");
+        assert_eq!(h.terrain_keys(), 0, "{layers:?} / enabled {enabled}: a t/ key reached the host");
+        let mut n = 0;
+        w.debug_tiles(|k, _, _, _| n += (k.layer == crate::rings::LayerKind::Terrain) as usize);
+        assert_eq!(n, 0);
+        assert!(!w.terrain_layer_active() && w.stats().terrain_rings == 0 && w.terrain_cpu().is_none());
+    }
+    let mut w = world();
+    assert!(w.configure_world(terrain_opts(VILNIUS.0, VILNIUS.1, Some(&["world", "terrain"]), true)).ok);
+    assert!(w.terrain_layer_active());
+    let mut h = Host::default();
+    let t0 = Instant::now();
+    while h.held.iter().filter(|k| k.layer == crate::rings::LayerKind::Terrain).count() < 20 && t0.elapsed() < Duration::from_secs(30) {
+        h.frame(&mut w);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let held_terrain = h.held.iter().filter(|k| k.layer == crate::rings::LayerKind::Terrain).count();
+    assert!(held_terrain >= 20, "only {held_terrain} terrain tiles");
+    assert!(h.held.iter().any(|k| k.layer == crate::rings::LayerKind::World));
+    let st = w.stats();
+    assert_eq!(st.terrain_rings, 2);
+    assert!(st.terrain_loaded[..2].iter().sum::<i32>() as usize == held_terrain && st.terrain_tris > 0);
+    let mut dbg = 0;
+    w.debug_tiles(|k, ring, _, _| {
+        if k.layer == crate::rings::LayerKind::Terrain {
+            dbg += 1;
+            assert!(ring < 2);
+        }
+    });
+    assert!(dbg >= held_terrain);
+    let cpu = w.terrain_cpu().unwrap();
+    assert!(cpu.n[..2].iter().sum::<u32>() as usize >= held_terrain);
+    // Teleport: every key of both layers comes back once.
+    let held = h.held.clone();
+    assert!(w.configure_world(terrain_opts(54.8985, 23.9036, Some(&["world", "terrain"]), true)).ok);
+    let unloaded: BTreeSet<LayerKey> = w.drain_unload().iter().copied().collect();
+    assert_eq!(unloaded, held, "teleport unloads both layers");
+    assert!(w.drain_unload().is_empty());
+}
+
+/// api 1.6: `terrain_center` keeps the relief (and its flat zone) where it was across a
+/// teleport; without it the flat zone follows the new origin. `status().terrain_active`.
+#[test]
+fn terrain_center_keeps_the_relief_across_a_reconfigure_and_status_reports_the_layer() {
+    let layers = Some(&["world", "terrain"][..]);
+    let height_at = |w: &World, lat: f64, lon: f64| {
+        let p = w.geodetic_to_local(lat, lon, 0.0).unwrap();
+        w.ground_height_at(p[0], p[2])
+    };
+    let (a, b) = ((VILNIUS.0, VILNIUS.1), (VILNIUS.0 + 0.045, VILNIUS.1 + 0.07)); // ~5 km / 4.5 km away
+    let mut w = world();
+    assert!(!w.status().terrain_active, "not configured");
+    assert!(w.configure_world(terrain_opts(a.0, a.1, layers, true)).ok);
+    assert!(w.status().terrain_active);
+    let probe = [(a.0, a.1), (a.0 + 0.004, a.1 + 0.003), (b.0, b.1)];
+    let first: Vec<f64> = probe.iter().map(|p| height_at(&w, p.0, p.1)).collect();
+    // Same centre, new origin: every probe height is the same (up to the local-frame round trip).
+    let mut o = terrain_opts(b.0, b.1, layers, true);
+    o.terrain_center = Some([a.0, a.1]);
+    assert!(w.configure_world(o).ok);
+    for (p, h) in probe.iter().zip(&first) {
+        assert!((height_at(&w, p.0, p.1) - h).abs() < 1e-6, "height at {p:?} moved");
+    }
+    // No centre: the flat zone moves to the new origin, so a spot that was inside the old flat
+    // zone (probe 1, ~550 m from its centre) gets relief.
+    assert!(w.configure_world(terrain_opts(b.0, b.1, layers, true)).ok);
+    assert!((height_at(&w, probe[1].0, probe[1].1) - first[1]).abs() > 1.0, "the flat zone should have moved");
+    // Out of range or not requested.
+    let mut bad = terrain_opts(a.0, a.1, layers, true);
+    bad.terrain_center = Some([91.0, 0.0]);
+    let r = w.configure_world(bad);
+    assert!(!r.ok && r.error.contains("terrain_center"), "{}", r.error);
+    assert!(w.status().terrain_active, "a rejected configure changes nothing");
+    assert!(w.configure_world(terrain_opts(a.0, a.1, Some(&["world"]), true)).ok);
+    assert!(!w.status().terrain_active, "layer not requested: flat");
+    w.shutdown();
+    assert!(!w.status().terrain_active);
+}
+
+/// `set_terrain_detail`: clamped to [0.25, detail_scale_max]; every held terrain key is
+/// re-delivered exactly once (same keys, nothing unloaded), the vector world is untouched.
+#[test]
+fn set_terrain_detail_redelivers_each_held_terrain_key_once() {
+    let mut w = world();
+    assert_eq!(w.set_terrain_detail(0.1), 0.25);
+    assert_eq!(w.set_terrain_detail(10.0), 2.0, "the default profile's detail_scale_max");
+    assert_eq!(w.set_terrain_detail(f64::NAN), 2.0, "ignored");
+    assert_eq!(w.set_terrain_detail(1.0), 1.0);
+    assert!(w.configure_world(terrain_opts(VILNIUS.0, VILNIUS.1, Some(&["world", "terrain"]), true)).ok);
+    assert_eq!(w.set_terrain_detail(5.0), 2.0, "terrain.detail_scale_max");
+    assert_eq!(w.set_terrain_detail(1.0), 1.0);
+    let mut h = Host::default();
+    h.settle_terrain(&mut w);
+    let held: BTreeSet<LayerKey> = h.held.iter().filter(|k| k.layer == crate::rings::LayerKind::Terrain).copied().collect();
+    assert!(held.len() >= 20);
+    let (nd, nu) = (h.deliveries.len(), h.unloads.len());
+    assert_eq!(w.set_terrain_detail(2.0), 2.0);
+    h.settle_terrain(&mut w);
+    let re: Vec<(LayerKey, bool)> =
+        h.deliveries[nd..].iter().filter(|(k, _)| k.layer == crate::rings::LayerKind::Terrain).copied().collect();
+    assert!(re.iter().all(|(_, again)| *again), "only re-deliveries");
+    let keys: BTreeSet<LayerKey> = re.iter().map(|r| r.0).collect();
+    assert_eq!(keys, held, "every held terrain key");
+    assert_eq!(re.len(), held.len(), "each exactly once");
+    assert!(h.unloads[nu..].iter().all(|k| k.layer == crate::rings::LayerKind::World), "no terrain unloads");
+    assert!(h.deliveries[nd..].iter().filter(|(k, _)| k.layer == crate::rings::LayerKind::World).all(|(_, again)| !*again));
+    assert_eq!(w.terrain_detail(), 2.0);
+}
+
+#[test]
+fn cross_layer_delivery_order() {
+    use crate::world::terrain_first;
+    assert!(!terrain_first(None, None) && !terrain_first(Some((false, 1.0)), None));
+    assert!(terrain_first(None, Some((true, 9e9))));
+    // Fresh before re-deliveries, whatever the distance.
+    assert!(terrain_first(Some((true, 10.0)), Some((false, 1e6))));
+    assert!(!terrain_first(Some((false, 1e6)), Some((true, 10.0))));
+    // Then strictly by distance from the camera (no layer weight): 999 m terrain beats 1000 m
+    // world, 1001 m does not.
+    assert!(terrain_first(Some((false, 1000.0)), Some((false, 999.0))));
+    assert!(!terrain_first(Some((false, 1000.0)), Some((false, 1001.0))));
+    assert!(!terrain_first(Some((false, 1000.0)), Some((false, 1000.0))), "ties go to the vector world");
+}
+
+// ---- First-fill delivery probe ------------------------------------------------------------
+
+/// One first-fill run (static camera at local 0, 300 m AGL, 2 deliveries per frame, ~60 fps
+/// wall clock) with the vector world and, optionally, the full default terrain layer.
+struct FillProbe {
+    /// Every fresh delivery: (frame, key, horizontal distance of the tile from the camera).
+    deliveries: Vec<(usize, LayerKey, f64)>,
+    /// First frame each key appeared in `poll_fades` with a value < 1 (fading in or out).
+    faded: std::collections::BTreeMap<LayerKey, (usize, f32)>,
+    /// (frame, key) of the first delivery of the tile under the camera, per layer and zoom.
+    under: Vec<(usize, LayerKey)>,
+    frames: usize,
+}
+
+fn fill_probe(terrain: bool, frames: usize) -> FillProbe {
+    let mut w = world();
+    let opts = if terrain {
+        WorldOptions {
+            profile_overrides: Some(serde_json::json!({ "terrain": { "enabled": true } })),
+            layers: Some(vec!["world".into(), "terrain".into()]),
+            ..synthetic(VILNIUS.0, VILNIUS.1)
+        }
+    } else {
+        synthetic(VILNIUS.0, VILNIUS.1)
+    };
+    assert!(w.configure_world(opts).ok);
+    let mut p = FillProbe { deliveries: Vec::new(), faded: Default::default(), under: Vec::new(), frames };
+    let half_w = |z: u8| 40_075_016.7 * VILNIUS.0.to_radians().cos() / f64::from(1u32 << z) / 2.0;
+    for f in 0..frames {
+        let t0 = Instant::now();
+        w.update_camera([0.0, 300.0, 0.0], [0.0; 3], 300.0);
+        let (dl, under) = (&mut p.deliveries, &mut p.under);
+        w.pop_ready(2, |t| {
+            if t.layer == crate::rings::LayerKind::Terrain && t.terrain.is_empty() {
+                return;
+            }
+            let k = t.layer_key();
+            let d = t.origin[0].hypot(t.origin[2]);
+            if !dl.iter().any(|x| x.1 == k) {
+                dl.push((f, k, d));
+                let hw = half_w(t.key.z);
+                if t.origin[0].abs() <= hw && t.origin[2].abs() <= hw {
+                    under.push((f, k));
+                }
+            }
+        });
+        for &(k, v) in w.drain_fades() {
+            if v < 1.0 {
+                p.faded.entry(k).or_insert((f, v));
+            }
+        }
+        let _ = w.drain_unload();
+        std::thread::sleep(Duration::from_millis(16).saturating_sub(t0.elapsed()));
+    }
+    p
+}
+
+impl FillProbe {
+    fn first(&self, layer: crate::rings::LayerKind, z: u8) -> Option<usize> {
+        self.deliveries.iter().find(|d| d.1.layer == layer && d.1.key.z == z).map(|d| d.0)
+    }
+    fn under_at(&self, layer: crate::rings::LayerKind, z: u8) -> Option<usize> {
+        self.under.iter().find(|d| d.1.layer == layer && d.1.key.z == z).map(|d| d.0)
+    }
+    /// Longest run of frames without a terrain delivery between the first terrain delivery and
+    /// the 60th one.
+    fn terrain_gap(&self) -> usize {
+        let t: Vec<usize> =
+            self.deliveries.iter().filter(|d| d.1.layer == crate::rings::LayerKind::Terrain).map(|d| d.0).take(60).collect();
+        t.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0)
+    }
+    fn summary(&self) -> String {
+        use crate::rings::LayerKind::{Terrain, World};
+        let mut s = String::new();
+        for z in 13..=16 {
+            s += &format!("world z{z}: first {:?} under-cam {:?}\n", self.first(World, z), self.under_at(World, z));
+        }
+        for z in 10..=14 {
+            s += &format!("terrain z{z}: first {:?} under-cam {:?}\n", self.first(Terrain, z), self.under_at(Terrain, z));
+        }
+        let fresh_faded_in = self
+            .deliveries
+            .iter()
+            .filter(|d| self.faded.get(&d.1).is_some_and(|&(f, v)| f <= d.0 + 1 && v == 0.0))
+            .count();
+        s += &format!(
+            "deliveries {} in {} frames, terrain max gap (first 60) {} frames, fresh tiles that faded in from 0: {}\n",
+            self.deliveries.len(),
+            self.frames,
+            self.terrain_gap(),
+            fresh_faded_in
+        );
+        for d in self.deliveries.iter().filter(|d| std::env::var("PROBE_TERRAIN").is_err() || d.1.layer == crate::rings::LayerKind::Terrain).take(48) {
+            s += &format!("  f{:>3} {:<16} {:>7.0} m\n", d.0, d.1.to_string(), d.2);
+        }
+        s
+    }
+}
+
+/// Probe for the delivery order at a first fill (prints only): `cargo test -p simworld-core
+/// fill_probe_print -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn fill_probe_print() {
+    println!("== vector only ==\n{}", fill_probe(false, 240).summary());
+    println!("== vector + terrain ==\n{}", fill_probe(true, 360).summary());
+}
+
+/// Cover churn of one run: deliveries, unloads, keys delivered again after an unload (`again`),
+/// of those within 180 frames (`soon`), how many of the re-deliveries were coarsen swaps (the
+/// 4 children unloaded within 90 frames after), and examples of the others.
+#[derive(Debug)]
+struct Churn {
+    deliveries: usize,
+    unloads: usize,
+    again: usize,
+    soon: usize,
+    coarsen_swaps: usize,
+    other: Vec<String>,
+}
+
+fn churn_probe(terrain: bool, frames: usize, cam: impl Fn(usize) -> ([f64; 3], [f64; 3], f64)) -> Churn {
+    let mut w = world();
+    let opts = WorldOptions {
+        profile_overrides: terrain.then(|| serde_json::json!({ "terrain": { "enabled": true } })),
+        layers: terrain.then(|| vec!["world".into(), "terrain".into()]),
+        ..synthetic(VILNIUS.0, VILNIUS.1)
+    };
+    assert!(w.configure_world(opts).ok);
+    let mut unloads: Vec<(usize, LayerKey)> = Vec::new();
+    let mut last_unload: std::collections::HashMap<LayerKey, usize> = Default::default();
+    let mut again: Vec<(usize, usize, LayerKey, usize, [f64; 2], f64)> = Vec::new();
+    let mut c = Churn { deliveries: 0, unloads: 0, again: 0, soon: 0, coarsen_swaps: 0, other: Vec::new() };
+    let mut shift = [0.0f64; 3];
+    for f in 0..frames {
+        let t0 = Instant::now();
+        let (p, v, agl) = cam(f);
+        let local = [p[0] - shift[0], p[1], p[2] - shift[2]];
+        if let Some(s) = w.update_camera(local, v, agl) {
+            shift = [shift[0] + s[0], 0.0, shift[2] + s[2]];
+        }
+        let mut got = Vec::new();
+        w.pop_ready(2, |t| got.push((t.layer_key(), t.ring)));
+        for (k, ring) in got {
+            c.deliveries += 1;
+            if let Some(&u) = last_unload.get(&k) {
+                again.push((u, f, k, ring, [p[0].round(), p[2].round()], agl));
+            }
+        }
+        let _ = w.drain_fades();
+        for k in w.drain_unload() {
+            c.unloads += 1;
+            last_unload.insert(*k, f);
+            unloads.push((f, *k));
+        }
+        std::thread::sleep(Duration::from_millis(16).saturating_sub(t0.elapsed()));
+    }
+    for (u, f, k, ring, p, agl) in again {
+        c.again += 1;
+        if f - u <= 180 {
+            c.soon += 1;
+        }
+        let kids = crate::rings::children(k.key);
+        let swap = kids.iter().all(|ch| unloads.iter().any(|&(uf, uk)| uk.layer == k.layer && uk.key == *ch && uf >= f && uf <= f + 90));
+        if swap {
+            c.coarsen_swaps += 1;
+        } else if c.other.len() < 12 {
+            c.other.push(format!("{k} ring {ring}: unloaded f{u}, delivered again f{f} (cam {p:?} agl {agl:.0})"));
+        }
+    }
+    c
+}
+
+/// Churn probe (prints only): `cargo test -p simworld-core churn_probe_print -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn churn_probe_print() {
+    for terrain in [false, true] {
+        let r = churn_probe(terrain, 900, |_| ([0.0, 300.0, 0.0], [0.0; 3], 300.0));
+        println!("terrain {terrain} static 300 m: {r:#?}");
+        for speed in [80.0, 250.0] {
+            let r = churn_probe(terrain, 900, |f| ([0.0, 300.0, -speed * f as f64 / 60.0], [0.0, 0.0, -speed], 300.0));
+            println!("terrain {terrain} level north {speed} m/s: {r:#?}");
+            let r = churn_probe(terrain, 900, |f| {
+                let t = f as f64 / 60.0;
+                let agl = (300.0 + 180.0 * t).min(3000.0);
+                ([0.0, agl, -speed * t], [0.0, if agl < 3000.0 { 180.0 } else { 0.0 }, -speed], agl)
+            });
+            println!("terrain {terrain} north {speed} m/s climbing: {r:#?}");
+        }
+    }
 }

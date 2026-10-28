@@ -26,7 +26,7 @@ public partial class FreeFlyCamera : Camera3D, IWorldCameraSource
 
     [Export(PropertyHint.Range, "0,1000,1,or_greater")] public float Speed { get; set; } = 80f;
     [Export] public float MouseSensitivity { get; set; } = 0.003f;
-    /// <summary>Terrain height under the camera. WorldView updates it every frame from WorldStreamer.ground_height_at (0 until a DEM exists).</summary>
+    /// <summary>Terrain height under the camera. WorldView updates it every frame from WorldStreamer.ground_height_at (0 unless the terrain layer is active).</summary>
     [Export] public float GroundY { get; set; } = 0f;
 
     public const float AutopilotAltitudeM = 300f;
@@ -36,6 +36,15 @@ public partial class FreeFlyCamera : Camera3D, IWorldCameraSource
     public const float ClimbFloorM = 100f;
     public const float MinAltitudeM = 20f;
     public const float MaxAltitudeM = 30000f;
+
+    /// <summary>
+    /// Terrain collision for the bench (set by <see cref="BenchArgs"/> while the terrain layer runs): the camera never goes below
+    /// <see cref="GroundY"/> + <see cref="MinAglM"/> (below the terrain its back faces are culled and the world looks gone), and the level autopilot
+    /// holds its height above ground instead of an absolute height.
+    /// </summary>
+    public bool ClampToGround { get; set; }
+    public const float MinAglM = 10f;
+    private float _autoAgl = AutopilotAltitudeM;
 
     public Vector3 Velocity { get; private set; }
     public bool Autopilot { get; private set; }
@@ -92,6 +101,7 @@ public partial class FreeFlyCamera : Camera3D, IWorldCameraSource
             var p = GlobalPosition;
             GlobalPosition = new Vector3(p.X, GroundY + AutopilotAltitudeM, p.Z);
             Autopilot = true;
+            _autoAgl = AutopilotAltitudeM;
             GD.Print($"[FreeFlyCamera] autopilot on: north at {Speed} m/s, {AutopilotAltitudeM} m AGL");
         }
     }
@@ -102,6 +112,7 @@ public partial class FreeFlyCamera : Camera3D, IWorldCameraSource
         {
             case InputEventKey { Pressed: true, Echo: false, PhysicalKeycode: Key.F }:
                 Autopilot = !Autopilot;
+                _autoAgl = Mathf.Max((float)AltitudeAgl, MinAglM);
                 GD.Print($"[FreeFlyCamera] autopilot {(Autopilot ? "on" : "off")} at {Speed} m/s");
                 break;
             case InputEventKey { Pressed: true, Echo: false, PhysicalKeycode: Key.Pageup }:
@@ -129,6 +140,14 @@ public partial class FreeFlyCamera : Camera3D, IWorldCameraSource
         }
     }
 
+    /// <summary>Sets the look direction: yaw (radians, 0 = north, positive turns left) and pitch (radians, negative looks down); mouse look continues from it.</summary>
+    public void SetLook(float yaw, float pitch)
+    {
+        _yaw = yaw;
+        _pitch = pitch;
+        Rotation = new Vector3(_pitch, _yaw, 0f);
+    }
+
     /// <summary>Jumps to the given altitude above ground (clamped), keeping x/z and orientation.</summary>
     public void SetAltitude(double altAgl)
     {
@@ -139,6 +158,19 @@ public partial class FreeFlyCamera : Camera3D, IWorldCameraSource
     }
 
     public override void _Process(double delta)
+    {
+        Move(delta);
+        if (ClampToGround)
+        {
+            var p = GlobalPosition;
+            float floor = GroundY + MinAglM;
+            if (Autopilot && ClimbRate <= 0f) p.Y = GroundY + _autoAgl; // level autopilot: constant height above ground over the hills
+            if (p.Y < floor) p.Y = floor;
+            GlobalPosition = p;
+        }
+    }
+
+    private void Move(double delta)
     {
         if (ClimbRate > 0f)
         {

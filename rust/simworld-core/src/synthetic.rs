@@ -6,14 +6,19 @@
 //! one tile at z13..z16, so every synthetic building is owned by exactly one tile per zoom.
 //! Coarser zooms are thinned (z14 keeps 1/2, z13 1/4) like a real low-zoom profile would.
 //!
+//! Three landmark lots (`special_lot`) inside the z16 tile that holds the frame origin carry a
+//! castle (`yes` + `historic=castle`), a slender tower (`yes` + `man_made=tower`, tagged height)
+//! and a ruin (`house` + `historic=ruins`) at every zoom (never thinned), so the light-profile
+//! rules (landmark / dark, docs/spec-night-windows.md) are exercised by the synthetic city.
+//!
 //! Ground (`generate_ground`): every district (16 x 16 lots = one z15 tile) is one landuse area
 //! (park, industrial, commercial or residential like its buildings; some districts are a lake
 //! with a built-up island, i.e. a polygon with a hole), and streets run along every 4th lot
 //! line (secondary on district edges, residential otherwise, lit by a hash of the line).
 
-use crate::geo::{lat_to_tile_y, lon_to_tile_x, tile_width_m, Frame, TileKey};
+use crate::geo::{lat_to_tile_y, lon_to_tile_x, tile_for, tile_width_m, Frame, TileKey};
 use crate::mvt::{
-    splitmix64, Building, GroundArea, GroundFeatures, Landuse, OsmType, RawBuilding, RoadLine, TileProjector, GROUND_COMMERCIAL,
+    splitmix64, Building, BuildingTags, GroundArea, GroundFeatures, Landuse, OsmType, RawBuilding, RoadLine, TileProjector, GROUND_COMMERCIAL,
     GROUND_GRASS, GROUND_INDUSTRIAL, GROUND_RESIDENTIAL, GROUND_WATER, ROAD_RESIDENTIAL, ROAD_SECONDARY,
 };
 
@@ -22,6 +27,33 @@ const EXTENT: f64 = 4096.0;
 
 const DISTRICT_LOTS: u64 = 16;
 const STREET_EVERY: u64 = 4;
+
+/// The landmark lots of the synthetic city.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Special {
+    Castle,
+    Tower,
+    Ruin,
+}
+
+/// First lot (z19) of the z16 tile holding the frame origin.
+fn special_base(frame: Frame) -> (u64, u64) {
+    let t = tile_for(frame.lat0, frame.lon0, 16);
+    let per = 1u64 << (LOT_ZOOM - 16);
+    (t.x as u64 * per, t.y as u64 * per)
+}
+
+/// Lots (z19, 8 x 8 per z16 tile) of the z16 tile holding the frame origin (`base`): castle at
+/// local (2, 2), tower at (5, 2), ruin at (2, 5).
+fn special_lot(base: (u64, u64), lx: u64, ly: u64) -> Option<Special> {
+    let (bx, by) = base;
+    match (lx.checked_sub(bx)?, ly.checked_sub(by)?) {
+        (2, 2) => Some(Special::Castle),
+        (5, 2) => Some(Special::Tower),
+        (2, 5) => Some(Special::Ruin),
+        _ => None,
+    }
+}
 
 fn unit(h: u64) -> f64 {
     (h >> 11) as f64 / (1u64 << 53) as f64
@@ -71,7 +103,7 @@ pub fn generate_ground(key: TileKey, frame: Frame, profile: &crate::profile::Pro
             let (x1, y1) = (x0 + DISTRICT_LOTS, y0 + DISTRICT_LOTS);
             // Exterior clockwise in screen space (MVT convention), hole counter-clockwise.
             let rect = |a: u64, b: u64, c: u64, e: u64| vec![[px(a, lx0), px(b, ly0)], [px(c, lx0), px(b, ly0)], [px(c, lx0), px(e, ly0)], [px(a, lx0), px(e, ly0)]];
-            let dist_m = ((x0 as f64 + 8.0 - ox).hypot(y0 as f64 + 8.0 - oy)) * lot_m;
+            let dist_m = crate::math::hypot(x0 as f64 + 8.0 - ox, y0 as f64 + 8.0 - oy) * lot_m;
             let class = if is_park(d) {
                 GROUND_GRASS
             } else if is_lake(d) {
@@ -97,7 +129,7 @@ pub fn generate_ground(key: TileKey, frame: Frame, profile: &crate::profile::Pro
                 hole.reverse();
                 rings.push(hole);
             }
-            g.areas.push(GroundArea { class, level, id: d & 0xFFFF_FFFF, rings });
+            g.areas.push(GroundArea { class, level, id: d & 0xFFFF_FFFF, rings, tint: 0, sub: 0, cut: false });
         }
     }
     // Streets on every 4th lot line inside [l0, l0 + per) (the line on the far edge belongs to
@@ -120,6 +152,11 @@ pub fn generate_ground(key: TileKey, frame: Frame, profile: &crate::profile::Pro
 }
 
 pub fn generate(key: TileKey, frame: Frame) -> Vec<Building> {
+    generate_on(key, frame, &crate::terrain::Terrain::flat())
+}
+
+/// [`generate`] on `terrain` (building bases stand on it).
+pub fn generate_on(key: TileKey, frame: Frame, terrain: &crate::terrain::Terrain) -> Vec<Building> {
     if key.z > LOT_ZOOM {
         return Vec::new();
     }
@@ -130,7 +167,8 @@ pub fn generate(key: TileKey, frame: Frame) -> Vec<Building> {
     let px_per_lot = EXTENT / per as f64;
     let ox = lon_to_tile_x(frame.lon0, LOT_ZOOM);
     let oy = lat_to_tile_y(frame.lat0, LOT_ZOOM);
-    let proj = TileProjector::new(key, frame, EXTENT);
+    let proj = TileProjector::new(key, frame, EXTENT).with_terrain(terrain.clone());
+    let base = special_base(frame);
 
     let mut out = Vec::new();
     for j in 0..per {
@@ -139,11 +177,57 @@ pub fn generate(key: TileKey, frame: Frame) -> Vec<Building> {
             let ly = key.y as u64 * per + j;
             let h = splitmix64((lx << 32) ^ ly ^ 0x5157_4E54);
             let district = district_hash(lx / DISTRICT_LOTS, ly / DISTRICT_LOTS);
+            if let Some(sp) = special_lot(base, lx, ly) {
+                // Landmark lots: always built, at every zoom.
+                let (cx, cy) = ((i as f64 + 0.5) * px_per_lot, (j as f64 + 0.5) * px_per_lot);
+                let (hw, hd, kind, height, levels, tags) = match sp {
+                    Special::Castle => (
+                        17.0,
+                        14.0,
+                        "yes",
+                        Some(18.0),
+                        None,
+                        BuildingTags { historic: Some("castle".into()), ..Default::default() },
+                    ),
+                    Special::Tower => (
+                        3.5,
+                        3.5,
+                        "yes",
+                        Some(42.0),
+                        None,
+                        BuildingTags { man_made: Some("tower".into()), ..Default::default() },
+                    ),
+                    Special::Ruin => (
+                        7.0,
+                        4.5,
+                        "house",
+                        None,
+                        Some(1.0),
+                        BuildingTags { historic: Some("ruins".into()), ..Default::default() },
+                    ),
+                };
+                let (w, d) = (hw * px_per_m, hd * px_per_m);
+                let raw = RawBuilding {
+                    osm_type: OsmType::Synthetic,
+                    id: h & 0x0000_FFFF_FFFF_FFFF,
+                    kind: kind.to_string(),
+                    height,
+                    levels,
+                    min_height: 0.0,
+                    landuse: Some(Landuse::Commercial),
+                    tags,
+                    polygons: vec![vec![vec![[cx - w, cy - d], [cx + w, cy - d], [cx + w, cy + d], [cx - w, cy + d]]]],
+                };
+                if let Some(b) = proj.finish(raw) {
+                    out.push(b);
+                }
+                continue;
+            }
             if is_park(district) || (is_lake(district) && !on_island(lx, ly)) {
                 continue; // park, or open water around a lake island
             }
-            let dist_m = ((lx as f64 + 0.5 - ox).hypot(ly as f64 + 0.5 - oy)) * lot_m;
-            let p_occ = 0.15 + 0.7 * (-dist_m / 6000.0).exp();
+            let dist_m = crate::math::hypot(lx as f64 + 0.5 - ox, ly as f64 + 0.5 - oy) * lot_m;
+            let p_occ = 0.15 + 0.7 * crate::math::exp(-dist_m / 6000.0);
             if unit(h) > p_occ {
                 continue;
             }
@@ -197,6 +281,7 @@ pub fn generate(key: TileKey, frame: Frame) -> Vec<Building> {
                 } else {
                     Landuse::Residential
                 }),
+                tags: BuildingTags::default(),
                 polygons: vec![vec![ring]],
             };
             if let Some(b) = proj.finish(raw) {

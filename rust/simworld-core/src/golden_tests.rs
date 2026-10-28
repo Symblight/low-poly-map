@@ -11,6 +11,13 @@
 //! features are sorted deterministically by `GroundFeatures::sort`). The hash is FNV-1a 64 over
 //! little-endian integers (stable across Rust versions, unlike `DefaultHasher`).
 //!
+//! Terrain mesh layer (api 1.5): `golden_terrain_mesh_and_layer_cover` pins the TIN of two tiles
+//! per terrain band and the terrain layer's cover (incl. a tall-peak camera).
+//!
+//! World seed (api 1.7): `golden_seed_world_tiles` pins seed tiles of the two-cities world
+//! (`low-poly-map/world/two-cities/`) in every band and three seed terrain tiles with COLOR; a
+//! change of those files changes these hashes too.
+//!
 //! Regenerate after an *intended* output change:
 //! `SIMWORLD_UPDATE_GOLDEN=1 cargo test -p simworld-core golden -- --nocapture`
 //! prints the new table instead of failing; paste it into `GOLDEN` and say why in the commit.
@@ -19,7 +26,8 @@
 use crate::geo::{tile_for, Frame, TileKey};
 use crate::mesher::{mesh_buildings, ClipRect, MeshData};
 use crate::profile::Profile;
-use crate::worker::{build_tile, decode_payload, Payload};
+use crate::terrain::Terrain;
+use crate::worker::{build_tile_on, decode_payload_on, Payload};
 
 const VILNIUS: (f64, f64) = (54.6872, 25.2797);
 
@@ -84,9 +92,14 @@ fn hash_lights(h: &mut Fnv, pos: &[[f32; 3]], col: &[[f32; 4]]) {
 /// Golden hash of one tile: buildings (per building, sorted by OSM id), ground, single and
 /// clustered lights, plus a few counts.
 pub(crate) fn tile_hash(key: TileKey, ring: usize, frame: Frame, profile: &Profile) -> u64 {
+    tile_hash_on(key, ring, frame, &Terrain::flat(), profile)
+}
+
+/// [`tile_hash`] on `terrain` (the worker path `build_tile_on`).
+pub(crate) fn tile_hash_on(key: TileKey, ring: usize, frame: Frame, terrain: &Terrain, profile: &Profile) -> u64 {
     let payload = Payload::Synthetic;
-    let data = build_tile(key, ring, frame, &payload, profile).expect("build_tile");
-    let dec = decode_payload(key, frame, &payload, false, profile).expect("decode");
+    let data = build_tile_on(key, ring, frame, terrain, &payload, profile).expect("build_tile");
+    let dec = decode_payload_on(key, frame, terrain, &payload, false, false, profile).expect("decode");
     let mut h = Fnv::new();
     h.u64(key.z as u64);
     h.u64(key.x as u64);
@@ -125,20 +138,27 @@ pub(crate) fn tile_hash(key: TileKey, ring: usize, frame: Frame, profile: &Profi
         hash_mesh(&mut h, m);
     }
 
-    // Ground on every R0-R2 tile, buildings on R0-R2, lights on R2/R3 (the set must exercise
-    // every output kind).
-    assert_eq!(data.ground.is_empty(), ring == 3, "{key}: ground");
+    // Ground on every tile (R3 since api 1.3), buildings on R0-R2, lights on R1..R3 (default lights.min_ring = 1; the set
+    // must exercise every output kind).
+    assert!(!data.ground.is_empty(), "{key}: ground");
     assert_eq!(data.mesh.is_empty(), ring == 3, "{key}: buildings");
-    assert_eq!(data.lights.is_empty(), ring < 2, "{key}: lights");
+    assert_eq!(data.lights.positions.is_empty(), ring < 1, "{key}: lights");
+    assert!(!data.lights.street_positions.is_empty(), "{key}: street lamps (default lights.street.min_ring = 0)");
 
     // Ground, in output order.
     hash_mesh(&mut h, &data.ground);
 
-    // Lights: one per owned building in decode order -> pair with the building, sort by id.
-    let owned: Vec<(u64, u64)> = dec.buildings.iter().filter(|b| b.owned).map(|b| (b.id, b.osm_type.tag())).collect();
+    // Lights: one per owned building in decode order, none for `dark` buildings -> pair with
+    // the building, sort by id.
+    let owned: Vec<(u64, u64)> = dec
+        .buildings
+        .iter()
+        .filter(|b| b.owned && crate::mesher::resolve(b, profile).profile != crate::mesher::PROFILE_DARK)
+        .map(|b| (b.id, b.osm_type.tag()))
+        .collect();
     let l = &data.lights;
     if !l.positions.is_empty() {
-        assert_eq!(owned.len(), l.positions.len(), "{key}: one light per owned building");
+        assert_eq!(owned.len(), l.positions.len(), "{key}: one light per owned non-dark building");
     }
     type Single = ((u64, u64), [f32; 3], [f32; 4]);
     let mut singles: Vec<Single> =
@@ -152,6 +172,11 @@ pub(crate) fn tile_hash(key: TileKey, ring: usize, frame: Frame, profile: &Profi
     }
     // Clusters are sorted by cell index already (independent of building order).
     hash_lights(&mut h, &l.clustered_positions, &l.clustered_colors);
+    // Street lamps (roads sorted, so output order is deterministic) and their clusters.
+    hash_lights(&mut h, &l.street_positions, &l.street_colors);
+    hash_lights(&mut h, &l.clustered_street_positions, &l.clustered_street_colors);
+    // Beacons on tall buildings (never clustered).
+    hash_lights(&mut h, &l.beacon_positions, &l.beacon_colors);
     h.0
 }
 
@@ -167,16 +192,22 @@ pub(crate) fn golden_keys() -> Vec<(TileKey, usize)> {
     v
 }
 
-/// Golden values for `golden_keys()` with `Profile::default()` (key, ring, hash).
+/// Golden values for `golden_keys()` with `Profile::default()` (key, ring, hash). Last regenerated
+/// for the R3 ground (api 1.3, `ground.r3`: only the two R3 hashes changed), before that for night-windows W4 (default `lights.min_ring` 2 -> 1: R1 tiles now carry lights, only the R1 hashes
+/// changed), before that for night-windows W3 (api 1.0): wall UVs only (window columns / floors on windowed R0/R1
+/// walls, `u = -1` + meters on windowless and all R2 walls); positions, normals, colors, indices,
+/// ground and lights unchanged (R3 hashes identical). Before that for W2 (profile_version 4):
+/// churches moved from civic to landmark (COLOR r and light color), and the synthetic castle /
+/// tower / ruin lots in the origin's z16 tile.
 const GOLDEN: &[(&str, usize, u64)] = &[
-    ("16/37370/20827", 0, 0xa8f519d447c070ac),
-    ("16/37371/20828", 0, 0x984cda40b2ad3d2e),
-    ("15/18685/10413", 1, 0x276ebec9152f356d),
-    ("15/18686/10414", 1, 0x2334a295b91a9d1c),
-    ("14/9342/5206", 2, 0xc825b13e74d91fa4),
-    ("14/9343/5207", 2, 0x9978650aeb8f768d),
-    ("13/4671/2603", 3, 0xf9b762c4c217b203),
-    ("13/4672/2604", 3, 0x4e5a9f4dfe400f6e),
+    ("16/37370/20827", 0, 0x3b765a5900178657),
+    ("16/37371/20828", 0, 0x467ce64ac1254619),
+    ("15/18685/10413", 1, 0xf9fda743f16d6b50),
+    ("15/18686/10414", 1, 0x3afc10b1968d2be8),
+    ("14/9342/5206", 2, 0x9e78d8f4a8c62bb2),
+    ("14/9343/5207", 2, 0xa549392f72cf056d),
+    ("13/4671/2603", 3, 0x3de346522f977b7c),
+    ("13/4672/2604", 3, 0x9a24caee5797d041),
 ];
 
 #[test]
@@ -351,4 +382,279 @@ fn configure_world_rejects_bad_options_and_keeps_running() {
     w.configure(VILNIUS.0, VILNIUS.1, "", "");
     assert_eq!(**w.profile(), Profile::default());
     assert!(w.attributions().is_empty());
+}
+
+/// The terrain golden setup (docs/spec-terrain.md section 11): terrain active (amplitude 120 m,
+/// no flat zone so the golden tiles around the origin carry relief), default profile otherwise.
+fn golden_terrain() -> (Profile, Terrain) {
+    let p = crate::profile::resolve(
+        None,
+        Some(&serde_json::json!({ "terrain": { "enabled": true, "amplitude_m": 120.0, "flat_radius_m": 0.0, "flat_blend_m": 0.0 } })),
+        &crate::NullLog,
+    )
+    .unwrap();
+    let t = Terrain::from_profile(&p, VILNIUS.0, VILNIUS.1);
+    (p, t)
+}
+
+/// Golden values for `golden_keys()` on the synthetic relief (terrain phase 1, api 1.4): bases on
+/// the lowest footprint corner, foundations, draped and subdivided ground, water snap, lights.
+const GOLDEN_TERRAIN: &[(&str, usize, u64)] = &[
+    ("16/37370/20827", 0, 0x8d9d912b5022a202),
+    ("16/37371/20828", 0, 0xdbfc2afb86562936),
+    ("15/18685/10413", 1, 0x04eb4ef73273d039),
+    ("15/18686/10414", 1, 0x281e68bd411161df),
+    ("14/9342/5206", 2, 0x825083792524cb6f),
+    ("14/9343/5207", 2, 0xd42c3ad0384e08e7),
+    ("13/4671/2603", 3, 0x283bd214eef3e966),
+    ("13/4672/2604", 3, 0x9517814bc4f2694e),
+];
+
+/// Golden cover on the synthetic relief for `COVER_CAMERAS`.
+const GOLDEN_TERRAIN_COVER: &[([usize; 4], u64)] = &[
+    ([16, 64, 116, 283], 0x235b86fbbaf4970a),
+    ([24, 72, 104, 280], 0xb4ceb134fe1ee729),
+    ([0, 56, 124, 282], 0x74762aaf157832a7),
+    ([0, 0, 76, 274], 0x1f2d9ad2c294989e),
+];
+
+#[test]
+fn golden_tile_hashes_with_terrain() {
+    let frame = Frame::new(VILNIUS.0, VILNIUS.1);
+    let (profile, terrain) = golden_terrain();
+    let got: Vec<(String, usize, u64)> =
+        golden_keys().into_iter().map(|(k, r)| (k.to_string(), r, tile_hash_on(k, r, frame, &terrain, &profile))).collect();
+    // Terrain changes every tile; the flat goldens are untouched (golden_tile_hashes_default_profile).
+    for ((k, r), (_, _, h)) in golden_keys().into_iter().zip(&got) {
+        assert_ne!(*h, tile_hash(k, r, frame, &profile), "{k}: terrain had no effect");
+    }
+    let covers: Vec<([usize; 4], u64)> = COVER_CAMERAS
+        .iter()
+        .map(|&(cam, vel)| {
+            let mut s = crate::scheduler::Scheduler::new(frame, false, std::sync::Arc::new(profile.clone())).with_terrain(terrain.clone());
+            cover_signature(&mut s, cam, vel)
+        })
+        .collect();
+    let table: String = got.iter().map(|(k, r, h)| format!("    (\"{k}\", {r}, 0x{h:016x}),\n")).collect();
+    let ctable: String = covers.iter().map(|(c, h)| format!("    ({c:?}, 0x{h:016x}),\n")).collect();
+    if std::env::var("SIMWORLD_UPDATE_GOLDEN").is_ok_and(|v| v == "1") {
+        println!("const GOLDEN_TERRAIN: &[(&str, usize, u64)] = &[\n{table}];");
+        println!("const GOLDEN_TERRAIN_COVER: &[([usize; 4], u64)] = &[\n{ctable}];");
+        return;
+    }
+    let want: Vec<(String, usize, u64)> = GOLDEN_TERRAIN.iter().map(|(k, r, h)| (k.to_string(), *r, *h)).collect();
+    assert_eq!(got, want, "terrain golden tile hashes changed; new table:\n{table}");
+    assert_eq!(covers, GOLDEN_TERRAIN_COVER.to_vec(), "terrain golden cover changed; new table:\n{ctable}");
+}
+
+// ---- Terrain mesh layer (api 1.5) ------------------------------------------------------
+
+/// Golden hash of one terrain tile (the worker path `build_terrain_tile`, detail 1): positions
+/// to 1 mm, indices, normals (none with flat shading), height range, surface triangle count and
+/// skirt depth. Terrain output is final on first delivery, so this is the settled output.
+pub(crate) fn terrain_tile_hash(key: TileKey, ring: usize, frame: Frame, terrain: &Terrain, profile: &Profile) -> u64 {
+    let t = crate::terrain::tin::build_terrain_tile(key, ring, frame, terrain, profile, 1.0).expect("terrain tile");
+    let mut h = Fnv::new();
+    h.u64(key.z as u64);
+    h.u64(key.x as u64);
+    h.u64(key.y as u64);
+    h.u64(ring as u64);
+    hash_mesh(&mut h, &t.mesh);
+    h.mm(t.h_min);
+    h.mm(t.h_max);
+    h.u64(t.surface_triangles as u64);
+    h.mm(t.skirt_m);
+    h.0
+}
+
+/// Two tiles per terrain band around the origin (z14 = ring 0 .. z10 = ring 4).
+pub(crate) fn terrain_golden_keys(profile: &Profile) -> Vec<(TileKey, usize)> {
+    let mut v = Vec::new();
+    for ring in 0..profile.terrain.bands.len() {
+        let z = profile.terrain.near_zoom as u8 - ring as u8;
+        let k = tile_for(VILNIUS.0, VILNIUS.1, z);
+        v.push((k, ring));
+        v.push((TileKey::new(z, k.x + 1, k.y + 1), ring));
+    }
+    v
+}
+
+/// The terrain layer's cover after one `update` at a fixed camera: tiles per terrain ring and an
+/// FNV hash of the sorted keys.
+pub(crate) fn terrain_cover_signature(s: &mut crate::scheduler::Scheduler, cam: [f64; 3], vel: [f64; 3]) -> (Vec<usize>, u64) {
+    let mut jobs = Vec::new();
+    s.update(cam, vel, std::time::Instant::now(), &mut jobs);
+    let l = *s.layer();
+    let mut keys: Vec<TileKey> = s.entries().map(|e| e.key).collect();
+    keys.sort();
+    let mut counts = vec![0usize; l.rings()];
+    let mut h = Fnv::new();
+    for k in &keys {
+        counts[l.ring_for_zoom(k.z).expect("layer zoom")] += 1;
+        h.u64(k.z as u64);
+        h.u64(k.x as u64);
+        h.u64(k.y as u64);
+    }
+    (counts, h.0)
+}
+
+/// Golden TIN hashes for `terrain_golden_keys()` on the golden relief (`golden_terrain()`).
+const GOLDEN_TERRAIN_MESH: &[(&str, usize, u64)] = &[
+    ("14/9342/5206", 0, 0xac84fa4bbbf88786),
+    ("14/9343/5207", 0, 0x2ad046a2e19e5254),
+    ("13/4671/2603", 1, 0x5ac449bfca8b74a1),
+    ("13/4672/2604", 1, 0x1227579ffd1bbb54),
+    ("12/2335/1301", 2, 0x9b56433baf81222d),
+    ("12/2336/1302", 2, 0x6edb503cd026b134),
+    ("11/1167/650", 3, 0x9b59fab43279d5e2),
+    ("11/1168/651", 3, 0xeca27caf79e2cda6),
+    ("10/583/325", 4, 0x18627aec814d2b08),
+    ("10/584/326", 4, 0xeb6ec0c20ee8c11d),
+];
+
+/// Golden terrain-layer cover for `COVER_CAMERAS` on the golden relief, then a tall-peak relief
+/// (amplitude 1200 m, ridges, peaks near 2 km) seen from 3000 m AGL.
+const GOLDEN_TERRAIN_LAYER_COVER: &[(&[usize], u64)] = &[
+    (&[28, 36, 108, 140, 101], 0x0ad674628ca4762d),
+    (&[36, 36, 100, 140, 100], 0x4c9258a8f3cc96e1),
+    (&[24, 44, 104, 144, 130], 0x2a26054e873e2b3e),
+    (&[0, 32, 100, 140, 128], 0x606dd9c7be01c641),
+    (&[4, 36, 108, 140, 128], 0x59c971a44de2df01),
+];
+
+#[test]
+fn golden_terrain_mesh_and_layer_cover() {
+    let frame = Frame::new(VILNIUS.0, VILNIUS.1);
+    let (profile, terrain) = golden_terrain();
+    let keys = terrain_golden_keys(&profile);
+    let got: Vec<(String, usize, u64)> =
+        keys.iter().map(|&(k, r)| (k.to_string(), r, terrain_tile_hash(k, r, frame, &terrain, &profile))).collect();
+    // Deterministic: a second build (another thread) gives the same hash.
+    let (k, r) = keys[2];
+    let (p2, t2) = (profile.clone(), terrain.clone());
+    let again = std::thread::spawn(move || terrain_tile_hash(k, r, frame, &t2, &p2)).join().unwrap();
+    assert_eq!(again, got[2].2);
+    let peak_profile = crate::profile::resolve(
+        None,
+        Some(&serde_json::json!({ "terrain": { "enabled": true, "amplitude_m": 1200.0, "ridge_share": 1.0, "flat_radius_m": 0.0, "flat_blend_m": 0.0 } })),
+        &crate::NullLog,
+    )
+    .unwrap();
+    let peak = Terrain::from_profile(&peak_profile, VILNIUS.0, VILNIUS.1);
+    let arc = std::sync::Arc::new(profile.clone());
+    let mut covers: Vec<(Vec<usize>, u64)> = COVER_CAMERAS
+        .iter()
+        .map(|&(cam, vel)| {
+            let mut s = crate::scheduler::Scheduler::new_terrain(frame, arc.clone(), terrain.clone());
+            terrain_cover_signature(&mut s, cam, vel)
+        })
+        .collect();
+    let mut s = crate::scheduler::Scheduler::new_terrain(frame, std::sync::Arc::new(peak_profile), peak);
+    covers.push(terrain_cover_signature(&mut s, [0.0, 0.0, 3000.0], [0.0; 3]));
+    let table: String = got.iter().map(|(k, r, h)| format!("    (\"{k}\", {r}, 0x{h:016x}),\n")).collect();
+    let ctable: String = covers.iter().map(|(c, h)| format!("    (&{c:?}, 0x{h:016x}),\n")).collect();
+    if std::env::var("SIMWORLD_UPDATE_GOLDEN").is_ok_and(|v| v == "1") {
+        println!("const GOLDEN_TERRAIN_MESH: &[(&str, usize, u64)] = &[\n{table}];");
+        println!("const GOLDEN_TERRAIN_LAYER_COVER: &[(&[usize], u64)] = &[\n{ctable}];");
+        return;
+    }
+    let want: Vec<(String, usize, u64)> = GOLDEN_TERRAIN_MESH.iter().map(|(k, r, h)| (k.to_string(), *r, *h)).collect();
+    assert_eq!(got, want, "terrain mesh golden hashes changed; new table:\n{table}");
+    let want_c: Vec<(Vec<usize>, u64)> = GOLDEN_TERRAIN_LAYER_COVER.iter().map(|(c, h)| (c.to_vec(), *h)).collect();
+    assert_eq!(covers, want_c, "terrain layer golden cover changed; new table:\n{ctable}");
+}
+
+// ---- World seed (api 1.7, docs/spec-world-seed.md section 12) ---------------------------
+
+/// Golden hash of one seed tile (the worker path `build_seed_tile_on` on the two-cities world):
+/// merged building mesh, ground, building / street / beacon / airport lights, counts.
+fn seed_tile_hash(key: TileKey, ring: usize, frame: Frame) -> u64 {
+    let (p, t, w) = crate::seed::world::test_world();
+    let d = crate::worker::build_seed_tile_on(key, ring, frame, t, w, p).expect("seed tile");
+    let mut h = Fnv::new();
+    h.u64(key.z as u64);
+    h.u64(key.x as u64);
+    h.u64(key.y as u64);
+    h.u64(ring as u64);
+    h.u64(d.building_count as u64);
+    h.mm(d.max_height);
+    hash_mesh(&mut h, &d.mesh);
+    hash_mesh(&mut h, &d.ground);
+    hash_lights(&mut h, &d.lights.positions, &d.lights.colors);
+    hash_lights(&mut h, &d.lights.street_positions, &d.lights.street_colors);
+    hash_lights(&mut h, &d.lights.beacon_positions, &d.lights.beacon_colors);
+    hash_lights(&mut h, &d.lights.airport_positions, &d.lights.airport_colors);
+    h.0
+}
+
+/// Golden hash of a seed world's terrain tile (TIN on the seed heights + COLOR by class).
+fn seed_terrain_hash(key: TileKey, ring: usize, frame: Frame) -> u64 {
+    let (p, t, w) = crate::seed::world::test_world();
+    let d = crate::worker::build_terrain_data(key, ring, frame, t, p, 1.0, Some(w)).expect("terrain tile");
+    let tile = d.terrain.expect("terrain");
+    let mut h = Fnv::new();
+    h.u64(key.z as u64);
+    h.u64(key.x as u64);
+    h.u64(key.y as u64);
+    h.u64(ring as u64);
+    hash_mesh(&mut h, &tile.mesh);
+    h.mm(tile.h_min);
+    h.mm(tile.h_max);
+    h.u64(tile.surface_triangles as u64);
+    h.0
+}
+
+/// Seed tiles: EYVI in every band (runway, lights, terminal), countryside, the Klaipeda coast,
+/// the Kaunas reservoir; terrain tiles over EYVI, the coast and the countryside.
+fn seed_golden_keys() -> (Vec<(TileKey, usize)>, Vec<(TileKey, usize)>) {
+    let eyvi = (54.6341, 25.2858);
+    let mut v: Vec<(TileKey, usize)> = (0..4).map(|r| (tile_for(eyvi.0, eyvi.1, 16 - r as u8), r)).collect();
+    v.push((tile_for(55.25, 24.3, 15), 1));
+    v.push((tile_for(55.25, 24.3, 13), 3));
+    v.push((tile_for(55.72, 21.11, 14), 2));
+    v.push((tile_for(54.86, 24.05, 15), 1));
+    let t = vec![(tile_for(eyvi.0, eyvi.1, 14), 0), (tile_for(55.6, 21.1, 12), 2), (tile_for(55.3, 23.0, 10), 4)];
+    (v, t)
+}
+
+/// Golden values for `seed_golden_keys()` (generator version 2: S1 fixes; regenerated 2026-10-28
+/// for the intended change "no drape lift inside airport fences, fences cut out of countryside and
+/// water, overlapping strips share one plane, coast-resolved terrain COLOR": the four EYVI tiles
+/// and the three terrain tiles changed, the countryside / coast / lake vector tiles did not).
+const GOLDEN_SEED: &[(&str, usize, u64)] = &[
+    ("16/37371/20844", 0, 0x38889b25a698a53b),
+    ("15/18685/10422", 1, 0x4291a9e4083f68e7),
+    ("14/9342/5211", 2, 0x11efed254d499019),
+    ("13/4671/2605", 3, 0x29b16f5dc3b2580c),
+    ("15/18595/10324", 1, 0xd77cc16cf9dcee0a),
+    ("13/4648/2581", 3, 0x45efcb5ba8e96834),
+    ("14/9152/5124", 2, 0x22824c070adbf70e),
+    ("15/18573/10386", 1, 0xd203841e628c3c28),
+];
+const GOLDEN_SEED_TERRAIN: &[(&str, usize, u64)] = &[
+    ("14/9342/5211", 0, 0x5413431b13f7e700),
+    ("12/2288/1283", 2, 0xa08e6737c1a5295c),
+    ("10/577/322", 4, 0x0c06200414397eff),
+];
+
+#[test]
+fn golden_seed_world_tiles() {
+    let frame = Frame::new(VILNIUS.0, VILNIUS.1);
+    let (vk, tk) = seed_golden_keys();
+    let got: Vec<(String, usize, u64)> = vk.iter().map(|&(k, r)| (k.to_string(), r, seed_tile_hash(k, r, frame))).collect();
+    let got_t: Vec<(String, usize, u64)> = tk.iter().map(|&(k, r)| (k.to_string(), r, seed_terrain_hash(k, r, frame))).collect();
+    // Deterministic across threads.
+    let (k, r) = vk[0];
+    assert_eq!(std::thread::spawn(move || seed_tile_hash(k, r, frame)).join().unwrap(), got[0].2);
+    let table: String = got.iter().map(|(k, r, h)| format!("    (\"{k}\", {r}, 0x{h:016x}),\n")).collect();
+    let ttable: String = got_t.iter().map(|(k, r, h)| format!("    (\"{k}\", {r}, 0x{h:016x}),\n")).collect();
+    if std::env::var("SIMWORLD_UPDATE_GOLDEN").is_ok_and(|v| v == "1") {
+        println!("const GOLDEN_SEED: &[(&str, usize, u64)] = &[\n{table}];");
+        println!("const GOLDEN_SEED_TERRAIN: &[(&str, usize, u64)] = &[\n{ttable}];");
+        return;
+    }
+    let want: Vec<(String, usize, u64)> = GOLDEN_SEED.iter().map(|(k, r, h)| (k.to_string(), *r, *h)).collect();
+    assert_eq!(got, want, "seed golden tile hashes changed; new table:\n{table}");
+    let want_t: Vec<(String, usize, u64)> = GOLDEN_SEED_TERRAIN.iter().map(|(k, r, h)| (k.to_string(), *r, *h)).collect();
+    assert_eq!(got_t, want_t, "seed golden terrain hashes changed; new table:\n{ttable}");
 }

@@ -53,7 +53,8 @@ public partial class NightRenderController : WorldEnvironment
     private float _night = -1f;
     private float _exposure = 1f;
     // Test aids (user args --cam-alt=<m AGL> --cam-pitch=<deg> --night=<0..1> --shot=<png>[,frames]); no effect without them.
-    private float _testAlt = -1f, _testPitch = float.NaN;
+    private float _testAlt = -1f, _testPitch = float.NaN, _testYaw = float.NaN;
+    private Vector2? _testXz;
     private bool _testNoGlow;
     private string _testBlend = "";
     private string _shotPath = "";
@@ -90,6 +91,13 @@ public partial class NightRenderController : WorldEnvironment
             else if (arg.StartsWith("--glow-blend=", System.StringComparison.Ordinal)) _testBlend = arg.Substring(13);
             else if (arg.StartsWith("--cam-alt=", System.StringComparison.Ordinal) && float.TryParse(arg.Substring(10), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var ca)) _testAlt = ca;
             else if (arg.StartsWith("--cam-pitch=", System.StringComparison.Ordinal) && float.TryParse(arg.Substring(12), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var cp)) _testPitch = cp;
+            else if (arg.StartsWith("--cam-yaw=", System.StringComparison.Ordinal) && float.TryParse(arg.Substring(10), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var cy)) _testYaw = cy;
+            else if (arg.StartsWith("--cam-xz=", System.StringComparison.Ordinal))
+            {
+                // --cam-xz=<x>,<z>: camera start in local meters (x east, z south), for framing a known spot in screenshots.
+                var xz = arg.Substring(9).Split(',');
+                if (xz.Length == 2 && float.TryParse(xz[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var cx) && float.TryParse(xz[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var cz)) _testXz = new Vector2(cx, cz);
+            }
             else if (arg.StartsWith("--shot=", System.StringComparison.Ordinal))
             {
                 // --shot=<png>[,<frames>]: save the viewport after N frames (default 90) and quit. Verification aid.
@@ -100,13 +108,17 @@ public partial class NightRenderController : WorldEnvironment
         }
 
         Look.ApplyStatic(_env);
+        Bridge?.SetEmissionLevel(Look.EmissionLevel); // the building shader scales lit windows by it (0.65 x, under the glow threshold)
+        Bridge?.SetLightFog(Look.FogBeginM, Look.FogEndM, Look.FogCurve); // light sprites fog themselves with the same curve
         ApplyTonemap();
         if (_testNoGlow) _env.GlowEnabled = false;
         if (_testBlend.Length > 0) _env.GlowBlendMode = _testBlend switch { "additive" => Godot.Environment.GlowBlendModeEnum.Additive, "screen" => Godot.Environment.GlowBlendModeEnum.Screen, "replace" => Godot.Environment.GlowBlendModeEnum.Replace, _ => Godot.Environment.GlowBlendModeEnum.Softlight };
         if (Camera != null)
         {
             if (_testAlt > 0f) Camera.SetAltitude(_testAlt);
-            if (!float.IsNaN(_testPitch)) Camera.Rotation = new Vector3(Mathf.DegToRad(_testPitch), 0f, 0f);
+            if (_testXz is { } xz0) Camera.GlobalPosition = new Vector3(xz0.X, Camera.GlobalPosition.Y, xz0.Y);
+            if (!float.IsNaN(_testPitch) || !float.IsNaN(_testYaw))
+                Camera.Rotation = new Vector3(float.IsNaN(_testPitch) ? Camera.Rotation.X : Mathf.DegToRad(_testPitch), float.IsNaN(_testYaw) ? Camera.Rotation.Y : Mathf.DegToRad(_testYaw), 0f);
         }
         if (_shotFrames > 0 && !System.Linq.Enumerable.Contains(OS.GetCmdlineUserArgs(), "--shot-hud") && GetParent()?.GetNodeOrNull<CanvasLayer>("HUD") is { } hud) hud.Visible = false;
     }
@@ -145,13 +157,18 @@ public partial class NightRenderController : WorldEnvironment
         }
     }
 
+    private int _altFrames;
+
     public override void _Process(double delta)
     {
+        // --cam-alt= is height above ground, but the ground height is only known once the world runs (terrain on: hills): apply it again.
+        if (_testAlt > 0f && Camera != null && Bridge is { TerrainActive: true } && ++_altFrames == 4) Camera.SetAltitude(_testAlt);
+
         float night = Bridge != null ? Bridge.NightFactor : 1f;
         float alt = Camera != null ? (float)Camera.AltitudeAgl : 0f;
 
         // ---- glow and fog: the addon's look ----
-        Look!.Update(_env, night, alt);
+        Look!.Update(_env, night, alt, Bridge?.TerrainReachM ?? 0f);
 
         // ---- eye adaptation (external view only) ----
         float target = 1f;
@@ -178,6 +195,18 @@ public partial class NightRenderController : WorldEnvironment
 
         if (_shotFrames > 0 && --_shotFrames == 0)
         {
+            if (Bridge != null && Camera != null)
+            {
+                long draws = (long)RenderingServer.ViewportGetRenderInfo(GetViewport().GetViewportRid(), RenderingServer.ViewportRenderInfoType.Visible, RenderingServer.ViewportRenderInfo.DrawCallsInFrame);
+                int vec = Bridge.CountVectorInFrustum(Camera, out int vecRule, out _);
+                string terr = "";
+                if (Bridge.TerrainActive)
+                {
+                    int drawn = Bridge.CountTerrainInFrustum(Camera, out int byRule, out long tris);
+                    terr = $" terrain: held {Bridge.TerrainCover.Loaded} (by ring {string.Join("/", Bridge.TerrainCover.LoadedByRing)}), visible by rule {byRule}, in frustum {drawn}, tris in frustum {tris:N0}, held tris {Bridge.TerrainCover.TrianglesLoaded:N0};";
+                }
+                GD.Print($"[NightRender] shot stats: viewport draw calls {draws}; vector building meshes held {Bridge.Cover.Loaded}, visible by rule {vecRule}, in frustum {vec};{terr} cam alt {Camera.AltitudeAgl:0} m AGL");
+            }
             var img = GetViewport().GetTexture().GetImage();
             img.SavePng(_shotPath);
             GD.Print($"[NightRender] screenshot {_shotPath} {img.GetWidth()}x{img.GetHeight()} tonemap={Tonemap} exposure={ExternalView}");
@@ -193,11 +222,17 @@ public partial class NightRenderController : WorldEnvironment
         _env.AmbientLightEnergy = Mathf.Lerp(0.6f, 0.35f, night);
         if (_sky != null)
         {
+            float skyEnergy = Mathf.Lerp(1f, 0.6f, night);
+            // The sky half is scaled by SkyEnergyMultiplier, the ground half (GroundEnergyMultiplier 1) and the fog colour are not:
+            // divide it out of the sky horizon so it equals the fogged ground and the sky's ground half. Otherwise the sky's own
+            // (straight, uncurved) horizon line shows as an edge between a darker sky and the fog-coloured ground below it, and the
+            // world reads as a box.
             _sky.SkyTopColor = DaySkyTop.Lerp(NightSkyTop, night);
-            _sky.SkyHorizonColor = fog;
+            _sky.SkyHorizonColor = fog / skyEnergy;
+            _sky.GroundEnergyMultiplier = 1f;
             _sky.GroundHorizonColor = fog;
             _sky.GroundBottomColor = fog; // same as the horizon: no dark band between the far-plane clipped ground and the sky
-            _sky.SkyEnergyMultiplier = Mathf.Lerp(1f, 0.6f, night);
+            _sky.SkyEnergyMultiplier = skyEnergy;
         }
         if (Sun != null)
         {

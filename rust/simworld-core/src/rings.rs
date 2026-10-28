@@ -25,8 +25,203 @@ pub const ROOT_ZOOM: u8 = 13;
 /// Finest zoom (R0).
 pub const LEAF_ZOOM: u8 = 16;
 /// Upper bound for any building (m; the vertex COLOR `a` encoding range), used only to bound
-/// the root candidate search.
-const MAX_BOX_HEIGHT_M: f64 = 400.0;
+/// the root candidate search (on top of the highest terrain when the terrain is active).
+pub const MAX_BOX_HEIGHT_M: f64 = 400.0;
+/// Most rings any layer can have (the terrain layer spans zooms 8..16 at most).
+pub const MAX_RINGS: usize = 9;
+/// Earth radius of the horizon cull (m; real-size Earth, `docs/spec-terrain.md` 5.1).
+pub const HORIZON_EARTH_RADIUS_M: f64 = 6_371_000.0;
+
+/// Which quadtree a tile belongs to (contract api 1.5: `layer` of a ready tile).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum LayerKind {
+    /// The vector world (buildings, ground, lights): zooms 13..16, keys `"z/x/y"`.
+    World,
+    /// The terrain mesh: zooms `terrain.far_zoom..=terrain.near_zoom`, keys `"t/z/x/y"`.
+    Terrain,
+}
+
+impl LayerKind {
+    /// Contract name (`layer` key of a ready tile / `debug_tiles` entry).
+    pub fn name(self) -> &'static str {
+        match self {
+            LayerKind::World => "world",
+            LayerKind::Terrain => "terrain",
+        }
+    }
+    /// Key prefix (`"t/"` for terrain, none for the vector world).
+    pub fn prefix(self) -> &'static str {
+        match self {
+            LayerKind::World => "",
+            LayerKind::Terrain => "t/",
+        }
+    }
+}
+
+/// A tile key with its layer: `"z/x/y"` (world) or `"t/z/x/y"` (terrain). The two layers never
+/// share a key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LayerKey {
+    pub layer: LayerKind,
+    pub key: TileKey,
+}
+
+impl LayerKey {
+    pub const fn world(key: TileKey) -> Self {
+        Self { layer: LayerKind::World, key }
+    }
+    pub const fn terrain(key: TileKey) -> Self {
+        Self { layer: LayerKind::Terrain, key }
+    }
+    /// Parse `"z/x/y"` or `"t/z/x/y"`.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.strip_prefix("t/") {
+            Some(r) => TileKey::parse(r).map(Self::terrain),
+            None => TileKey::parse(s).map(Self::world),
+        }
+    }
+}
+
+impl std::fmt::Display for LayerKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{}", self.layer.prefix(), self.key)
+    }
+}
+
+/// One quadtree layer of the cover (`docs/spec-terrain.md` 5.1): zoom range, band edges (ring =
+/// `leaf_zoom - z`), the shared hysteresis / look-ahead tuning, in-flight limits and the
+/// optional horizon cull. The vector layer is `{13, 16, bands.*}` exactly as before; the terrain
+/// layer is `{terrain.far_zoom, terrain.near_zoom, terrain.bands[*].edge_m}`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Layer {
+    pub kind: LayerKind,
+    /// Coarsest zoom (the roots; ring `rings() - 1`).
+    pub root_zoom: u8,
+    /// Finest zoom (ring 0).
+    pub leaf_zoom: u8,
+    /// Outer slant-distance edge per ring (m); entries past `rings()` are unused.
+    pub edge_m: [f64; MAX_RINGS],
+    pub hysteresis: f64,
+    pub look_ahead_s: f64,
+    pub look_ahead_clamp: f64,
+    /// Box height (m) above the terrain of a tile whose own height is still unknown (buildings;
+    /// 0 for the terrain layer, whose box is the terrain range alone).
+    pub default_tile_height_m: f64,
+    /// Jobs in flight per ring: fetches and mesh jobs.
+    pub max_fetch: u32,
+    pub max_mesh: u32,
+    /// Horizon cull margin (m); `None` = no cull (the vector layer, or `terrain.horizon_cull`
+    /// off).
+    pub horizon_margin_m: Option<f64>,
+}
+
+impl Layer {
+    /// The vector layer: zooms 13..16, the profile's `bands.*` and `streaming.*` limits.
+    pub fn world(b: &BandParams, max_fetch: u32, max_mesh: u32) -> Self {
+        let mut edge_m = [0.0; MAX_RINGS];
+        edge_m[..RING_COUNT].copy_from_slice(&b.edge_m);
+        Self {
+            kind: LayerKind::World,
+            root_zoom: ROOT_ZOOM,
+            leaf_zoom: LEAF_ZOOM,
+            edge_m,
+            hysteresis: b.hysteresis,
+            look_ahead_s: b.look_ahead_s,
+            look_ahead_clamp: b.look_ahead_clamp,
+            default_tile_height_m: b.default_tile_height_m,
+            max_fetch,
+            max_mesh,
+            horizon_margin_m: None,
+        }
+    }
+
+    /// The terrain layer of a (validated) profile: zooms `far_zoom..=near_zoom`, edges from
+    /// `terrain.bands`, hysteresis and look-ahead from `bands.*`.
+    pub fn terrain(t: &crate::profile::TerrainProfile, b: &BandParams) -> Self {
+        let mut edge_m = [0.0; MAX_RINGS];
+        for (i, band) in t.bands.iter().take(MAX_RINGS).enumerate() {
+            edge_m[i] = band.edge_m;
+        }
+        Self {
+            kind: LayerKind::Terrain,
+            root_zoom: t.far_zoom as u8,
+            leaf_zoom: t.near_zoom as u8,
+            edge_m,
+            hysteresis: b.hysteresis,
+            look_ahead_s: b.look_ahead_s,
+            look_ahead_clamp: b.look_ahead_clamp,
+            default_tile_height_m: 0.0,
+            max_fetch: t.max_fetch,
+            max_mesh: t.max_mesh,
+            horizon_margin_m: t.horizon_cull.then_some(t.horizon_margin_m),
+        }
+    }
+
+    /// Number of rings (zoom levels).
+    pub fn rings(&self) -> usize {
+        (self.leaf_zoom - self.root_zoom) as usize + 1
+    }
+
+    /// Outer edge of the coarsest ring (roots exist below it).
+    pub fn reach_m(&self) -> f64 {
+        self.edge_m[self.rings() - 1]
+    }
+
+    pub fn ring_for_zoom(&self, z: u8) -> Option<usize> {
+        (self.root_zoom..=self.leaf_zoom).contains(&z).then(|| (self.leaf_zoom - z) as usize)
+    }
+
+    pub fn zoom_for_ring(&self, ring: usize) -> u8 {
+        self.leaf_zoom - ring as u8
+    }
+
+    /// Parent inside this layer (`None` at the root zoom).
+    pub fn parent(&self, k: TileKey) -> Option<TileKey> {
+        (k.z > self.root_zoom).then(|| TileKey::new(k.z - 1, k.x / 2, k.y / 2))
+    }
+
+    /// The tile's sibling group (its parent's children), including itself.
+    pub fn siblings(&self, k: TileKey) -> [TileKey; 4] {
+        match self.parent(k) {
+            Some(p) => children(p),
+            None => [k; 4],
+        }
+    }
+
+    /// The look-ahead clamp of a ring (default: half the ring's radius).
+    pub fn look_ahead_clamp_m(&self, ring: usize) -> f64 {
+        self.edge_m[ring] * self.look_ahead_clamp
+    }
+
+    /// Band thresholds with hysteresis (as [`BandParams::inside`]).
+    pub fn inside(&self, d: f64, edge: f64, current: bool) -> bool {
+        if current {
+            d <= edge * self.hysteresis
+        } else {
+            d < edge
+        }
+    }
+}
+
+/// Horizontal distance (m) past which a tile box `[lo, hi]` (m above MSL) is below the horizon
+/// of a camera at `cam_alt` (MSL) over ground `cam_ground` on a real-size Earth:
+/// `sqrt(2R max(cam_alt - ref, 0)) + sqrt(2R max(hi - ref, 0)) + margin`, `ref` = the lower of
+/// the ground under the camera and the tile's minimum.
+pub fn horizon_line_m(cam_alt: f64, cam_ground: f64, lo: f64, hi: f64, margin_m: f64) -> f64 {
+    let r2 = 2.0 * HORIZON_EARTH_RADIUS_M;
+    let h_ref = cam_ground.min(lo);
+    (r2 * (cam_alt - h_ref).max(0.0)).sqrt() + (r2 * (hi - h_ref).max(0.0)).sqrt() + margin_m
+}
+
+/// Horizon test with the band hysteresis: a tile above the horizon now (`current`) drops out
+/// only `hysteresis` past the line, a culled one comes back at the line.
+pub fn above_horizon(horizontal_m: f64, line_m: f64, hysteresis: f64, current: bool) -> bool {
+    if current {
+        horizontal_m <= line_m * hysteresis
+    } else {
+        horizontal_m < line_m
+    }
+}
 
 /// Band tuning from the world profile (`bands.*`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -104,8 +299,8 @@ pub fn look_ahead(cam: [f64; 3], vel: [f64; 3], max_offset_m: f64, horizon_s: f6
 pub struct ViewPoint {
     pub wx: f64,
     pub wy: f64,
-    /// Height (m) on the `ground_height` scale: AGL + terrain under the view point (equal to
-    /// AGL while the terrain is flat).
+    /// Height (m above MSL): AGL + terrain under the view point (equal to AGL with the terrain
+    /// off).
     pub alt: f64,
     /// Meters per world unit at the view point's latitude.
     pub m_per_unit: f64,
@@ -117,7 +312,7 @@ impl ViewPoint {
             wx: lon_to_tile_x(lon, 0),
             wy: lat_to_tile_y(lat, 0),
             alt,
-            m_per_unit: MERCATOR_CIRCUMFERENCE * lat.to_radians().cos(),
+            m_per_unit: MERCATOR_CIRCUMFERENCE * crate::math::cos(lat.to_radians()),
         }
     }
 
@@ -127,36 +322,55 @@ impl ViewPoint {
         let (x0, y0) = (k.x as f64 * s, k.y as f64 * s);
         let dx = (x0 - self.wx).max(self.wx - (x0 + s)).max(0.0);
         let dy = (y0 - self.wy).max(self.wy - (y0 + s)).max(0.0);
-        dx.hypot(dy) * self.m_per_unit
+        crate::math::hypot(dx, dy) * self.m_per_unit
     }
 
-    /// Slant distance (m) to the nearest point of the tile box: footprint x [g, g + box_h], with
-    /// g = `geo::ground_height` at the footprint point nearest to the view point (`alt` is the
-    /// view point's height on the same vertical scale, see `Scheduler::views`).
+    /// Slant distance (m) to the nearest point of the tile box footprint x [0, box_h] (flat
+    /// terrain). Same as `slant_box_m(k, 0.0, box_h)`.
     pub fn slant_m(&self, k: TileKey, box_h: f64) -> f64 {
-        let s = 1.0 / (1u64 << k.z) as f64;
-        let (x0, y0) = (k.x as f64 * s, k.y as f64 * s);
-        let (nx, ny) = (self.wx.clamp(x0, x0 + s), self.wy.clamp(y0, y0 + s));
-        let g = crate::geo::ground_height(crate::geo::tile_y_to_lat(ny, 0), crate::geo::tile_x_to_lon(nx, 0));
-        let v = (self.alt - (g + box_h)).max(g - self.alt).max(0.0);
-        self.horizontal_m(k).hypot(v)
+        self.slant_box_m(k, 0.0, 0.0 + box_h)
     }
 
-    /// Append every z13 tile that could be a root (slant < R3 edge * hysteresis) to `out`.
+    /// Slant distance (m) to the nearest point of the tile box footprint x [lo, hi] (heights in
+    /// meters above MSL, the scale of `alt`; see `Scheduler::views`). The scheduler passes
+    /// `lo` = the tile's terrain minimum and `hi` = its terrain maximum + building height, both
+    /// from `Terrain::tile_range` (deterministic per key; `[0, 0]` with the terrain off).
+    pub fn slant_box_m(&self, k: TileKey, lo: f64, hi: f64) -> f64 {
+        let v = (self.alt - hi).max(lo - self.alt).max(0.0);
+        crate::math::hypot(self.horizontal_m(k), v)
+    }
+
+    /// Append every z13 tile that could be a root (slant < R3 edge * hysteresis) to `out`, with
+    /// box tops at most [`MAX_BOX_HEIGHT_M`] (flat terrain).
     pub fn root_candidates(&self, b: &BandParams, out: &mut Vec<TileKey>) {
-        let reach = b.edge_m[RING_COUNT - 1] * b.hysteresis;
-        let v = (self.alt - MAX_BOX_HEIGHT_M).max(0.0);
+        self.root_candidates_below(b, MAX_BOX_HEIGHT_M, out)
+    }
+
+    /// [`ViewPoint::root_candidates`] for boxes whose tops are at most `max_top_m` above MSL
+    /// (highest terrain + [`MAX_BOX_HEIGHT_M`] with the terrain active).
+    pub fn root_candidates_below(&self, b: &BandParams, max_top_m: f64, out: &mut Vec<TileKey>) {
+        self.root_candidates_at(b.edge_m[RING_COUNT - 1] * b.hysteresis, ROOT_ZOOM, max_top_m, out)
+    }
+
+    /// Root candidates of a layer: every `root_zoom` tile whose box (top at most `max_top_m`)
+    /// can be closer than the layer's reach times the hysteresis.
+    pub fn root_candidates_layer(&self, l: &Layer, max_top_m: f64, out: &mut Vec<TileKey>) {
+        self.root_candidates_at(l.reach_m() * l.hysteresis, l.root_zoom, max_top_m, out)
+    }
+
+    fn root_candidates_at(&self, reach: f64, root_zoom: u8, max_top_m: f64, out: &mut Vec<TileKey>) {
+        let v = (self.alt - max_top_m).max(0.0);
         if v >= reach {
             return;
         }
         let r_units = (reach * reach - v * v).sqrt() / self.m_per_unit;
-        let n = 1i64 << ROOT_ZOOM;
+        let n = 1i64 << root_zoom;
         let to_tile = |w: f64| (w * n as f64).floor() as i64;
         let (x0, x1) = (to_tile(self.wx - r_units).max(0), to_tile(self.wx + r_units).min(n - 1));
         let (y0, y1) = (to_tile(self.wy - r_units).max(0), to_tile(self.wy + r_units).min(n - 1));
         for y in y0..=y1 {
             for x in x0..=x1 {
-                out.push(TileKey::new(ROOT_ZOOM, x as u32, y as u32));
+                out.push(TileKey::new(root_zoom, x as u32, y as u32));
             }
         }
     }

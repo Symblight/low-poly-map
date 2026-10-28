@@ -109,6 +109,7 @@ fn bench_update_camera_cost() {
                         let result = build_tile(key, ring, frame, &payload, &Profile::default());
                         let _ = s.handle(WorkerMsg::Decoded { key, ring, job, result }, t_start);
                     }
+                    Job::Terrain { .. } => unreachable!("vector layer"),
                 }
             }
             for _ in 0..2 {

@@ -88,7 +88,7 @@ Today's `DiskCache` writes each tile to `{cache_dir}/pmtiles-v{N}-{hash}/{z}/{x}
 ### File and location
 
 - One database per source: `{cache_dir}/tiles-{hash}.sqlite` (+ `-wal`, `-shm` while open). `{hash}` is today's `source_dir_name(url)` hash, so different archives never mix.
-- `cache_dir` stays a host argument. Hosts should pass a purgeable, non-backed-up folder: `Library/Caches` on iOS (to verify: Godot's `user://` maps to `Documents`, which iCloud backs up), `%LOCALAPPDATA%` on Windows, `~/Library/Caches` on macOS. The test bench keeps `user://tile_cache` on desktop.
+- `cache_dir` stays a host argument. Hosts must pass a purgeable, non-backed-up folder: `OS.GetCacheDir()` (`Library/Caches` on iOS, the platform cache folder elsewhere). Never `user://` on iOS: Godot maps it to `Documents`, which iCloud backs up (Apple's data storage guidelines reject re-downloadable data there). The addon's `WorldView.CacheDir` defaults to `cache://simworld/tiles` = `OS.GetCacheDir()/<project name>/simworld/tiles` (`docs/spec-world-seed.md` section 8b; before 2026-10-27 it was `user://simworld_cache`). The test bench keeps `user://tile_cache` on desktop. The library never opens a database it did not create here (no game saves, no shared files).
 - On first open, delete legacy `pmtiles-v*-{hash}/` folders for the same source (today's `remove_stale_versions` generalized). No migration of their content: the cache refills from the network.
 
 ### Schema

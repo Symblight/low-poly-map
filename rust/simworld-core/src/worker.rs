@@ -6,17 +6,22 @@
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
+use ahash::AHashMap;
 use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender};
+use tokio::task::AbortHandle;
 
-use crate::fetch::{DiskCache, FetchError, FetchParams, Fetcher, Note, Source};
+use crate::fetch::{DiskCache, FetchError, FetchErrorKind, FetchParams, Fetcher, Note, Source};
 use crate::geo::{Frame, TileKey};
 use crate::lights::LightSet;
 use crate::mesher::{mesh_tile, MeshData};
 use crate::ground::mesh_ground;
-use crate::mvt::{decode_tile, Building, DecodedTile, GroundFeatures, TileProjector};
+use crate::mvt::{decode_tile_on, Building, DecodedTile, GroundFeatures, TileProjector};
+use crate::seed::SeedWorld;
+use crate::terrain::tin::{build_terrain_tile_colored, TerrainTile};
+use crate::terrain::Terrain;
 use crate::profile::Profile;
 use crate::synthetic;
 
@@ -33,13 +38,15 @@ pub struct TileData {
     /// Merged building mesh (tile-root relative), clipped to the tile. Empty for R3.
     pub mesh: MeshData,
     /// Merged ground mesh (areas + road strips, tile-root relative, no UV), clipped to the
-    /// tile. Empty for R3 and for tiles without ground features.
+    /// tile. Empty for tiles without ground features (every band has ground since api 1.3).
     pub ground: MeshData,
     /// Highest roof top (m above ground) of any building decoded in the tile, including
     /// buffer copies owned by neighbours; 0 for an empty tile. Height of the slant-distance box.
     pub max_height: f32,
     /// Worker-side CPU time (decode + mesh + lights), microseconds.
     pub cpu_us: u64,
+    /// Terrain layer only (api 1.5): the terrain mesh of the tile (`None` for vector tiles).
+    pub terrain: Option<Box<TerrainTile>>,
 }
 
 impl TileData {
@@ -56,6 +63,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cancel_aborts_a_hanging_fetch_and_still_replies() {
+        // A server that accepts connections and never answers: the fetch hangs (request
+        // timeout 20 s by default) until it is cancelled.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/hang.pmtiles", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let _held: Vec<_> = listener.incoming().collect();
+        });
+        let w = Worker::new(Frame::new(54.6872, 25.2797), &url, "", Arc::new(Profile::default())).unwrap();
+        let key = TileKey::new(16, 37370, 20827);
+        let fetched = |w: &Worker| {
+            while let Some(m) = w.try_recv() {
+                if let WorkerMsg::Fetched { job, result, .. } = m {
+                    return Some((job, result));
+                }
+            }
+            None
+        };
+        w.submit(Job::Fetch { key, ring: 0, job: 7 });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(fetched(&w).is_none(), "the server never answers");
+        w.cancel(&[7, 99]); // unknown ids are ignored
+        let t0 = std::time::Instant::now();
+        let (job, result) = loop {
+            if let Some(r) = fetched(&w) {
+                break r;
+            }
+            assert!(t0.elapsed() < std::time::Duration::from_secs(5), "no reply after cancel");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(job, 7);
+        assert_eq!(result.unwrap_err().kind, FetchErrorKind::Cancelled);
+        assert!(lock(&w.fetches).is_empty(), "the task removed its abort handle");
+    }
+
+    #[test]
     fn tile_data_records_max_roof_height() {
         let frame = Frame::new(54.6872, 25.2797);
         let key = crate::geo::tile_for(54.6872, 25.2797, 16);
@@ -68,17 +111,17 @@ mod tests {
         assert!(d.max_height > 10.0);
         assert_eq!(d.max_height, expect);
         assert_eq!(build_tile(key, 0, frame, &Payload::Bytes(Bytes::new()), &p).unwrap().max_height, 0.0);
-        // Lights only for R2/R3.
-        assert!(d.lights.is_empty() && !d.mesh.is_empty());
+        // Building lights from R1 (default lights.min_ring), street lamps on every band.
+        assert!(d.lights.positions.is_empty() && !d.lights.street_positions.is_empty() && !d.mesh.is_empty());
         let k14 = crate::geo::tile_for(54.6872, 25.2797, 14);
         let d2 = build_tile(k14, 2, frame, &Payload::Synthetic, &p).unwrap();
         assert!(!d2.lights.is_empty() && !d2.mesh.is_empty());
         assert!(d2.lights.clustered_positions.len() < d2.lights.positions.len());
         let k13 = crate::geo::tile_for(54.6872, 25.2797, 13);
         let d3 = build_tile(k13, 3, frame, &Payload::Synthetic, &p).unwrap();
-        assert!(!d3.lights.is_empty() && d3.mesh.is_empty());
-        // Ground for R0-R2 only (synthetic city has streets and districts everywhere).
-        assert!(!d.ground.is_empty() && !d2.ground.is_empty() && d3.ground.is_empty());
+        assert!(!d3.lights.positions.is_empty() && !d3.lights.street_positions.is_empty() && d3.mesh.is_empty());
+        // Ground on every band (synthetic city has streets and districts everywhere); R3 is the coarsest.
+        assert!(!d.ground.is_empty() && !d2.ground.is_empty() && !d3.ground.is_empty());
         assert!(d.ground.uvs.is_empty());
         assert_eq!(d.ground, build_tile(key, 0, frame, &Payload::Synthetic, &p).unwrap().ground);
         // Deterministic.
@@ -94,12 +137,14 @@ mod tests {
         let lit = |min_ring: u32, ring: usize| {
             let mut w = crate::profile::WorldProfile::default();
             w.lights.min_ring = min_ring;
+            w.lights.street.min_ring = 4; // building lights only
+            w.lights.beacons.min_ring = 4;
             let p = Profile::new(w).unwrap();
             build_tile(key, ring, frame, &Payload::Synthetic, &p).unwrap().lights
         };
         let reference = lit(2, 2);
         assert!(!reference.is_empty());
-        assert!(lit(2, 1).is_empty() && lit(2, 0).is_empty(), "default: R0/R1 unlit");
+        assert!(lit(2, 1).is_empty() && lit(2, 0).is_empty(), "min_ring 2: R0/R1 unlit");
         assert_eq!(lit(1, 1), reference, "R1 lit like R2 would be");
         assert!(lit(1, 0).is_empty());
         assert_eq!(lit(0, 0), reference);
@@ -168,12 +213,17 @@ pub enum Payload {
 pub enum Job {
     Fetch { key: TileKey, ring: usize, job: u64 },
     Decode { key: TileKey, ring: usize, job: u64, payload: Payload },
+    /// Terrain layer (api 1.5): build the TIN of a terrain tile at `detail` times the band's
+    /// `max_error_m`. No fetch stage (the terrain is a function).
+    Terrain { key: TileKey, ring: usize, job: u64, detail: f64 },
 }
 
 #[derive(Debug)]
 pub enum WorkerMsg {
     Fetched { key: TileKey, ring: usize, job: u64, result: Result<(Bytes, Source), FetchError> },
     Decoded { key: TileKey, ring: usize, job: u64, result: Result<TileData, String> },
+    /// Result of a [`Job::Terrain`] (routed to the terrain layer's scheduler).
+    TerrainBuilt { key: TileKey, ring: usize, job: u64, result: Result<TileData, String> },
     Info(String),
     /// Logged as a (rate-limited) warning on the main thread.
     Warn(String),
@@ -183,22 +233,46 @@ pub enum WorkerMsg {
     Error(String),
 }
 
-/// CPU stage: payload -> buildings, ground features (if `want_ground`) and projector
-/// (shared by real and synthetic tiles).
+/// CPU stage: payload -> buildings, ground areas (if `want_ground`), roads (if `want_roads`) and projector
+/// (shared by real and synthetic tiles). Flat terrain; see [`decode_payload_on`].
 pub fn decode_payload(
     key: TileKey,
     frame: Frame,
     payload: &Payload,
     want_ground: bool,
+    want_roads: bool,
+    profile: &Profile,
+) -> Result<DecodedTile, String> {
+    decode_payload_on(key, frame, &Terrain::flat(), payload, want_ground, want_roads, profile)
+}
+
+/// [`decode_payload`] on `terrain` (the projector of the result carries it).
+pub fn decode_payload_on(
+    key: TileKey,
+    frame: Frame,
+    terrain: &Terrain,
+    payload: &Payload,
+    want_ground: bool,
+    want_roads: bool,
     profile: &Profile,
 ) -> Result<DecodedTile, String> {
     match payload {
-        Payload::Synthetic => Ok(DecodedTile {
-            buildings: synthetic::generate(key, frame),
-            ground: if want_ground { synthetic::generate_ground(key, frame, profile) } else { GroundFeatures::default() },
-            proj: TileProjector::new(key, frame, 4096.0),
-        }),
-        Payload::Bytes(b) => decode_tile(b, key, frame, want_ground, profile),
+        Payload::Synthetic => {
+            let mut ground =
+                if want_ground || want_roads { synthetic::generate_ground(key, frame, profile) } else { GroundFeatures::default() };
+            if !want_ground {
+                ground.areas.clear();
+            }
+            if !want_roads {
+                ground.roads.clear();
+            }
+            Ok(DecodedTile {
+                buildings: synthetic::generate_on(key, frame, terrain),
+                ground,
+                proj: TileProjector::new(key, frame, 4096.0).with_terrain(terrain.clone()),
+            })
+        }
+        Payload::Bytes(b) => decode_tile_on(b, key, frame, terrain, want_ground, want_roads, profile),
     }
 }
 
@@ -209,7 +283,7 @@ pub fn tile_buildings_proj(
     payload: &Payload,
     profile: &Profile,
 ) -> Result<(Vec<Building>, TileProjector), String> {
-    decode_payload(key, frame, payload, false, profile).map(|t| (t.buildings, t.proj))
+    decode_payload(key, frame, payload, false, false, profile).map(|t| (t.buildings, t.proj))
 }
 
 /// CPU stage: payload -> buildings.
@@ -219,25 +293,117 @@ pub fn tile_buildings(key: TileKey, frame: Frame, payload: &Payload, profile: &P
 
 /// CPU stage: payload -> flat per-tile output (building + ground meshes per ring, lights). The
 /// decoded structs are dropped here, on the worker; only flat buffers cross to the main thread.
+/// Flat terrain; see [`build_tile_on`].
 pub fn build_tile(key: TileKey, ring: usize, frame: Frame, payload: &Payload, profile: &Profile) -> Result<TileData, String> {
+    build_tile_on(key, ring, frame, &Terrain::flat(), payload, profile)
+}
+
+/// [`build_tile`] on `terrain`: building bases (+ foundations), draped ground and light heights
+/// all sample it through the tile's projector. This is what the worker pool runs.
+pub fn build_tile_on(
+    key: TileKey,
+    ring: usize,
+    frame: Frame,
+    terrain: &Terrain,
+    payload: &Payload,
+    profile: &Profile,
+) -> Result<TileData, String> {
     let t0 = std::time::Instant::now();
     let want_ground = profile.ground_params(ring).is_some();
-    let DecodedTile { buildings, ground: gf, proj } = decode_payload(key, frame, payload, want_ground, profile)?;
-    let mesh = mesh_tile(&buildings, &proj, ring, profile);
-    let ground = mesh_ground(&gf, &proj, ring, profile);
+    let want_streets = ring >= profile.lights.street.min_ring as usize;
+    let DecodedTile { buildings, ground: gf, proj } =
+        decode_payload_on(key, frame, terrain, payload, want_ground, want_ground || want_streets, profile)?;
+    Ok(finish_tile(buildings, gf, &proj, ring, profile, &[], t0))
+}
+
+/// The seed generator's tile (api 1.7, `docs/spec-world-seed.md` section 7): generated in tile
+/// pixels from `(key, seed)` alone, then projected, meshed and lit exactly like archive data,
+/// plus the airport lights (`airport_lights`).
+pub fn build_seed_tile_on(
+    key: TileKey,
+    ring: usize,
+    frame: Frame,
+    terrain: &Terrain,
+    seed: &SeedWorld,
+    profile: &Profile,
+) -> Result<TileData, String> {
+    let t0 = std::time::Instant::now();
+    let want_ground = profile.ground_params(ring).is_some();
+    let want_streets = ring >= profile.lights.street.min_ring as usize;
+    let st = match crate::seed::world::route(key, seed) {
+        crate::seed::world::TileSource::Seed => crate::seed::world::generate(key, seed),
+    };
+    let proj = TileProjector::new(key, frame, crate::seed::world::EXTENT).with_terrain(terrain.clone());
+    let buildings: Vec<Building> = st.buildings.into_iter().filter_map(|b| proj.finish(b)).collect();
+    let mut gf = st.ground;
+    if !want_ground {
+        gf.areas.clear();
+    }
+    if !(want_ground || want_streets) {
+        gf.roads.clear();
+    }
+    Ok(finish_tile(buildings, gf, &proj, ring, profile, &st.airport_lights, t0))
+}
+
+/// Mesh, ground and lights of a decoded or generated tile (shared by every source).
+fn finish_tile(
+    buildings: Vec<Building>,
+    gf: GroundFeatures,
+    proj: &TileProjector,
+    ring: usize,
+    profile: &Profile,
+    airport_lights: &[crate::seed::world::AirportLightPx],
+    t0: std::time::Instant,
+) -> TileData {
+    let want_streets = ring >= profile.lights.street.min_ring as usize;
+    let mesh = mesh_tile(&buildings, proj, ring, profile);
+    let ground = mesh_ground(&gf, proj, ring, profile);
+    let mut lights = if ring >= profile.lights.min_ring as usize { LightSet::from_buildings(&buildings, profile) } else { LightSet::default() };
+    if want_streets {
+        lights.set_streets(&gf.roads, proj, profile);
+    }
+    if ring >= profile.lights.beacons.min_ring as usize {
+        lights.set_beacons(&buildings, proj, profile);
+    }
+    if !airport_lights.is_empty() {
+        lights.set_airport(airport_lights, proj, ring, profile);
+    }
     drop(gf);
-    let lights = if ring >= profile.lights.min_ring as usize { LightSet::from_buildings(&buildings, profile) } else { LightSet::default() };
     let building_count = buildings.len();
     let max_height = buildings.iter().map(|b| crate::mesher::resolve(b, profile).height).fold(0.0f32, f32::max);
     drop(buildings);
-    Ok(TileData {
+    TileData {
         building_count,
         lights: Arc::new(lights),
         mesh,
         ground,
         max_height,
         cpu_us: t0.elapsed().as_micros() as u64,
-    })
+        terrain: None,
+    }
+}
+
+/// Terrain layer: the TIN of terrain tile `key` (ring = index in `terrain.bands`) as a
+/// [`TileData`] with only `terrain` set (box height 0: the box is the terrain range).
+pub fn build_terrain_data(
+    key: TileKey,
+    ring: usize,
+    frame: Frame,
+    terrain: &Terrain,
+    profile: &Profile,
+    detail: f64,
+    seed: Option<&SeedWorld>,
+) -> Result<TileData, String> {
+    let t0 = std::time::Instant::now();
+    // A seed world's terrain carries COLOR: r = ground class / 8, g = tint / 8 (api 1.7).
+    let color = seed.map(|s| {
+        move |lat: f64, lon: f64| {
+            let (class, tint) = s.class_at(lat, lon);
+            [class as f32 / 8.0, tint as f32 / 8.0, 0.0, 1.0]
+        }
+    });
+    let tile = build_terrain_tile_colored(key, ring, frame, terrain, profile, detail, color.as_ref().map(|c| c as &dyn Fn(f64, f64) -> [f32; 4]))?;
+    Ok(TileData { terrain: Some(Box::new(tile)), cpu_us: t0.elapsed().as_micros() as u64, ..TileData::default() })
 }
 
 fn panic_text(p: Box<dyn std::any::Any + Send>) -> String {
@@ -247,6 +413,11 @@ fn panic_text(p: Box<dyn std::any::Any + Send>) -> String {
         .unwrap_or_else(|| "unknown panic".into())
 }
 
+/// The fetch map stays usable after a panic elsewhere (it only holds abort handles).
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub struct Worker {
     rt: Option<tokio::runtime::Runtime>,
     pool: rayon::ThreadPool,
@@ -254,6 +425,11 @@ pub struct Worker {
     rx: Receiver<WorkerMsg>,
     fetcher: Option<Arc<Fetcher>>,
     frame: Frame,
+    /// Terrain every decode job meshes on (cloned into the job).
+    terrain: Terrain,
+    /// Seed world (api 1.7): synthetic-payload tiles come from its generator, terrain tiles get
+    /// its COLOR.
+    seed: Option<Arc<SeedWorld>>,
     profile: Arc<Profile>,
     cache_bytes: Arc<AtomicU64>,
     /// A disk cache folder is in use (tile source + non-empty `cache_dir`).
@@ -262,12 +438,25 @@ pub struct Worker {
     url: String,
     cache_dir: String,
     cache_cap: u64,
+    /// Fetches in flight by job id, for [`Worker::cancel`] (each task removes its own entry).
+    fetches: Arc<Mutex<AHashMap<u64, AbortHandle>>>,
 }
 
 impl Worker {
     /// `url` empty = synthetic city (no runtime / fetcher needed).
     pub fn new(frame: Frame, url: &str, cache_dir: &str, profile: Arc<Profile>) -> Result<Self, String> {
         Self::with_cache(frame, url, cache_dir, profile, None)
+    }
+
+    /// The terrain decode jobs mesh on (flat unless set; set before the first job).
+    pub fn set_terrain(&mut self, terrain: Terrain) {
+        self.terrain = terrain;
+    }
+
+    /// The seed world tiles are generated from (set before the first job; `None` = the old
+    /// synthetic city for an empty `tile_url`).
+    pub fn set_seed(&mut self, seed: Option<Arc<SeedWorld>>) {
+        self.seed = seed;
     }
 
     /// [`Worker::new`], reusing a disk cache that is already open (from
@@ -329,12 +518,15 @@ impl Worker {
             rx,
             fetcher,
             frame,
+            terrain: Terrain::flat(),
+            seed: None,
             profile,
             cache_bytes,
             disk_cache,
             url: url.to_string(),
             cache_dir: cache_dir.to_string(),
             cache_cap,
+            fetches: Arc::new(Mutex::new(AHashMap::new())),
         })
     }
 
@@ -383,6 +575,22 @@ impl Worker {
         self.cache_bytes.load(Ordering::Relaxed)
     }
 
+    /// Abort the fetches of these jobs (ids the scheduler orphaned: the tile left the cover or
+    /// its pending work became moot). Each still gets its `Fetched` reply, with
+    /// [`FetchErrorKind::Cancelled`], so the in-flight slot is freed at once instead of after
+    /// the request; a fetch that already finished replies normally. Unknown ids are ignored.
+    pub fn cancel(&self, jobs: &[u64]) {
+        if jobs.is_empty() {
+            return;
+        }
+        let mut map = lock(&self.fetches);
+        for j in jobs {
+            if let Some(h) = map.remove(j) {
+                h.abort();
+            }
+        }
+    }
+
     pub fn try_recv(&self) -> Option<WorkerMsg> {
         self.rx.try_recv().ok()
     }
@@ -401,23 +609,48 @@ impl Worker {
                     return;
                 };
                 let f = f.clone();
+                // Inner task so a panic or a cancel becomes a JoinError instead of a lost reply
+                // (the scheduler's in-flight counters need exactly one reply per job).
+                let inner = rt.spawn(async move { f.fetch(key).await });
+                let fetches = self.fetches.clone();
+                // Registered before the outer task exists, so its removal always comes after.
+                lock(&fetches).insert(job, inner.abort_handle());
                 rt.spawn(async move {
-                    // Inner task so a panic becomes a JoinError instead of a lost reply.
-                    let result = match tokio::spawn(async move { f.fetch(key).await }).await {
+                    let result = match inner.await {
                         Ok(r) => r,
+                        Err(e) if e.is_cancelled() => Err(FetchError::new(FetchErrorKind::Cancelled, format!("{key}: cancelled"))),
                         Err(e) => Err(format!("fetch task: {e}").into()),
                     };
+                    lock(&fetches).remove(&job);
                     let _ = tx.send(WorkerMsg::Fetched { key, ring, job, result });
                 });
             }
             Job::Decode { key, ring, job, payload } => {
                 let tx = self.tx.clone();
                 let frame = self.frame;
+                let terrain = self.terrain.clone();
                 let profile = self.profile.clone();
+                let seed = self.seed.clone();
                 self.pool.spawn(move || {
-                    let result = catch_unwind(AssertUnwindSafe(|| build_tile(key, ring, frame, &payload, &profile)))
+                    let result = catch_unwind(AssertUnwindSafe(|| match (&seed, &payload) {
+                        (Some(s), Payload::Synthetic) => build_seed_tile_on(key, ring, frame, &terrain, s, &profile),
+                        _ => build_tile_on(key, ring, frame, &terrain, &payload, &profile),
+                    }))
                         .unwrap_or_else(|p| Err(format!("decode panic: {}", panic_text(p))));
                     let _ = tx.send(WorkerMsg::Decoded { key, ring, job, result });
+                });
+            }
+            Job::Terrain { key, ring, job, detail } => {
+                let tx = self.tx.clone();
+                let frame = self.frame;
+                let terrain = self.terrain.clone();
+                let profile = self.profile.clone();
+                let seed = self.seed.clone();
+                self.pool.spawn(move || {
+                    let result =
+                        catch_unwind(AssertUnwindSafe(|| build_terrain_data(key, ring, frame, &terrain, &profile, detail, seed.as_deref())))
+                            .unwrap_or_else(|p| Err(format!("terrain panic: {}", panic_text(p))));
+                    let _ = tx.send(WorkerMsg::TerrainBuilt { key, ring, job, result });
                 });
             }
         }

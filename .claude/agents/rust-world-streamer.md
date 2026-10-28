@@ -34,7 +34,9 @@ lowpolymap/rust/
       diag.rs             # Log trait (info/warn/error), Diagnostics (profile, warnings_per_second)
       geo.rs              # Web Mercator, z/x/y, f64 ENU, floating origin
       rings.rs            # wanted set, look-ahead, hysteresis, priorities
-      scheduler.rs        # quadtree cover, sibling swap, fades, delivery guarantees
+      scheduler/          # mod.rs: Scheduler (quadtree cover, sibling swap, delivery guarantees, fetch cancel);
+                          #   state.rs (TileState, Entry, ReadyTile, Stats, CpuStats), fade.rs (Fade, fade_gap_m),
+                          #   sim.rs (GodotSim: the host visibility rule), tests.rs
       fetch.rs            # PMTiles over HTTPS range requests + SQLite disk cache (own cache thread; docs/spec-tile-cache.md)
       mvt.rs              # vector tile decode -> Building structs
       mesher.rs           # simplify, extrude walls, earcut roofs, merge per tile

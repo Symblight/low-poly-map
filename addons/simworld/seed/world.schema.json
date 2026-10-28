@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://simworld.local/seed/world.schema.json",
+  "title": "SimWorld seed world manifest (world.json)",
+  "description": "World manifest of a seed world (docs/spec-world-seed.md section 4.1): names the water file, the airport file (with filters and per-airport corrections) and the city files. Paths are res://, user:// or OS paths (relative paths resolve against the manifest's folder). Read by the library at configure time and by `simworld-cli seed validate`.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "world_version", "world_seed", "water", "airports", "cities"],
+  "$defs": {
+    "path": { "description": "File path: res://, user:// or an OS path (relative = against the manifest's folder).", "type": "string", "minLength": 1 },
+    "ident": { "description": "OurAirports ident (e.g. EYKA).", "type": "string", "pattern": "^[A-Za-z0-9_-]+$" },
+    "lat": { "description": "Latitude, WGS84 degrees (quantized to 1e-7 on load).", "type": "number", "minimum": -85, "maximum": 85 },
+    "lon": { "description": "Longitude, WGS84 degrees (quantized to 1e-7 on load).", "type": "number", "minimum": -180, "maximum": 180 },
+    "feet": { "description": "Feet.", "type": "number", "minimum": 0, "maximum": 100000 },
+    "runway_override": {
+      "description": "Corrections of one runway (any runway field of the airport file), or `remove: true`.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "le_lat": { "$ref": "#/$defs/lat" },
+        "le_lon": { "$ref": "#/$defs/lon" },
+        "he_lat": { "$ref": "#/$defs/lat" },
+        "he_lon": { "$ref": "#/$defs/lon" },
+        "width_ft": { "$ref": "#/$defs/feet" },
+        "length_ft": { "$ref": "#/$defs/feet" },
+        "surface": { "description": "OurAirports surface code (ASP, CON, GRS, ...).", "type": "string" },
+        "lighted": { "description": "Runway has lights.", "type": "boolean" },
+        "closed": { "description": "Runway is closed (not drawn).", "type": "boolean" },
+        "le_heading_degT": { "description": "True heading of the le end, degrees.", "type": "number", "minimum": 0, "maximum": 360 },
+        "le_displaced_threshold_ft": { "$ref": "#/$defs/feet" },
+        "he_displaced_threshold_ft": { "$ref": "#/$defs/feet" },
+        "remove": { "description": "true = drop this runway.", "type": "boolean" }
+      }
+    }
+  },
+  "properties": {
+    "format": { "description": "File format version. This library reads 1.", "type": "integer", "const": 1 },
+    "world_version": { "description": "The author's version of the whole world; logged and returned by seed_world_info(), not part of any hash.", "type": "integer", "minimum": 0, "maximum": 2147483647 },
+    "world_seed": { "description": "Root of every city seed (hashed once). Changing it re-rolls every city, never airports or water.", "type": "string", "minLength": 1 },
+    "water": { "$ref": "#/$defs/path" },
+    "airports": {
+      "description": "Airport file and selection.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file"],
+      "properties": {
+        "file": { "$ref": "#/$defs/path" },
+        "types": {
+          "description": "OurAirports types to include (default large_airport, medium_airport, small_airport).",
+          "type": "array",
+          "items": { "description": "OurAirports type.", "type": "string", "enum": ["large_airport", "medium_airport", "small_airport", "heliport", "seaplane_base", "balloonport", "closed"] }
+        },
+        "include": { "description": "Idents included regardless of their type.", "type": "array", "items": { "$ref": "#/$defs/ident" } },
+        "exclude": { "description": "Idents never included.", "type": "array", "items": { "$ref": "#/$defs/ident" } },
+        "overrides": {
+          "description": "Per-ident corrections, applied on load before everything else. An unknown ident or runway is an error.",
+          "type": "object",
+          "additionalProperties": {
+            "description": "Corrections of one airport.",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "lat": { "$ref": "#/$defs/lat" },
+              "lon": { "$ref": "#/$defs/lon" },
+              "elevation_ft": { "description": "Field elevation, feet (informational).", "type": "number", "minimum": -2000, "maximum": 30000 },
+              "type": { "description": "OurAirports type.", "type": "string", "enum": ["large_airport", "medium_airport", "small_airport", "heliport", "seaplane_base", "balloonport", "closed"] },
+              "runways": {
+                "description": "Per runway key \"<le>/<he>\" as in the airport file.",
+                "type": "object",
+                "additionalProperties": { "$ref": "#/$defs/runway_override" }
+              },
+              "add": {
+                "description": "Runways OurAirports lacks (same shape as the airport file's runways).",
+                "type": "array",
+                "items": { "$ref": "airports.schema.json#/$defs/runway" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "cities": { "description": "City files (section 4.2).", "type": "array", "items": { "$ref": "#/$defs/path" } },
+    "roads": { "$ref": "#/$defs/path" }
+  }
+}

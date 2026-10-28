@@ -1,0 +1,9 @@
+{
+  "format": 1,
+  "roads": [
+    { "id": "a1-vilnius-kaunas", "name": "A1", "class": "motorway", "lit": 0.0, "from": "vilnius", "to": "kaunas",
+      "points": [[25.1802, 54.6801], [24.9050, 54.7350], [24.5100, 54.8200], [24.0300, 54.8850]] },
+    { "id": "eyka-access", "class": "primary", "from": "kaunas", "to": "airport:EYKA",
+      "points": [[23.9790, 54.9150], [24.0600, 54.9550]] }
+  ]
+}

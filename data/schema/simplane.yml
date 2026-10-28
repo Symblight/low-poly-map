@@ -68,6 +68,35 @@ layers:
             value: '${ feature.tags.has("min_height") ? feature.tags.min_height.replace(",", ".").replaceRegex("^\\s*([0-9]+(?:\\.[0-9]+)?).*$", "$1") : "0" }'
           - key: colour
             tag_value: building:colour
+          # Night windows (docs/spec-night-windows.md section 1): raw tags the Rust side resolves
+          # through the world profile (light profiles landmark / dark, `buildings.dark_states`).
+          # Each one is written only when the tag is present; `kind` stays the raw `building`.
+          - key: historic
+            tag_value: historic
+          - key: man_made
+            tag_value: man_made
+          # `windows=yes|no`, else `window=yes|no`; other values (`many`, ...) are dropped.
+          - key: windows
+            type: boolean
+            include_when:
+              windows: ["yes", "no"]
+              window: ["yes", "no"]
+            value: '${ feature.tags.has("windows", "yes", "no") ? feature.tags.windows : feature.tags.window }'
+          - key: ruins
+            type: boolean
+            include_when:
+              ruins: "yes"
+            value: true
+          - key: disused
+            type: boolean
+            include_when:
+              disused: "yes"
+            value: true
+          - key: abandoned
+            type: boolean
+            include_when:
+              "abandoned:building": __any__
+            value: true
 
   - id: landuse
     buffer: 4

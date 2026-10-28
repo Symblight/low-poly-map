@@ -14,7 +14,7 @@ addons/simworld/            # THE LIBRARY ADDON (edit here, then run tools/sync_
   plugin.cfg, simworld.gdextension (bin/ holds built libraries, ignored)
   runtime/                   # WorldView (owns WorldStreamer, uploads tiles, origin shifts), IWorldCameraSource, WorldRenderSettings,
                              #   NightLook, ShaderGlobals, SimWorldPlugin, WorldStreamerFacade, TilePool, TileCover, TileKey
-  shaders/                   # building_day, ground, light_sprite, lod_dither.gdshaderinc, earth_curve.gdshaderinc (relative includes)
+  shaders/                   # building_windows, ground, light_sprite, lod_dither.gdshaderinc, earth_curve.gdshaderinc (relative includes)
   textures/light_dot_32.png  # 32×32 radial falloff
   profiles/                  # world profile JSON + schema
 low-poly-map/                # test bench (Godot project root); addons/ inside it is a generated copy, never edit it

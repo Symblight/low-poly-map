@@ -2,7 +2,10 @@
 //!
 //! Schema (custom planetiler profile):
 //! - layer `buildings`: `id` (OSM id, f64/int), `osm_type` ("way"/"relation"), `kind`, `height`,
-//!   `levels` (may be fractional), `min_height`, `colour`.
+//!   `levels` (may be fractional), `min_height`, `colour`; since the night-windows schema (W2)
+//!   also the optional `historic`, `man_made` (raw tag values), `windows` (bool, from `windows`
+//!   else `window`, yes/no only), `ruins`, `disused`, `abandoned` (bools), each written only
+//!   when the tag is present. Older archives lack them: every one defaults to "absent".
 //! - layer `landuse`: `id`, `kind` = `landuse` tag, or a leisure value (park, garden,
 //!   playground, pitch, golf_course, nature_reserve, recreation_ground), or a natural value
 //!   (water, wood, grassland, scrub, wetland), or `riverbank`. All of them feed the ground mesh
@@ -23,6 +26,7 @@ use mvt_reader::feature::Value;
 
 use crate::geo::{Frame, TileKey};
 use crate::profile::Profile;
+use crate::terrain::Terrain;
 
 pub const BUILDINGS_LAYER: &str = "buildings";
 pub const LANDUSE_LAYER: &str = "landuse";
@@ -134,6 +138,15 @@ pub struct GroundArea {
     pub level: u8,
     pub id: u64,
     pub rings: Vec<Vec<[f64; 2]>>,
+    /// Ground COLOR `g` = tint / 8 (api 1.7; 0..7, the countryside patchwork of a seed world;
+    /// always 0 for archive and synthetic-city areas).
+    pub tint: u8,
+    /// Ground COLOR `b` = sub-kind / 8 (api 1.7; class 7 `aeroway`: 0 field, 1 runway paved,
+    /// 2 runway grass, 3 taxiway, 4 apron; 0 for every other area).
+    pub sub: u8,
+    /// Cut by the tile's [`GroundFeatures::cutouts`] (a seed world's countryside and water under
+    /// an airport fence); false for every archive and synthetic-city area.
+    pub cut: bool,
 }
 
 /// One road feature (one or more polylines) in tile pixels.
@@ -152,6 +165,10 @@ pub struct RoadLine {
 pub struct GroundFeatures {
     pub areas: Vec<GroundArea>,
     pub roads: Vec<RoadLine>,
+    /// Convex quads (tile pixels, a seed world's airport fences) removed from every area with
+    /// `cut` set, so inside a fence only the airport's own areas stack (contract section 9
+    /// "Airports"). Empty for every archive and synthetic-city tile.
+    pub cutouts: Vec<[[f64; 2]; 4]>,
 }
 
 impl GroundFeatures {
@@ -177,6 +194,63 @@ impl GroundFeatures {
     }
 }
 
+/// Optional OSM tags of a building beyond `kind` (tile attributes, see module docs). All absent
+/// on archives built before the night-windows schema.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BuildingTags {
+    /// Raw `historic=*` value (`castle`, `ruins`, `city_gate`, ...).
+    pub historic: Option<String>,
+    /// Raw `man_made=*` value (`tower`, `chimney`, `water_tower`, ...).
+    pub man_made: Option<String>,
+    /// `windows=yes|no` (else `window=yes|no`); `None` = not tagged.
+    pub windows: Option<bool>,
+    /// `ruins=yes`.
+    pub ruins: bool,
+    /// `disused=yes`.
+    pub disused: bool,
+    /// Any `abandoned:building=*`.
+    pub abandoned: bool,
+}
+
+/// Largest spacing (m) of the base samples along a footprint edge ([`TileProjector::base_height`]).
+pub const BASE_EDGE_STEP_M: f64 = 10.0;
+/// At most this many parts per footprint edge (long walls of huge buildings).
+const BASE_EDGE_MAX_PARTS: usize = 64;
+/// Level of the global base-sampling lattice: points `i / 2^level` in fractional Mercator
+/// coordinates (2^-21 of the circumference: 19 m Mercator, about 11 m on the ground at 55 deg).
+pub const BASE_LATTICE_LEVEL: i32 = 21;
+/// Most lattice points per footprint bounding box (the lattice coarsens by 2 until it fits).
+const BASE_LATTICE_MAX: i64 = 64;
+
+/// Raised parts (`min_height` > 0.25 m) stand on the building under them (api 1.7): a raised
+/// part whose centroid lies inside the footprint of a building that stands on the ground takes
+/// that building's base (the highest such base when several overlap), so its bottom stays
+/// `min_height` above the lower part's base like its roof stays `min_height` above it, instead
+/// of following the (smaller) part footprint's own highest point. A raised part over nothing
+/// keeps its own base. No-op with the terrain off (every base is 0).
+pub fn stack_raised_parts(buildings: &mut [Building]) {
+    let raised: Vec<usize> = (0..buildings.len()).filter(|&i| buildings[i].min_height > 0.25).collect();
+    for i in raised {
+        let c = buildings[i].centroid_px;
+        let mut best: Option<f32> = None;
+        for (j, o) in buildings.iter().enumerate() {
+            if j == i || o.min_height > 0.25 {
+                continue;
+            }
+            if o.polygons.iter().any(|p| point_in_rings(c, p)) {
+                best = Some(best.map_or(o.base_m, |b| b.max(o.base_m)));
+            }
+        }
+        if let Some(b) = best {
+            buildings[i].base_m = b;
+        }
+    }
+}
+
+/// Encoder buffer of the `buildings` layer as a fraction of the tile extent (planetiler
+/// `buffer: 4` of 256 px = 64 of 4096 units; tileset structure, `data/schema/simplane.yml`).
+pub const ENCODER_BUFFER_FRACTION: f64 = 4.0 / 256.0;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Building {
     pub osm_type: OsmType,
@@ -187,14 +261,27 @@ pub struct Building {
     pub min_height: f32,
     /// Landuse at the building centroid (`None` = no landuse polygon there).
     pub landuse: Option<Landuse>,
+    /// `historic`, `man_made`, `windows` and the state tags.
+    pub tags: BuildingTags,
     /// Footprint as received (clipped by the encoder to tile + buffer), tile pixel space.
     pub polygons: PxPolygons,
+    /// The encoder cut the footprint at the tile + buffer boundary (a vertex lies on it), so
+    /// `polygons` and `footprint_m2` are only a piece of the building and differ per tile and
+    /// zoom.
+    pub clipped: bool,
+    /// Footprint area as received (exterior minus holes, all polygons), m² (at the tile
+    /// center's Mercator scale). Only meaningful when `clipped` is false.
+    pub footprint_m2: f32,
     /// Area centroid in tile pixels.
     pub centroid_px: [f64; 2],
     /// Area centroid (east, north) relative to the tile center, meters.
     pub centroid: [f32; 2],
-    /// Terrain height under the centroid (`geo::ground_height`), m. Walls, roofs and the light
-    /// point start from here (0 while the terrain is flat).
+    /// Building base (m above MSL): the HIGHEST terrain height under the footprint
+    /// (`TileProjector::base_height`, api 1.7; 0 with the terrain off). The roof is at
+    /// `base_m + height` and the window floors hang from it; walls reach down to the exact
+    /// ground at each of their vertices (`mesher`). Light points and beacons use
+    /// `base_m + height` too, so they stay on the roof. A raised part (`min_height` > 0.25 m)
+    /// takes the base of the building under it ([`stack_raised_parts`]).
     pub base_m: f32,
     /// True for exactly one of the tiles the building appears in (the tile containing its
     /// centroid). Buffer copies in neighbouring tiles are `false`. Used for light points; the
@@ -227,6 +314,7 @@ pub struct RawBuilding {
     pub levels: Option<f32>,
     pub min_height: f32,
     pub landuse: Option<Landuse>,
+    pub tags: BuildingTags,
     pub polygons: PxPolygons,
 }
 
@@ -271,21 +359,37 @@ pub fn centroid_px(polys: &[Vec<Vec<[f64; 2]>>]) -> Option<[f64; 2]> {
     }
 }
 
-/// Projects tile pixels to ENU relative to the tile center.
-#[derive(Clone, Copy, Debug)]
+/// Projects tile pixels to ENU relative to the tile center, with the terrain height there.
+/// Workers get their heights only through this (`Terrain` is part of the job): flat (0) unless
+/// built [`TileProjector::with_terrain`].
+#[derive(Clone, Debug)]
 pub struct TileProjector {
     key: TileKey,
     frame: Frame,
     extent: f64,
     center: [f64; 2],
+    terrain: Terrain,
 }
 
 impl TileProjector {
+    /// A projector over flat terrain (every height 0).
     pub fn new(key: TileKey, frame: Frame, extent: f64) -> Self {
-        Self { key, frame, extent, center: frame.tile_center(key) }
+        Self { key, frame, extent, center: frame.tile_center(key), terrain: Terrain::flat() }
+    }
+    /// The same projector sampling `terrain` for every height.
+    pub fn with_terrain(mut self, terrain: Terrain) -> Self {
+        self.terrain = terrain;
+        self
+    }
+    pub fn terrain(&self) -> &Terrain {
+        &self.terrain
     }
     pub fn key(&self) -> TileKey {
         self.key
+    }
+    /// WGS84 lat/lon of a tile pixel.
+    pub fn lat_lon(&self, px: [f64; 2]) -> (f64, f64) {
+        self.key.frac_to_lat_lon(px[0] / self.extent, px[1] / self.extent)
     }
     pub fn extent(&self) -> f64 {
         self.extent
@@ -299,14 +403,91 @@ impl TileProjector {
     }
     /// Tile pixel -> ((east, north) relative to the tile center, terrain height there).
     pub fn project_h(&self, px: [f64; 2]) -> ([f64; 2], f64) {
-        let (lat, lon) = self.key.frac_to_lat_lon(px[0] / self.extent, px[1] / self.extent);
+        let (lat, lon) = self.lat_lon(px);
         let [e, n] = self.frame.enu(lat, lon);
-        ([e - self.center[0], n - self.center[1]], crate::geo::ground_height(lat, lon))
+        ([e - self.center[0], n - self.center[1]], self.terrain.height(lat, lon))
+    }
+    /// [`TileProjector::project_h`] with the water-snapped height (`Terrain::water_height`).
+    pub fn project_water(&self, px: [f64; 2]) -> ([f64; 2], f64) {
+        let (lat, lon) = self.lat_lon(px);
+        let [e, n] = self.frame.enu(lat, lon);
+        ([e - self.center[0], n - self.center[1]], self.terrain.water_height(lat, lon))
     }
     /// Terrain height (m) at a tile pixel.
     pub fn ground_at(&self, px: [f64; 2]) -> f64 {
-        let (lat, lon) = self.key.frac_to_lat_lon(px[0] / self.extent, px[1] / self.extent);
-        crate::geo::ground_height(lat, lon)
+        let (lat, lon) = self.lat_lon(px);
+        self.terrain.height(lat, lon)
+    }
+    /// Building base (m), api 1.7: the HIGHEST terrain height under the footprint as decoded
+    /// (before the mesher's tile clipping and simplification, so every band and every tile the
+    /// building is meshed in samples the same outline; only the encoder's own buffer cut,
+    /// `Building::clipped`, can differ): every outer-ring vertex, points along every outer edge
+    /// at most [`BASE_EDGE_STEP_M`] apart (at least the midpoint), the centroid when it lies
+    /// inside, and the points of a global Mercator lattice inside the footprint
+    /// ([`BASE_LATTICE_LEVEL`], coarsened by powers of two to at most [`BASE_LATTICE_MAX`]
+    /// points), so a hill top inside a large footprint counts. With the terrain off, the height
+    /// at `centroid` (0, nothing else is sampled).
+    pub fn base_height(&self, polygons: &PxPolygons, centroid: [f64; 2]) -> f64 {
+        if !self.terrain.is_active() {
+            return self.ground_at(centroid);
+        }
+        let mut hi = f64::NEG_INFINITY;
+        let step_px = BASE_EDGE_STEP_M / self.m_per_px();
+        let (mut b0, mut b1) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+        for p in polygons {
+            let Some(outer) = p.first() else { continue };
+            let n = outer.len();
+            for i in 0..n {
+                let (a, b) = (outer[i], outer[(i + 1) % n]);
+                hi = hi.max(self.ground_at(a));
+                for k in 0..2 {
+                    b0[k] = b0[k].min(a[k]);
+                    b1[k] = b1[k].max(a[k]);
+                }
+                let len = crate::math::hypot(b[0] - a[0], b[1] - a[1]);
+                let parts = ((len / step_px).ceil() as usize).clamp(2, BASE_EDGE_MAX_PARTS);
+                for j in 1..parts {
+                    let t = j as f64 / parts as f64;
+                    hi = hi.max(self.ground_at([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]));
+                }
+            }
+        }
+        if !hi.is_finite() {
+            return self.ground_at(centroid);
+        }
+        let inside = |q: [f64; 2]| polygons.iter().any(|p| point_in_rings(q, p));
+        if inside(centroid) {
+            hi = hi.max(self.ground_at(centroid));
+        }
+        // Global lattice (fractional Mercator coordinates i / 2^level), the same points at every
+        // zoom: tile pixel = (i / 2^level * 2^z - x) * extent.
+        let (z, ext) = (self.key.z as i32, self.extent);
+        let to_g = |px: f64, t: u32| (t as f64 + px / ext) / (1u64 << z) as f64;
+        let (gx0, gx1) = (to_g(b0[0], self.key.x), to_g(b1[0], self.key.x));
+        let (gy0, gy1) = (to_g(b0[1], self.key.y), to_g(b1[1], self.key.y));
+        let mut level = BASE_LATTICE_LEVEL;
+        let range = |lv: i32| {
+            let s = (1u64 << lv) as f64;
+            let (ix0, ix1) = ((gx0 * s).ceil() as i64, (gx1 * s).floor() as i64);
+            let (iy0, iy1) = ((gy0 * s).ceil() as i64, (gy1 * s).floor() as i64);
+            (ix0, ix1, iy0, iy1)
+        };
+        let mut r = range(level);
+        while level > 0 && (r.1 - r.0 + 1).max(0) * (r.3 - r.2 + 1).max(0) > BASE_LATTICE_MAX {
+            level -= 1;
+            r = range(level);
+        }
+        let s = (1u64 << level) as f64;
+        let zs = (1u64 << z) as f64;
+        for iy in r.2..=r.3 {
+            for ix in r.0..=r.1 {
+                let q = [(ix as f64 / s * zs - self.key.x as f64) * ext, (iy as f64 / s * zs - self.key.y as f64) * ext];
+                if inside(q) {
+                    hi = hi.max(self.ground_at(q));
+                }
+            }
+        }
+        hi
     }
     pub fn project(&self, px: [f64; 2]) -> [f32; 2] {
         let [e, n] = self.project64(px);
@@ -326,6 +507,21 @@ impl TileProjector {
         if polygons.is_empty() {
             return None;
         }
+        // A vertex on (or beyond) the encoder's buffer line: the footprint was cut there.
+        let buf = self.extent * ENCODER_BUFFER_FRACTION;
+        let (lo, hi) = (-buf + 1.0, self.extent + buf - 1.0);
+        let clipped = polygons
+            .iter()
+            .flatten()
+            .flatten()
+            .any(|p| p[0] <= lo || p[0] >= hi || p[1] <= lo || p[1] >= hi);
+        let area_px2: f64 = polygons
+            .iter()
+            .map(|p| ring_area2(&p[0]).abs() - p[1..].iter().map(|h| ring_area2(h).abs()).sum::<f64>())
+            .sum::<f64>()
+            * 0.5;
+        let mpp = self.m_per_px();
+        let base_m = self.base_height(&polygons, c) as f32;
         Some(Building {
             osm_type: raw.osm_type,
             id: raw.id,
@@ -334,10 +530,13 @@ impl TileProjector {
             levels: raw.levels,
             min_height: raw.min_height,
             landuse: raw.landuse,
+            tags: raw.tags,
             polygons,
+            clipped,
+            footprint_m2: (area_px2.max(0.0) * mpp * mpp) as f32,
             centroid_px: c,
             centroid: self.project(c),
-            base_m: self.ground_at(c) as f32,
+            base_m,
             owned,
         })
     }
@@ -370,6 +569,34 @@ fn text(v: &Value) -> Option<String> {
         Value::Bool(b) => Some(b.to_string()),
         Value::Null => None,
         other => num(other).map(|n| n.to_string()),
+    }
+}
+
+/// A boolean tile attribute: MVT bool, or the strings `yes` / `true` / `1` (and numbers != 0).
+fn flag(v: &Value) -> Option<bool> {
+    match v {
+        Value::Bool(b) => Some(*b),
+        Value::String(s) => match s.trim() {
+            "yes" | "true" | "1" => Some(true),
+            "no" | "false" | "0" => Some(false),
+            _ => None,
+        },
+        Value::Null => None,
+        other => num(other).map(|n| n != 0.0),
+    }
+}
+
+/// The optional building tags of a feature (absent attributes = absent tags).
+fn building_tags(props: &HashMap<String, Value>) -> BuildingTags {
+    let s = |k: &str| props.get(k).and_then(text).map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+    let b = |k: &str| props.get(k).and_then(flag).unwrap_or(false);
+    BuildingTags {
+        historic: s("historic"),
+        man_made: s("man_made"),
+        windows: props.get("windows").and_then(flag),
+        ruins: b("ruins"),
+        disused: b("disused"),
+        abandoned: b("abandoned"),
     }
 }
 
@@ -582,7 +809,7 @@ fn decode_landuse(
                     if fallback {
                         polys.push((class, id, rings.clone()));
                     }
-                    a.push(GroundArea { class: gclass, level, id, rings });
+                    a.push(GroundArea { class: gclass, level, id, rings, tint: 0, sub: 0, cut: false });
                 }
                 None if fallback => polys.push((class, id, rings)),
                 None => {}
@@ -625,7 +852,7 @@ fn decode_roads(
 /// Decode the `buildings` layer of an MVT tile (gzip or raw) into buildings; each building's
 /// landuse is resolved from the tile's `landuse` layer at its centroid.
 pub fn decode_buildings(bytes: &[u8], key: TileKey, frame: Frame, profile: &Profile) -> Result<Vec<Building>, String> {
-    decode_tile(bytes, key, frame, false, profile).map(|t| t.buildings)
+    decode_tile(bytes, key, frame, false, false, profile).map(|t| t.buildings)
 }
 
 /// One decoded tile: buildings, ground features (only when requested) and the projector.
@@ -636,12 +863,34 @@ pub struct DecodedTile {
     pub proj: TileProjector,
 }
 
-/// Decode buildings (always) and, with `want_ground`, the `landuse` areas and `roads` lines.
-pub fn decode_tile(bytes: &[u8], key: TileKey, frame: Frame, want_ground: bool, profile: &Profile) -> Result<DecodedTile, String> {
+/// Decode buildings (always) and, with `want_ground`, the `landuse` areas, with `want_roads` the `roads` lines (ground
+/// meshes need both; street lamps need roads only, also on R3). Flat terrain; see [`decode_tile_on`].
+pub fn decode_tile(
+    bytes: &[u8],
+    key: TileKey,
+    frame: Frame,
+    want_ground: bool,
+    want_roads: bool,
+    profile: &Profile,
+) -> Result<DecodedTile, String> {
+    decode_tile_on(bytes, key, frame, &Terrain::flat(), want_ground, want_roads, profile)
+}
+
+/// [`decode_tile`] on `terrain`: building bases and every later height of the tile come from it
+/// (the projector carries it).
+pub fn decode_tile_on(
+    bytes: &[u8],
+    key: TileKey,
+    frame: Frame,
+    terrain: &Terrain,
+    want_ground: bool,
+    want_roads: bool,
+    profile: &Profile,
+) -> Result<DecodedTile, String> {
     let empty_tile = || DecodedTile {
         buildings: Vec::new(),
         ground: GroundFeatures::default(),
-        proj: TileProjector::new(key, frame, 4096.0),
+        proj: TileProjector::new(key, frame, 4096.0).with_terrain(terrain.clone()),
     };
     if bytes.is_empty() {
         return Ok(empty_tile());
@@ -651,8 +900,10 @@ pub fn decode_tile(bytes: &[u8], key: TileKey, frame: Frame, want_ground: bool, 
     let layers = reader.get_layer_metadata().map_err(|e| format!("mvt layers: {e:?}"))?;
     let mut ground = GroundFeatures::default();
     let landuse = decode_landuse(&reader, &layers, want_ground.then_some(&mut ground.areas), profile)?;
-    if want_ground {
+    if want_roads {
         decode_roads(&reader, &layers, &mut ground.roads, profile)?;
+    }
+    if want_ground || want_roads {
         ground.sort();
     }
     // All layers share the tile's extent (4096 in our archive); take it from whichever exists.
@@ -661,7 +912,7 @@ pub fn decode_tile(bytes: &[u8], key: TileKey, frame: Frame, want_ground: bool, 
         .find(|l| l.name == BUILDINGS_LAYER)
         .or_else(|| layers.iter().find(|l| l.name == LANDUSE_LAYER || l.name == ROADS_LAYER))
         .map_or(4096.0, layer_extent);
-    let proj = TileProjector::new(key, frame, extent);
+    let proj = TileProjector::new(key, frame, extent).with_terrain(terrain.clone());
     let Some(layer) = layers.iter().find(|l| l.name == BUILDINGS_LAYER) else {
         return Ok(DecodedTile { buildings: Vec::new(), ground, proj });
     };
@@ -693,6 +944,7 @@ pub fn decode_tile(bytes: &[u8], key: TileKey, frame: Frame, want_ground: bool, 
             levels: props.get("levels").and_then(num).map(|v| v as f32),
             min_height: props.get("min_height").and_then(num).unwrap_or(0.0).max(0.0) as f32,
             landuse: lu,
+            tags: building_tags(props),
             polygons,
         };
         if let Some(b) = proj.finish(raw) {
@@ -706,6 +958,9 @@ pub fn decode_tile(bytes: &[u8], key: TileKey, frame: Frame, want_ground: bool, 
             .then(a.centroid_px[0].total_cmp(&b.centroid_px[0]))
             .then(a.centroid_px[1].total_cmp(&b.centroid_px[1]))
     });
+    if terrain.is_active() {
+        stack_raised_parts(&mut out);
+    }
     Ok(DecodedTile { buildings: out, ground, proj })
 }
 
@@ -735,6 +990,7 @@ pub(crate) mod test_mvt {
     pub enum Val {
         S(&'static str),
         D(f64),
+        B(bool),
     }
 
     pub struct Feat {
@@ -773,6 +1029,10 @@ pub(crate) mod test_mvt {
                     Val::D(d) => {
                         tag(&mut vb, 3, 1);
                         vb.extend_from_slice(&d.to_le_bytes());
+                    }
+                    Val::B(b) => {
+                        tag(&mut vb, 7, 0);
+                        varint(&mut vb, *b as u64);
                     }
                 }
                 vals.push(vb);
@@ -905,6 +1165,61 @@ mod tests {
         assert!(!b.owned);
     }
 
+    /// Night-window attributes (W2 tile schema): decoded when present, absent otherwise (old
+    /// archives); `clipped` / `footprint_m2` from the received geometry.
+    #[test]
+    fn decodes_night_window_attributes_and_clipping() {
+        let t = encode_layer(
+            "buildings",
+            &[
+                Feat {
+                    id: 10,
+                    rings: vec![square(1000, 1000, 100)],
+                    props: vec![
+                        ("id", Val::D(1.0)),
+                        ("osm_type", Val::S("way")),
+                        ("kind", Val::S("yes")),
+                        ("historic", Val::S("castle")),
+                        ("man_made", Val::S("tower")),
+                        ("windows", Val::B(false)),
+                        ("ruins", Val::B(true)),
+                        ("disused", Val::B(true)),
+                        ("abandoned", Val::S("yes")),
+                    ],
+                },
+                // Old archive: none of the attributes. Cut by the encoder at the -64 buffer line.
+                Feat { id: 20, rings: vec![square(-64, 2000, 200)], props: vec![("id", Val::D(2.0)), ("kind", Val::S("yes"))] },
+                Feat { id: 30, rings: vec![square(3000, 3000, 100)], props: vec![("id", Val::D(3.0)), ("windows", Val::B(true))] },
+            ],
+        );
+        let key = TileKey::new(16, 37370, 20827);
+        let frame = Frame::new(54.6872, 25.2797);
+        let bs = decode_buildings(&t, key, frame, &Profile::default()).unwrap();
+        let get = |id| bs.iter().find(|b| b.id == id).unwrap();
+        let a = get(1);
+        assert_eq!(
+            a.tags,
+            BuildingTags {
+                historic: Some("castle".into()),
+                man_made: Some("tower".into()),
+                windows: Some(false),
+                ruins: true,
+                disused: true,
+                abandoned: true
+            }
+        );
+        assert!(!a.clipped);
+        let mpp = TileProjector::new(key, frame, 4096.0).m_per_px();
+        assert!(((a.footprint_m2 as f64) - 100.0 * 100.0 * mpp * mpp).abs() < 0.01, "{}", a.footprint_m2);
+        let b = get(2);
+        assert_eq!(b.tags, BuildingTags::default());
+        assert!(b.clipped);
+        assert_eq!(get(3).tags.windows, Some(true));
+        assert!(!get(3).clipped);
+        // Ruins + disused: dark whatever the historic / man_made values say.
+        assert_eq!(crate::mesher::resolve(a, &Profile::default()).profile, crate::mesher::PROFILE_DARK);
+    }
+
     #[test]
     fn gzip_and_determinism() {
         use std::io::Write;
@@ -938,7 +1253,10 @@ mod tests {
             levels: None,
             min_height: 0.0,
             landuse: None,
+            tags: BuildingTags::default(),
             polygons: vec![],
+            clipped: false,
+            footprint_m2: 0.0,
             centroid_px: [0.0; 2],
             centroid: [0.0; 2],
             base_m: 0.0,
@@ -989,7 +1307,7 @@ mod tests {
         ));
         let key = TileKey::new(16, 37370, 20827);
         let frame = Frame::new(54.6872, 25.2797);
-        let d = decode_tile(&t, key, frame, true, &Profile::default()).unwrap();
+        let d = decode_tile(&t, key, frame, true, true, &Profile::default()).unwrap();
         assert_eq!(d.buildings.len(), 1);
         assert_eq!(d.buildings[0].landuse, Some(Landuse::Residential));
         assert_eq!(d.buildings[0].base_m, 0.0);
@@ -1004,7 +1322,7 @@ mod tests {
         assert_eq!((g.roads[1].class, g.roads[1].lit), (ROAD_PRIMARY, true));
         assert_eq!(g.roads[1].lines[0].len(), 3);
         // Without ground: same buildings, no ground.
-        let nb = decode_tile(&t, key, frame, false, &Profile::default()).unwrap();
+        let nb = decode_tile(&t, key, frame, false, false, &Profile::default()).unwrap();
         assert!(nb.ground.is_empty());
         assert_eq!(nb.buildings, d.buildings);
         // Meshes: R0 has the footway, R1 not.

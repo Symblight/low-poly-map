@@ -9,6 +9,10 @@
 //! started by a `poll_ready` delivery is already in that frame's `poll_fades`. Re-centering happens inside `update_camera`; every position handed out
 //! afterwards (`poll_ready` origins, `debug_tiles` rects) is in the post-shift local frame.
 //!
+//! Layers (api 1.5): a host that requested the layer `terrain` (and whose profile enables it)
+//! also gets terrain tiles, keys `"t/z/x/y"`, through the same `poll_ready` / `poll_fades` /
+//! `poll_unload`; every ready tile carries `layer` (`"world"` / `"terrain"`).
+//!
 //! Signals (api 0.7) are emitted on the main thread from inside the calls that cause them:
 //! `origin_shifted` from `update_camera` / `update_camera_geodetic`, `status_changed` from those
 //! and `poll_ready`. Emission goes through `base_mut()` (gdext typed signals), so handlers may
@@ -20,10 +24,10 @@ use godot::classes::mesh::ArrayType;
 use godot::classes::INode;
 use godot::prelude::*;
 
-use simworld_core::geo::TileKey;
+use simworld_core::latency::{Latency, STAGES};
 use simworld_core::mesher::MeshData;
-use simworld_core::rings::RING_COUNT;
-use simworld_core::{ConfigureResult, Log, Status, World, API_MAJOR, API_MINOR};
+use simworld_core::rings::{LayerKey, LayerKind, MAX_RINGS, RING_COUNT};
+use simworld_core::{AirportInfo, ConfigureResult, Log, RunwayEndInfo, SeedInfo, Status, World, API_MAJOR, API_MINOR};
 
 use crate::convert::{json_to_variant, options_from_dict};
 use crate::host::{diagnostics_from_env, GodotLog};
@@ -81,16 +85,145 @@ fn mesh_array(m: &MeshData) -> VarArray {
     a
 }
 
+/// Terrain mesh (api 1.5): `Mesh.ARRAY_MAX`-length Array with VERTEX and INDEX, plus NORMAL
+/// when the mesh has normals (`terrain.shading = "smooth"`) and COLOR in a seed world (api 1.7:
+/// r = ground class / 8, g = tint / 8); every other slot nil. Empty Array when there is no
+/// terrain mesh (vector tiles).
+fn terrain_array(m: &MeshData) -> VarArray {
+    let mut a = VarArray::new();
+    if m.is_empty() {
+        return a;
+    }
+    a.resize(ArrayType::MAX.ord() as usize, &Variant::nil());
+    a.set(ArrayType::VERTEX.ord() as usize, &PackedVector3Array::from(as_v3(&m.positions)).to_variant());
+    if !m.normals.is_empty() {
+        a.set(ArrayType::NORMAL.ord() as usize, &PackedVector3Array::from(as_v3(&m.normals)).to_variant());
+    }
+    if !m.colors.is_empty() {
+        a.set(ArrayType::COLOR.ord() as usize, &PackedColorArray::from(as_col(&m.colors)).to_variant());
+    }
+    a.set(ArrayType::INDEX.ord() as usize, &PackedInt32Array::from(&m.indices[..]).to_variant());
+    a
+}
+
 fn per_ring(v: [i32; RING_COUNT]) -> PackedInt32Array {
     PackedInt32Array::from(&v[..])
 }
 
-fn key_string(k: TileKey) -> GString {
+fn per_terrain_ring(v: &[i32; MAX_RINGS], rings: usize) -> PackedInt32Array {
+    PackedInt32Array::from(&v[..rings.min(MAX_RINGS)])
+}
+
+/// `debug_stats()["latency"]` (api 1.3): stage name -> { p50, p95, max (ms), n } per band.
+fn latency_dict(l: &Latency) -> VarDictionary {
+    let mut out = VarDictionary::new();
+    for st in STAGES {
+        let s: [_; RING_COUNT] = std::array::from_fn(|r| l.summary(st, r));
+        let mut d = VarDictionary::new();
+        d.set("p50", &PackedFloat32Array::from(&s.map(|x| x.p50)[..]));
+        d.set("p95", &PackedFloat32Array::from(&s.map(|x| x.p95)[..]));
+        d.set("max", &PackedFloat32Array::from(&s.map(|x| x.max)[..]));
+        d.set("n", &PackedInt32Array::from(&s.map(|x| x.n as i32)[..]));
+        out.set(st.name(), &d);
+    }
+    out
+}
+
+/// `"z/x/y"` (world) or `"t/z/x/y"` (terrain).
+fn key_string(k: LayerKey) -> GString {
     GString::from(k.to_string().as_str())
 }
 
 fn v3(p: [f64; 3]) -> Vector3 {
     Vector3::new(p[0] as f32, p[1] as f32, p[2] as f32)
+}
+
+fn end_dict(e: &RunwayEndInfo) -> VarDictionary {
+    let mut d = VarDictionary::new();
+    d.set("ident", &GString::from(e.ident.as_str()));
+    d.set("lat", e.lat);
+    d.set("lon", e.lon);
+    d.set("position", v3(e.position));
+    d.set("threshold_lat", e.threshold_lat);
+    d.set("threshold_lon", e.threshold_lon);
+    d.set("threshold_position", v3(e.threshold_position));
+    d.set("displaced_threshold_m", e.displaced_threshold_m);
+    d.set("touchdown_position", v3(e.touchdown_position));
+    d.set("heading_deg", e.heading_deg);
+    d
+}
+
+/// `airports()` entry (api 1.7).
+fn airport_dict(a: &AirportInfo) -> VarDictionary {
+    let mut d = VarDictionary::new();
+    d.set("ident", &GString::from(a.ident.as_str()));
+    d.set("name", &GString::from(a.name.as_str()));
+    d.set("type", &GString::from(a.kind.as_str()));
+    d.set("lat", a.lat);
+    d.set("lon", a.lon);
+    d.set("position", v3(a.position));
+    match a.elevation_ft {
+        Some(e) => d.set("elevation_ft", e),
+        None => d.set("elevation_ft", &Variant::nil()),
+    }
+    let mut runways: Array<VarDictionary> = Array::new();
+    for r in &a.runways {
+        let mut rd = VarDictionary::new();
+        rd.set("designator", &GString::from(r.designator.as_str()));
+        rd.set("le", &end_dict(&r.le));
+        rd.set("he", &end_dict(&r.he));
+        rd.set("length_m", r.length_m);
+        rd.set("width_m", r.width_m);
+        rd.set("surface", &GString::from(r.surface.as_str()));
+        rd.set("paved", r.paved);
+        rd.set("lighted", r.lighted);
+        rd.set("approximate", r.approximate);
+        let lights: Vec<Vector3> = r.lights.iter().map(|p| v3(*p)).collect();
+        rd.set("lights", &PackedVector3Array::from(&lights[..]));
+        rd.set("light_colors", &PackedColorArray::from(as_col(&r.light_colors)));
+        runways.push(&rd);
+    }
+    d.set("runways", &runways);
+    d
+}
+
+/// `seed_world_info()` (api 1.7).
+fn seed_info_dict(i: &SeedInfo) -> VarDictionary {
+    let mut d = VarDictionary::new();
+    d.set("manifest", &GString::from(i.manifest.as_str()));
+    d.set("generator_version", i.generator_version as i64);
+    let phases: PackedStringArray = i.phases.iter().map(|s| GString::from(s.as_str())).collect();
+    d.set("phases", &phases);
+    d.set("world_version", i.world_version);
+    d.set("world_seed", &GString::from(i.world_seed.as_str()));
+    let mut cities: Array<VarDictionary> = Array::new();
+    for c in &i.cities {
+        let mut cd = VarDictionary::new();
+        cd.set("id", &GString::from(c.id.as_str()));
+        cd.set("name", &GString::from(c.name.as_str()));
+        cd.set("lat", c.lat);
+        cd.set("lon", c.lon);
+        cd.set("radius_km", c.radius_km);
+        cd.set("version", c.version);
+        cd.set("source", &GString::from(c.source.as_str()));
+        let ap: PackedStringArray = c.airports.iter().map(|s| GString::from(s.as_str())).collect();
+        cd.set("airports", &ap);
+        cities.push(&cd);
+    }
+    d.set("cities", &cities);
+    d.set("airports", i.airports as i64);
+    d.set("water_polygons", i.water_polygons as i64);
+    let warnings: PackedStringArray = i.warnings.iter().map(|s| GString::from(s.as_str())).collect();
+    d.set("warnings", &warnings);
+    let mb = |b: usize| b as f64 / 1_048_576.0;
+    let mut m = VarDictionary::new();
+    m.set("water_index_mb", mb(i.stats.water_index_bytes));
+    m.set("water_raster_mb", mb(i.stats.water_raster_bytes));
+    m.set("strip_index_kb", i.stats.strip_index_bytes as f64 / 1024.0);
+    m.set("airports_kb", i.stats.airport_bytes as f64 / 1024.0);
+    m.set("load_ms", i.stats.build_ms);
+    d.set("memory", &m);
+    d
 }
 
 fn status_dict(s: &Status) -> VarDictionary {
@@ -99,6 +232,7 @@ fn status_dict(s: &Status) -> VarDictionary {
     d.set("message", &GString::from(s.message.as_str()));
     d.set("failed_fetches", s.failed_fetches.min(i64::MAX as u64) as i64);
     d.set("last_error", &GString::from(s.last_error.as_str()));
+    d.set("terrain_active", s.terrain_active);
     d
 }
 
@@ -234,7 +368,8 @@ impl WorldStreamer {
         let mut out = Array::new();
         self.world.pop_ready(max.max(0) as usize, |t| {
             let mut d = VarDictionary::new();
-            d.set("key", &key_string(t.key));
+            d.set("key", &key_string(t.layer_key()));
+            d.set("layer", &GString::from(t.layer.name()));
             d.set("ring", t.ring as i64);
             d.set("origin", Vector3::new(t.origin[0] as f32, t.origin[1] as f32, t.origin[2] as f32));
             d.set("mesh", &mesh_array(t.mesh));
@@ -242,6 +377,19 @@ impl WorldStreamer {
             d.set("ground", &mesh_array(t.ground));
             d.set("lights", &PackedVector3Array::from(as_v3(t.lights)));
             d.set("light_colors", &PackedColorArray::from(as_col(t.light_colors)));
+            d.set("street_lights", &PackedVector3Array::from(as_v3(t.street_lights)));
+            d.set("street_light_colors", &PackedColorArray::from(as_col(t.street_light_colors)));
+            d.set("beacon_lights", &PackedVector3Array::from(as_v3(t.beacon_lights)));
+            d.set("beacon_light_colors", &PackedColorArray::from(as_col(t.beacon_light_colors)));
+            // api 1.7: airport lights of a seed world (empty elsewhere).
+            d.set("airport_lights", &PackedVector3Array::from(as_v3(t.airport_lights)));
+            d.set("airport_light_colors", &PackedColorArray::from(as_col(t.airport_light_colors)));
+            // api 1.5: the terrain mesh (empty Array on vector tiles), its height range.
+            d.set("terrain", &terrain_array(t.terrain));
+            if t.layer == LayerKind::Terrain {
+                d.set("h_min", t.h_min);
+                d.set("h_max", t.h_max);
+            }
             out.push(&d);
         });
         self.emit_status_change();
@@ -290,6 +438,19 @@ impl WorldStreamer {
         d.set("version", &GString::from(self.world.version()));
         d.set("api_major", API_MAJOR as i64);
         d.set("api_minor", API_MINOR as i64);
+        if let Some(l) = self.world.latency() {
+            d.set("latency", &latency_dict(l));
+        }
+        // api 1.5: terrain-mesh layer counters, only while the layer runs.
+        if self.world.terrain_layer_active() {
+            let n = st.terrain_rings;
+            d.set("terrain_queued", &per_terrain_ring(&st.terrain_queued, n));
+            d.set("terrain_fetching", &per_terrain_ring(&st.terrain_fetching, n));
+            d.set("terrain_meshing", &per_terrain_ring(&st.terrain_meshing, n));
+            d.set("terrain_loaded", &per_terrain_ring(&st.terrain_loaded, n));
+            d.set("terrain_tris", st.terrain_tris.min(i64::MAX as u64) as i64);
+            d.set("terrain_detail", self.world.terrain_detail());
+        }
         d
     }
 
@@ -301,21 +462,52 @@ impl WorldStreamer {
         Vector2i::new(API_MAJOR as i32, API_MINOR as i32)
     }
 
-    /// Terrain height (m) under a point in current local x/z meters: `geo::ground_height` at the
-    /// point's lat/lon (through the current floating origin). 0 until a DEM spike; called by
+    /// Terrain height (m) under a point in current local x/z meters: `Terrain::height` at the
+    /// point's lat/lon (through the current floating origin). 0 with the terrain off; called by
     /// C# once per frame for height above ground, so it stays a few microseconds.
     #[func]
     fn ground_height_at(&self, local_x: f64, local_z: f64) -> f64 {
         self.world.ground_height_at(local_x, local_z)
     }
 
+    /// Terrain detail (api 1.5): multiplies every terrain band's `max_error_m` by `scale`,
+    /// clamped to [0.25, `terrain.detail_scale_max`] (1 = the profile). Held terrain tiles are
+    /// re-meshed and re-delivered under the same keys, nearest first, at the re-delivery rate.
+    /// Returns the scale in effect.
+    #[func]
+    fn set_terrain_detail(&mut self, scale: f64) -> f64 {
+        self.world.set_terrain_detail(scale)
+    }
+
+    /// Airports of a seed world (api 1.7): ident, name, type, reference point, runways with both
+    /// ends, thresholds, touchdown points and lights, in the current local frame (call again
+    /// after `origin_shifted`). Empty without a seed world.
+    #[func]
+    fn airports(&self) -> Array<VarDictionary> {
+        let mut out = Array::new();
+        for a in self.world.airports() {
+            out.push(&airport_dict(&a));
+        }
+        out
+    }
+
+    /// The seed world (api 1.7): generator version, built phases, world version and seed,
+    /// cities, counts, validation warnings and measured sizes. Empty without a seed world.
+    #[func]
+    fn seed_world_info(&self) -> VarDictionary {
+        self.world.seed_world_info().map_or_else(VarDictionary::new, |i| seed_info_dict(&i))
+    }
+
     /// One entry per tracked tile: key, ring, state, min, max (local x/z meters).
     #[func]
     fn debug_tiles(&self) -> Array<VarDictionary> {
         let mut out = Array::new();
+        let source = |l| self.world.tile_source(l);
         self.world.debug_tiles(|key, ring, state, [x0, z0, x1, z1]| {
             let mut d = VarDictionary::new();
             d.set("key", &key_string(key));
+            d.set("layer", &GString::from(key.layer.name()));
+            d.set("source", &GString::from(source(key.layer)));
             d.set("ring", ring as i64);
             d.set("state", &GString::from(state));
             d.set("min", Vector2::new(x0 as f32, z0 as f32));

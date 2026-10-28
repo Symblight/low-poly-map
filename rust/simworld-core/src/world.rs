@@ -44,7 +44,7 @@ use crate::terrain::Terrain;
 use crate::status::{Health, Status, StatusState, MSG_NOT_CONFIGURED, MSG_SHUT_DOWN};
 use crate::worker::{Job, Worker, WorkerMsg};
 
-mod lod;
+pub mod lod;
 
 /// Bounded wait of `shutdown` and of a re-configure that replaces a worker using a disk cache
 /// (until the old cache thread has flushed and closed its file).
@@ -578,6 +578,7 @@ impl World {
         let Some(w) = &self.worker else { return };
         let mut ids = std::mem::take(&mut self.cancel_buf);
         if let Some(s) = &mut self.scheduler {
+            w.release(s.take_released_data()); // decoded data tiles are freed off the main thread
             s.drain_cancelled(&mut ids);
             w.cancel(LayerKind::World, &ids);
             ids.clear();

@@ -130,8 +130,10 @@ fn geodetic_camera_drives_the_same_cover_and_reports_the_shift() {
     assert!(!ta.is_empty());
     assert_eq!(ta, tiles(&b));
 
-    // Invalid input: rejected, logged, nothing changes.
-    let stats = a.stats();
+    // Invalid input: rejected, logged, nothing changes. (The job pool's counters move on the
+    // worker threads meanwhile; they are not state of the camera call.)
+    let stats_now = |w: &World| crate::world::WorldStats { jobs: Default::default(), ..w.stats() };
+    let stats = stats_now(&a);
     for (lat, lon, alt, v) in [
         (f64::NAN, g[1], 400.0, vel_ned),
         (95.0, g[1], 400.0, vel_ned),
@@ -141,7 +143,7 @@ fn geodetic_camera_drives_the_same_cover_and_reports_the_shift() {
     ] {
         assert!(a.update_camera_geodetic(lat, lon, alt, v).is_err());
     }
-    assert_eq!(a.stats(), stats);
+    assert_eq!(stats_now(&a), stats);
     assert_eq!(tiles(&a), ta);
 
     // A > 5 km jump re-centers: returned once, and take_origin_shift reports the same vector.

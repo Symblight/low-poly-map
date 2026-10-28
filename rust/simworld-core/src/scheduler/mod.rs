@@ -102,13 +102,17 @@ mod data_mem;
 mod data_needs;
 mod fade;
 mod landmarks;
+mod plan_memo;
 pub mod sim;
 mod state;
 mod terrain_plan;
+mod view;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod budget_tests;
+#[cfg(test)]
+mod plan_memo_tests;
 
 pub use data::{DataStats, DataStore};
 pub use landmarks::LandmarkStats;
@@ -130,12 +134,16 @@ use crate::geo::{Frame, RectEn, TileKey};
 use crate::latency::{Latency, Stage, TileTimes};
 use crate::mesher::MeshData;
 use crate::profile::Profile;
-use crate::rings::{above_horizon, children, horizon_line_m, look_ahead, Layer, LayerKind, ViewPoint, MAX_BOX_HEIGHT_M, MAX_RINGS, RING_COUNT};
+use crate::rings::{children, Layer, LayerKind, ViewPoint, MAX_BOX_HEIGHT_M, MAX_RINGS, RING_COUNT};
+use crate::gen_cache::GenCache;
 use crate::terrain::height::ErrorProxy;
 use crate::terrain::Terrain;
 use crate::jobs::Priority;
 use crate::data::DataLevels;
 use crate::worker::{DataRef, Job, LmRef, Payload, WorkerMsg};
+
+/// Entries of the tile-box memo ([`Scheduler::terrain_box_of`]).
+const TERRAIN_CACHE_CAP: usize = 8192;
 
 // Tuning (world profile): `streaming.max_fetch_per_band` / `max_mesh_per_band` (jobs in flight
 // per band), `lights.cluster_on_agl_m` / `cluster_off_agl_m` (light carpet switch),
@@ -147,8 +155,8 @@ pub struct Scheduler {
     /// Heights of the tile boxes and view points (flat unless set with `with_terrain`).
     terrain: Terrain,
     /// `Terrain::tile_range` of root candidates without an entry (a pure function of the key,
-    /// so the cache never changes a result; cleared when it grows large).
-    terrain_cache: AHashMap<TileKey, [f64; 2]>,
+    /// so the cache never changes a result; bounded, evicts gradually).
+    terrain_cache: GenCache<TileKey, [f64; 2]>,
     profile: Arc<Profile>,
     /// The quadtree layer this scheduler runs (zooms, edges, hysteresis, limits, horizon cull).
     layer: Layer,
@@ -208,6 +216,11 @@ pub struct Scheduler {
     t_roots: ahash::AHashSet<TileKey>,
     t_work: Vec<TileKey>,
     t_heap: std::collections::BinaryHeap<SplitCandidate>,
+    /// Terrain layer: when the last plan can be reused (`plan_memo`).
+    plan_memo: plan_memo::PlanMemo,
+    /// Tests: recompute every reused plan and assert it equals the fresh one.
+    #[cfg(test)]
+    pub(crate) verify_plan_reuse: bool,
     balance_forced: usize,
     /// Terrain layer: SSE splits the tile budget (`terrain.max_tiles`) left out in the last
     /// `update` (review M1).
@@ -297,7 +310,7 @@ impl Scheduler {
             frame,
             synthetic,
             terrain: Terrain::flat(),
-            terrain_cache: AHashMap::new(),
+            terrain_cache: GenCache::new(TERRAIN_CACHE_CAP),
             layer,
             fade_cap: Duration::from_secs_f64(profile.fades.cap_s),
             max_fades: profile.fades.max_active as usize,
@@ -333,6 +346,9 @@ impl Scheduler {
             t_roots: ahash::AHashSet::new(),
             t_work: Vec::new(),
             t_heap: std::collections::BinaryHeap::new(),
+            plan_memo: Default::default(),
+            #[cfg(test)]
+            verify_plan_reuse: false,
             budget_skipped: 0,
             balance_forced: 0,
             cpu: CpuStats::default(),
@@ -421,6 +437,12 @@ impl Scheduler {
         if let Some(d) = &mut self.data {
             d.sync(mem);
         }
+    }
+
+    /// Decoded data tiles dropped since the last call, for the caller to free off the main
+    /// thread (`Worker::release`).
+    pub fn take_released_data(&mut self) -> Vec<Arc<crate::data::DataTile>> {
+        self.data.as_mut().map(|d| d.take_released()).unwrap_or_default()
     }
 
     /// Unregister the data tiles from the budget (before the scheduler is dropped).
@@ -528,34 +550,6 @@ impl Scheduler {
         &self.terrain
     }
 
-    /// Terrain [min, max] under a tile: the entry's, else the cache, else `Terrain::tile_range`
-    /// (cached). `[0, 0]` with the terrain off.
-    fn terrain_box_of(&mut self, k: TileKey) -> [f64; 2] {
-        if !self.terrain.is_active() {
-            return [0.0, 0.0];
-        }
-        if let Some(e) = self.entries.get(&k) {
-            return e.terrain_box;
-        }
-        if let Some(g) = self.terrain_cache.get(&k) {
-            return *g;
-        }
-        if self.terrain_cache.len() >= 8192 {
-            self.terrain_cache.clear();
-        }
-        let g = match &mut self.proxy {
-            // Terrain layer: one probe for the box and the error proxy.
-            Some(p) => {
-                let pr = p.probe(k);
-                p.error_m_probed(k, &pr);
-                self.terrain.range_from_probe(pr.lo, pr.hi, pr.step)
-            }
-            None => self.terrain.tile_range(k),
-        };
-        self.terrain_cache.insert(k, g);
-        g
-    }
-
     pub fn clustered(&self) -> bool {
         self.clustered
     }
@@ -567,46 +561,6 @@ impl Scheduler {
     /// Stage latencies of the last deliveries per band (`debug_stats()["latency"]`).
     pub fn latency(&self) -> &Latency {
         &self.latency
-    }
-
-    /// Look-ahead view point per band (entries past the layer's ring count repeat the last
-    /// one). `cam` = (east, north, AGL), `vel` = (east, north, up).
-    pub fn views(&self, cam: [f64; 3], vel: [f64; 3]) -> [ViewPoint; MAX_RINGS] {
-        self.views_ground(cam, vel).0
-    }
-
-    /// [`Scheduler::views`] plus the terrain height under each view point.
-    fn views_ground(&self, cam: [f64; 3], vel: [f64; 3]) -> ([ViewPoint; MAX_RINGS], [f64; MAX_RINGS]) {
-        let l = &self.layer;
-        let last = l.rings() - 1;
-        let mut ground = [0.0; MAX_RINGS];
-        // The camera's MSL altitude (AGL + the terrain under it); the look-ahead moves it by the
-        // velocity, so a hill under the camera does not become a hill under every view point.
-        let (clat, clon) = self.frame.lat_lon(cam[0], cam[1]);
-        let cam_msl = [cam[0], cam[1], cam[2] + self.terrain.height(clat, clon)];
-        let views = std::array::from_fn(|i| {
-            let r = i.min(last);
-            let la = look_ahead(cam_msl, vel, l.look_ahead_clamp_m(r), l.look_ahead_s);
-            let (lat, lon) = self.frame.lat_lon(la[0], la[1]);
-            // Terrain scale of the tile boxes (terrain hook; 0 while flat). Never below ground.
-            let g = self.terrain.height(lat, lon);
-            ground[i] = g;
-            ViewPoint::new(lat, lon, la[2].max(g))
-        });
-        (views, ground)
-    }
-
-    /// Horizon cull of the layer (none unless `horizon_margin_m` is set): whether tile `k` with
-    /// terrain box `g` is above the horizon seen from `view` over ground `ground`, with
-    /// hysteresis (`current` = it is in the cover now).
-    fn horizon_ok(&self, view: &ViewPoint, ground: f64, k: TileKey, g: [f64; 2], current: bool) -> bool {
-        match self.layer.horizon_margin_m {
-            None => true,
-            Some(margin) => {
-                let line = horizon_line_m(view.alt, ground, g[0], g[1] + self.layer.default_tile_height_m, margin);
-                above_horizon(view.horizontal_m(k), line, self.layer.hysteresis, current)
-            }
-        }
     }
 
     /// Recompute the cover around the camera and push new jobs into `jobs`.
@@ -625,8 +579,7 @@ impl Scheduler {
         if kind == LayerKind::World {
             self.update_light_mode(cam[2]);
         }
-        let (views, grounds) = self.views_ground(cam, vel);
-        let cam_view = self.views(cam, [0.0; 3])[0];
+        let (views, grounds, cam_view) = self.views_ground(cam, vel);
         self.cam_view = Some(cam_view);
 
         // 1. Roots and the tree below them (hysteresis on both; terrain: horizon cull too).

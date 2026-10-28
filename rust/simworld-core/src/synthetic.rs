@@ -344,7 +344,8 @@ pub struct OverviewLevel {
 
 /// The overview data tile `key` (z11): one block per street block (4 x 4 lots between the
 /// streets) from its non-landmark buildings (bounding box, area-weighted mean height rounded to
-/// 5 m, kind by area, smallest member id; blocks under 150 m² dropped), the landmarks with full
+/// 5 m, kind by area, smallest member id; blocks under 150 m² dropped; base left at 0 for the
+/// chunks to resolve, `data::LazyBases`), the landmarks with full
 /// geometry, one light point per building (landmarks too; tagged roofs rounded to 5 m, area for
 /// tagged heights), districts and the secondary streets.
 pub fn overview_level(key: TileKey, frame: Frame, terrain: &crate::terrain::Terrain, profile: &crate::profile::Profile) -> OverviewLevel {
@@ -417,6 +418,7 @@ pub fn overview_level(key: TileKey, frame: Frame, terrain: &crate::terrain::Terr
         groups.entry((lx / STREET_EVERY, ly / STREET_EVERY)).or_default().push(Member { bb, area, h, id: r.id, kind: r.kind, landuse: r.landuse });
     }
     let mut blocks = Vec::new();
+    let flat = TileProjector::new(key, frame, EXTENT);
     for members in groups.values() {
         let mut bb = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
         for m in members {
@@ -445,7 +447,8 @@ pub fn overview_level(key: TileKey, frame: Frame, terrain: &crate::terrain::Terr
             tags: BuildingTags::default(),
             polygons: vec![vec![vec![[bb[0], bb[1]], [bb[2], bb[1]], [bb[2], bb[3]], [bb[0], bb[3]]]]],
         };
-        blocks.extend(proj.finish(raw));
+        // Base left open: resolved by the chunks that mesh the block (`data::LazyBases`).
+        blocks.extend(flat.finish(raw));
     }
     let order = |a: &Building, b: &Building| {
         (a.osm_type.tag(), a.id)

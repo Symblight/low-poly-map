@@ -39,11 +39,17 @@ use std::time::Instant;
 use crate::geo::{Frame, TileKey};
 use crate::ground::mesh_ground;
 use crate::lights::{beacon_points_in, cluster, light_points_in, LightSet};
-use crate::mesher::{mesh_building_iter, ClipRect, MeshData};
+use crate::mesher::{mesh_building_iter, MeshData};
 use crate::mvt::{decode_overview_on, decode_tile_on, Building, GroundFeatures, TileProjector};
 use crate::profile::Profile;
 use crate::terrain::Terrain;
 use crate::worker::TileData;
+
+mod bases;
+mod synthetic;
+pub use bases::LazyBases;
+use bases::select_idx;
+pub use synthetic::{synthetic_chunk, synthetic_data_tile};
 
 /// The level of a data tile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,6 +137,9 @@ pub struct DataTile {
     /// Decode order (sorted). `centroid` / `owned` refer to the whole data tile; chunks use
     /// [`TileProjector::place`] instead.
     pub buildings: Vec<Building>,
+    /// `buildings` whose `base_m` is still open (the synthetic overview's blocks; resolved by
+    /// the chunks that mesh them). Empty: every base is final.
+    pub lazy_bases: LazyBases,
     /// Pixel bounding box `[x0, y0, x1, y1]` of each building's outer rings (chunk candidates).
     pub bboxes: Vec<[f64; 4]>,
     /// Overview: the landmarks (full geometry) and their bounding boxes; empty for detail.
@@ -183,6 +192,7 @@ impl DataTile {
             key,
             level: DataLevel::Detail,
             buildings,
+            lazy_bases: LazyBases::default(),
             bboxes,
             landmarks: Vec::new(),
             landmark_bboxes: Vec::new(),
@@ -214,6 +224,7 @@ impl DataTile {
             key,
             level: DataLevel::Overview,
             buildings: blocks,
+            lazy_bases: LazyBases::default(),
             bboxes,
             landmarks,
             landmark_bboxes,
@@ -224,6 +235,13 @@ impl DataTile {
             bytes,
             cpu_us: t0.elapsed().as_micros() as u64,
         }
+    }
+
+    /// The bases of `buildings` are computed when a chunk meshes them (their `base_m` is a
+    /// placeholder until then; [`LazyBases`]).
+    pub fn with_open_bases(mut self) -> Self {
+        self.lazy_bases = LazyBases::open(self.buildings.len());
+        self
     }
 
     /// Whether the tile has landmarks (a landmark tile of it is delivered only then).
@@ -256,48 +274,6 @@ pub fn decode_level(key: TileKey, level: DataLevel, frame: Frame, terrain: &Terr
     }
 }
 
-/// The synthetic city's data tile `key` of `level` (step T2c): generated, not decoded.
-pub fn synthetic_data_tile(key: TileKey, level: DataLevel, frame: Frame, terrain: &Terrain, profile: &Profile) -> DataTile {
-    let t0 = Instant::now();
-    match level {
-        DataLevel::Detail => {
-            let (buildings, ground, proj) = crate::synthetic::detail_level(key, frame, terrain, profile);
-            DataTile::detail(key, buildings, ground, proj, t0)
-        }
-        DataLevel::Overview => {
-            let o = crate::synthetic::overview_level(key, frame, terrain, profile);
-            DataTile::overview(key, o.blocks, o.landmarks, o.lights, o.light_landmark, o.ground, o.proj, t0)
-        }
-    }
-}
-
-/// A synthetic city chunk exactly as the streaming path builds it (T2c): generated data tile(s)
-/// of [`DataLevels::SYNTHETIC`], cut by [`build_chunk_with`]; landmarks folded in unless
-/// `landmark_layer` (the host draws the landmark layer). Golden tests and reference builds.
-pub fn synthetic_chunk(chunk: TileKey, ring: usize, frame: Frame, terrain: &Terrain, profile: &Profile, landmark_layer: bool) -> Result<TileData, String> {
-    let l = DataLevels::SYNTHETIC;
-    let dk = l.data_of(chunk).ok_or_else(|| format!("{chunk}: not a synthetic chunk"))?;
-    let dt = synthetic_data_tile(dk, l.level_of(dk), frame, terrain, profile);
-    let lk = if landmark_layer { None } else { l.landmarks_of(chunk) };
-    let other = lk.filter(|k| *k != dk).map(|k| synthetic_data_tile(k, l.level_of(k), frame, terrain, profile));
-    let lm = match (lk, &other) {
-        (None, _) => None,
-        (Some(_), Some(o)) => Some(o),
-        (Some(_), None) => Some(&dt),
-    };
-    build_chunk_with(&dt, lm, chunk, ring, profile, &|| false).map(|d| d.expect("never stopped"))
-}
-
-/// Indices-free selection of the buildings whose bbox meets `r`.
-fn select<'a>(buildings: &'a [Building], bboxes: &[[f64; 4]], r: ClipRect) -> Vec<&'a Building> {
-    buildings
-        .iter()
-        .zip(bboxes)
-        .filter(|(_, bb)| !(bb[2] <= r.x0 || bb[0] >= r.x1 || bb[3] <= r.y0 || bb[1] >= r.y1))
-        .map(|(b, _)| b)
-        .collect()
-}
-
 /// [`build_chunk_with`] without landmarks folded in (compatibility path, tests).
 pub fn build_chunk(dt: &DataTile, chunk: TileKey, ring: usize, profile: &Profile, stop: &dyn Fn() -> bool) -> Result<Option<TileData>, String> {
     build_chunk_with(dt, None, chunk, ring, profile, stop)
@@ -322,11 +298,12 @@ pub fn build_chunk_with(
     let t0 = crate::diag::CpuClock::start();
     let proj = dt.proj.cut(chunk).ok_or_else(|| format!("chunk {chunk} is not inside data tile {}", dt.key))?;
     let r = proj.rect();
-    let sel = select(&dt.buildings, &dt.bboxes, r);
+    let idx = select_idx(&dt.bboxes, r);
+    let sel: Vec<&Building> = idx.iter().map(|&i| &dt.buildings[i]).collect();
     let lm = match lm {
         Some(l) => {
             let p = l.proj.cut(chunk).ok_or_else(|| format!("chunk {chunk} is not inside landmark tile {}", l.key))?;
-            let s = select(&l.landmarks, &l.landmark_bboxes, p.rect());
+            let s: Vec<&Building> = select_idx(&l.landmark_bboxes, p.rect()).into_iter().map(|i| &l.landmarks[i]).collect();
             Some((l, p, s))
         }
         None => None,
@@ -336,7 +313,8 @@ pub fn build_chunk_with(
     }
     let mut mesh = MeshData::default();
     if let Some(p) = profile.lod(ring) {
-        mesh = mesh_building_iter(sel.iter().copied(), &proj, r, p, profile);
+        let based = dt.lazy_bases.based(&dt.buildings, &idx, &dt.proj);
+        mesh = mesh_building_iter(based.iter().map(|b| b.as_ref()), &proj, r, p, profile);
         if let Some((_, lp, ls)) = &lm {
             mesh.append(mesh_building_iter(ls.iter().copied(), lp, lp.rect(), p, profile));
         }

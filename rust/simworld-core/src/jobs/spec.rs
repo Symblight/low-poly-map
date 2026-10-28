@@ -4,7 +4,6 @@
 use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 /// Job id: the generation number of a request (unique among the pool's pending jobs).
 pub type JobId = u64;
@@ -120,20 +119,13 @@ pub struct PoolConfig {
     pub name: String,
     /// Platform thread setup (iOS QoS later). `None` = nothing.
     pub on_thread_start: Option<ThreadStart>,
-    /// How long an idle worker polls for a new job before it sleeps on the condition variable
-    /// (a job arriving within it starts without a wake-up; rayon spins similarly). 0 = sleep at
-    /// once (battery-sensitive platforms).
-    pub idle_spin: Duration,
 }
 
 impl PoolConfig {
     pub fn new(threads: usize, name: &str) -> Self {
-        Self { threads: threads.max(1), name: name.to_string(), on_thread_start: None, idle_spin: DEFAULT_IDLE_SPIN }
+        Self { threads: threads.max(1), name: name.to_string(), on_thread_start: None }
     }
 }
-
-/// Default [`PoolConfig::idle_spin`].
-pub const DEFAULT_IDLE_SPIN: Duration = Duration::from_micros(100);
 
 /// Default worker count: cores - 2, clamped to 2..=4 (desktop; the measured spike setting).
 pub fn default_threads() -> usize {

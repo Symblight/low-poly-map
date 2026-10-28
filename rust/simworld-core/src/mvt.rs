@@ -28,6 +28,9 @@ use crate::geo::{Frame, TileKey};
 use crate::profile::Profile;
 use crate::terrain::Terrain;
 
+mod stack;
+pub use stack::stack_raised_parts;
+
 pub const BUILDINGS_LAYER: &str = "buildings";
 pub const LANDUSE_LAYER: &str = "landuse";
 pub const ROADS_LAYER: &str = "roads";
@@ -225,31 +228,6 @@ const BASE_EDGE_MAX_PARTS: usize = 64;
 pub const BASE_LATTICE_LEVEL: i32 = 21;
 /// Most lattice points per footprint bounding box (the lattice coarsens by 2 until it fits).
 const BASE_LATTICE_MAX: i64 = 64;
-
-/// Raised parts (`min_height` > 0.25 m) stand on the building under them (api 1.7): a raised
-/// part whose centroid lies inside the footprint of a building that stands on the ground takes
-/// that building's base (the highest such base when several overlap), so its bottom stays
-/// `min_height` above the lower part's base like its roof stays `min_height` above it, instead
-/// of following the (smaller) part footprint's own highest point. A raised part over nothing
-/// keeps its own base. No-op with the terrain off (every base is 0).
-pub fn stack_raised_parts(buildings: &mut [Building]) {
-    let raised: Vec<usize> = (0..buildings.len()).filter(|&i| buildings[i].min_height > 0.25).collect();
-    for i in raised {
-        let c = buildings[i].centroid_px;
-        let mut best: Option<f32> = None;
-        for (j, o) in buildings.iter().enumerate() {
-            if j == i || o.min_height > 0.25 {
-                continue;
-            }
-            if o.polygons.iter().any(|p| point_in_rings(c, p)) {
-                best = Some(best.map_or(o.base_m, |b| b.max(o.base_m)));
-            }
-        }
-        if let Some(b) = best {
-            buildings[i].base_m = b;
-        }
-    }
-}
 
 /// Encoder buffer of the `buildings` layer as a fraction of the tile extent (planetiler
 /// `buffer: 4` of 256 px = 64 of 4096 units; tileset structure, `data/schema/simplane.yml`).

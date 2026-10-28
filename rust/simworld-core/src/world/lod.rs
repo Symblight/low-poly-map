@@ -4,6 +4,24 @@
 use super::{World, LOD_QUALITY_MAX, LOD_QUALITY_MIN};
 use crate::rings::{LodView, RING_COUNT};
 
+/// The LOD state a host reads several times a second (contract `lod_state()`, api 1.11): the
+/// values of the matching `debug_stats` keys without the rest of the overlay counters.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LodState {
+    pub tau_eff: f64,
+    pub lod_quality: f64,
+    pub lod_edges_m: [f64; RING_COUNT],
+    pub view_fov_y_deg: f64,
+    pub view_height_px: f64,
+    pub lod_tiles_est: [f64; RING_COUNT],
+    pub lod_max_tiles: u32,
+    /// Whether the terrain layer runs; the terrain cover's tau (`terrain.tau_px` x the
+    /// `set_terrain_detail` scale) and that scale.
+    pub terrain_active: bool,
+    pub terrain_tau_eff: f64,
+    pub terrain_detail: f64,
+}
+
 impl World {
     /// Contract `set_view(fov_y_deg, viewport_h_px, forward)` (api 1.10): the view the
     /// screen-space error is measured in. `fov_y_deg` in [1, 179], `viewport_h_px` (physical
@@ -80,5 +98,51 @@ impl World {
     /// SSE refine distances of the current view and tau_eff.
     pub fn lod_edges_m(&self) -> [f64; RING_COUNT] {
         self.profile.bands().edges_for(&self.lod_view, self.cover_quality())
+    }
+
+    /// Contract `lod_state()` (api 1.11): [`LodState`] of the current view, quality, budget and
+    /// terrain detail.
+    pub fn lod_state(&self) -> LodState {
+        // One capped-quality bisection for tau, edges and the estimate.
+        let q = self.cover_quality();
+        let edges = self.profile.bands().edges_for(&self.lod_view, q);
+        LodState {
+            tau_eff: self.profile.lod.tau_px * q,
+            lod_quality: self.lod_quality,
+            lod_edges_m: edges,
+            view_fov_y_deg: self.lod_view.fov_y_deg,
+            view_height_px: self.lod_view.viewport_h_px,
+            lod_tiles_est: crate::rings::estimate_cover_tiles(&edges, crate::math::cos(self.origin_lat.to_radians())),
+            lod_max_tiles: self.profile.lod.max_tiles,
+            terrain_active: self.terrain_layer_active(),
+            terrain_tau_eff: self.profile.terrain.tau_px * self.terrain_detail(),
+            terrain_detail: self.terrain_detail(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::world::{World, WorldOptions};
+
+    /// `lod_state()` carries exactly the values of the single getters (the `debug_stats` keys).
+    #[test]
+    fn lod_state_matches_the_getters() {
+        let mut w = World::new(std::sync::Arc::new(crate::NullLog), crate::Diagnostics::default(), "test");
+        assert!(w.configure_world(WorldOptions { origin_lat: 54.6872, origin_lon: 25.2797, ..WorldOptions::default() }).ok);
+        for (fov, h, q) in [(60.0, 1080.0, 1.0), (15.0, 2160.0, 0.5), (90.0, 540.0, 3.0)] {
+            assert!(w.set_view(fov, h, [0.0, 0.0, -1.0]));
+            w.set_lod_quality(q);
+            let s = w.lod_state();
+            assert_eq!(s.tau_eff, w.tau_eff());
+            assert_eq!(s.lod_quality, w.lod_quality());
+            assert_eq!(s.lod_edges_m, w.lod_edges_m());
+            assert_eq!(s.lod_tiles_est, w.lod_tiles_estimate());
+            assert_eq!((s.view_fov_y_deg, s.view_height_px), (fov, h));
+            assert_eq!(s.lod_max_tiles, w.profile().lod.max_tiles);
+            assert!(!s.terrain_active);
+            assert_eq!(s.terrain_tau_eff, w.profile().terrain.tau_px * w.terrain_detail());
+        }
+        w.shutdown();
     }
 }

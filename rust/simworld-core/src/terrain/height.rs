@@ -26,7 +26,7 @@
 //! from [`Terrain::bounds`]), so neighbouring tiles quantize a shared sample identically and the
 //! GPU decodes every layer with the same two numbers. Default terrain: 967.5 m span -> 1.48 cm.
 
-use std::collections::HashMap;
+use crate::gen_cache::GenCache;
 
 use crate::budget::{MemoryBudget, HEIGHT_GRID_LEN};
 use crate::geo::{tile_width_m, tile_x_to_lon, tile_y_to_lat, TileKey};
@@ -377,13 +377,13 @@ pub struct ErrorProxy {
     terrain: Terrain,
     root_zoom: u8,
     comps: Vec<Comp>,
-    memo: HashMap<TileKey, f64>,
+    memo: GenCache<TileKey, f64>,
     /// Apply the edit floors (default). Off for the TIN-path cover (G2, see
     /// [`ErrorProxy::without_edit_floor`]).
     edit_floor: bool,
 }
 
-/// Memo entries kept before the memo is cleared (a few MB at most).
+/// Memo entries kept at most (a few MB; evicted gradually, [`GenCache`]).
 const MEMO_CAP: usize = 1 << 16;
 
 impl ErrorProxy {
@@ -419,7 +419,7 @@ impl ErrorProxy {
                 comps.push(Comp { amp: e * f.plateau_share * 0.5, lambda: 2.0 * width, crease: false });
             }
         }
-        Self { terrain: terrain.clone(), root_zoom, comps, memo: HashMap::new(), edit_floor: true }
+        Self { terrain: terrain.clone(), root_zoom, comps, memo: GenCache::new(MEMO_CAP), edit_floor: true }
     }
 
     /// The proxy without the edit floors: every tile takes the unedited formula
@@ -458,7 +458,7 @@ impl ErrorProxy {
 
     /// The memoized, monotonic proxy (m).
     pub fn error_m(&mut self, key: TileKey) -> f64 {
-        if let Some(&e) = self.memo.get(&key) {
+        if let Some(e) = self.memo.get(&key) {
             return e;
         }
         let raw = self.raw_error_m(key);
@@ -468,7 +468,7 @@ impl ErrorProxy {
     /// [`ErrorProxy::error_m`] with the key's probe already taken (`probe` must be
     /// `self.probe(key)`; the scheduler shares it with [`Terrain::tile_range`]). Same value.
     pub fn error_m_probed(&mut self, key: TileKey, probe: &Probe) -> f64 {
-        if let Some(&e) = self.memo.get(&key) {
+        if let Some(e) = self.memo.get(&key) {
             return e;
         }
         let raw = self.raw_from_probe(key, probe);
@@ -477,7 +477,7 @@ impl ErrorProxy {
 
     /// Whether `key` is memoized.
     pub fn contains(&self, key: TileKey) -> bool {
-        self.memo.contains_key(&key)
+        self.memo.contains(&key)
     }
 
     /// The terrain the proxy samples.
@@ -487,9 +487,6 @@ impl ErrorProxy {
 
     fn finish(&mut self, key: TileKey, raw: f64) -> f64 {
         let e = if key.z > self.root_zoom && key.z > 0 { raw.min(self.error_m(parent_key(key))) } else { raw };
-        if self.memo.len() >= MEMO_CAP {
-            self.memo.clear();
-        }
         self.memo.insert(key, e);
         e
     }

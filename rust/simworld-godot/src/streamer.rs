@@ -30,7 +30,7 @@ use simworld_core::mesher::MeshData;
 use simworld_core::rings::{LayerKey, LayerKind, MAX_RINGS, RING_COUNT};
 use simworld_core::{AirportInfo, ConfigureResult, Log, RunwayEndInfo, SeedInfo, Status, World, API_MAJOR, API_MINOR};
 
-use crate::convert::{json_to_variant, options_from_dict};
+use crate::convert::{json_to_variant, lod_state_dict, options_from_dict, vector_lod_into};
 use crate::host::{diagnostics_from_env, GodotLog};
 use crate::version_string;
 
@@ -482,16 +482,8 @@ impl WorldStreamer {
             // re-deliveries that dominate `latency` during flight.
             d.set("latency_first", &latency_dict(l.first()));
         }
-        // api 1.10: screen-space-error LOD (set_view / set_lod_quality).
-        d.set("tau_eff", self.world.tau_eff());
-        d.set("lod_quality", self.world.lod_quality());
-        d.set("lod_edges_m", &PackedFloat64Array::from(&self.world.lod_edges_m()[..]));
-        // api 1.11 (review M1): the estimated cover per ring and the tile budget it is capped to.
-        d.set("lod_tiles_est", &PackedFloat64Array::from(&self.world.lod_tiles_estimate()[..]));
-        d.set("lod_max_tiles", self.world.profile().lod.max_tiles as i64);
-        let v = self.world.lod_view();
-        d.set("view_fov_y_deg", v.fov_y_deg);
-        d.set("view_height_px", v.viewport_h_px as i64);
+        // api 1.10 / 1.11: screen-space-error LOD (the vector keys of `lod_state()`).
+        vector_lod_into(&mut d, &self.world.lod_state());
         // api 1.5: terrain-mesh layer counters, only while the layer runs.
         if self.world.terrain_layer_active() {
             let n = st.terrain_rings;
@@ -540,6 +532,13 @@ impl WorldStreamer {
     fn set_view(&mut self, fov_y_deg: f64, viewport_h_px: i64, forward: Vector3) {
         let f = [forward.x as f64, forward.y as f64, forward.z as f64];
         self.world.set_view(fov_y_deg, viewport_h_px as f64, f);
+    }
+
+    /// The LOD state only (api 1.11): the `debug_stats` LOD keys plus the terrain cover's tau,
+    /// for hosts that follow the live edges several times a second.
+    #[func]
+    fn lod_state(&self) -> VarDictionary {
+        lod_state_dict(&self.world.lod_state())
     }
 
     /// LOD quality (api 1.10): live multiplier of the profile's `lod.tau_px` (2 = half the

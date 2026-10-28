@@ -34,6 +34,7 @@ use crate::profile::Profile;
 use crate::synthetic;
 
 mod levels_probe;
+mod release;
 
 /// Decoded tile, ready for conversion on the main thread. Only flat arrays cross the channel:
 /// the per-building structs are dropped on the worker (freeing thousands of small allocations
@@ -581,6 +582,8 @@ pub struct Worker {
     cache_cap: u64,
     /// Fetches in flight by job id, for [`Worker::cancel`] (each task removes its own entry).
     fetches: Arc<Mutex<AHashMap<u64, AbortHandle>>>,
+    /// Ids of [`Worker::release`] jobs.
+    release_seq: AtomicU64,
 }
 
 impl Worker {
@@ -666,6 +669,7 @@ impl Worker {
             cache_dir: cache_dir.to_string(),
             cache_cap,
             fetches: Arc::new(Mutex::new(AHashMap::new())),
+            release_seq: AtomicU64::new(0),
         })
     }
 

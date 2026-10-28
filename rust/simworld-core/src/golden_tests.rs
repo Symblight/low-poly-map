@@ -128,7 +128,10 @@ pub(crate) fn tile_hash_on(key: TileKey, ring: usize, frame: Frame, terrain: &Te
     };
     let mut per_building: Vec<((u64, u64), MeshData)> = Vec::new();
     if let Some(lod) = profile.lod(ring) {
-        for (list, p) in [(&dt.buildings, &proj), (&lm.landmarks, &lproj)] {
+        // The chunk's buildings with their bases resolved (open on synthetic overview blocks).
+        let idx: Vec<usize> = (0..dt.buildings.len()).filter(|&i| meets(&dt.buildings[i], proj.rect())).collect();
+        let own: Vec<Building> = dt.lazy_bases.based(&dt.buildings, &idx, &dt.proj).into_iter().map(|b| b.into_owned()).collect();
+        for (list, p) in [(&own, &proj), (&lm.landmarks, &lproj)] {
             for b in list.iter().filter(|b| meets(b, p.rect())) {
                 let m = mesh_building_iter(std::iter::once(b), p, p.rect(), lod, profile);
                 if !m.is_empty() {

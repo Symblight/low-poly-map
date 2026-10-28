@@ -372,8 +372,8 @@ pub fn build_chunk_with(
     Ok(Some(TileData {
         building_count,
         lights: Arc::new(lights),
-        mesh,
-        ground,
+        mesh: Arc::new(mesh),
+        ground: Arc::new(ground),
         max_height,
         cpu_us: t0.us(),
         terrain: None,
@@ -410,8 +410,8 @@ pub fn build_landmark_tile(dt: &DataTile, profile: &Profile, stop: &dyn Fn() -> 
     Ok(Some(TileData {
         building_count: dt.landmarks.len(),
         lights: Arc::new(lights),
-        mesh,
-        ground: MeshData::default(),
+        mesh: Arc::new(mesh),
+        ground: Arc::default(),
         max_height,
         cpu_us: t0.us(),
         terrain: None,

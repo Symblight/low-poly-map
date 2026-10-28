@@ -105,6 +105,7 @@ mod fade;
 mod landmarks;
 mod plan_memo;
 mod presence;
+mod recent;
 pub mod sim;
 mod state;
 mod terrain_plan;
@@ -117,6 +118,7 @@ mod budget_tests;
 mod plan_memo_tests;
 
 pub use boxes::{ProbeBatch, ProbeResult};
+pub use recent::{Kept, RecentStats};
 pub use data::{DataStats, DataStore};
 pub use landmarks::LandmarkStats;
 use landmarks::{LandmarkLayer, LmState};
@@ -135,7 +137,6 @@ use ahash::AHashMap;
 use crate::fetch::FetchErrorKind;
 use crate::geo::{Frame, RectEn, TileKey};
 use crate::latency::{Latency, Stage, TileTimes};
-use crate::mesher::MeshData;
 use crate::profile::Profile;
 use crate::rings::{children, Layer, LayerKind, ViewPoint, MAX_BOX_HEIGHT_M, MAX_RINGS, RING_COUNT};
 use crate::gen_cache::GenCache;
@@ -206,6 +207,8 @@ pub struct Scheduler {
     detail_gen: u32,
     /// Terrain layer (G2): the pure per-key error proxy the cover refines by.
     proxy: Option<ErrorProxy>,
+    /// Recently delivered outputs, served again without a rebuild (`recent`).
+    recent: recent::RecentTiles,
     /// Reused presence memo (`presence`; valid within one pass only).
     presence: presence::Presence,
     /// Async probes of cold boxes / error proxies (`boxes`; `None` = probed inline).
@@ -322,6 +325,7 @@ impl Scheduler {
             terrain_cache: GenCache::new(TERRAIN_CACHE_CAP),
             layer,
             fade_cap: Duration::from_secs_f64(profile.fades.cap_s),
+            recent: recent::RecentTiles::new(profile.memory.recent_tiles_mb, profile.memory.recent_tiles_s),
             max_fades: profile.fades.max_active as usize,
             fades_elsewhere: 0,
             capped: Vec::new(),
@@ -581,6 +585,7 @@ impl Scheduler {
         self.epoch += 1;
         self.now = now;
         self.absorb_probes();
+        self.recent.expire(now);
         let l = self.layer;
         let kind = l.kind;
         let top = l.rings() - 1;
@@ -767,12 +772,14 @@ impl Scheduler {
         let unloading = &mut self.unloading;
         let ready = &mut self.ready;
         let cancelled = &mut self.cancelled;
+        let recent = &mut self.recent;
         self.entries.retain(|_, e| {
             if e.mark == epoch {
                 return true;
             }
             orphan_job(cancelled, e);
             if e.held {
+                recent.left(e.key, now);
                 let mut blank = Entry::blank(e.key, e.ring, e.rect, e.center, default_h);
                 blank.terrain_box = e.terrain_box;
                 let mut u = std::mem::replace(e, blank);
@@ -931,6 +938,9 @@ impl Scheduler {
             .sort_unstable_by(|a, b| a.1.cmp(&b.1).then(a.2.total_cmp(&b.2)).then(a.0.cmp(&b.0)).then(a.3.cmp(&b.3)));
         for i in 0..self.cand.len() {
             let (ring, _, _, key) = self.cand[i];
+            if self.serve_recent(key) {
+                continue;
+            }
             if self.data_key(key).is_some() {
                 self.dispatch_chunk(key, ring, max_decode, jobs);
                 continue;
@@ -1415,6 +1425,7 @@ impl Scheduler {
             }
             // A key in `dropped` is still held by the host and stays there for `drain_unload`.
             if e.held {
+                self.recent.left(c, self.now);
                 e.state = TileState::Idle;
                 e.split = false;
                 e.relight = false;
@@ -1466,6 +1477,7 @@ impl Scheduler {
                 self.next_job += 1;
             }
             self.dropped.push(k);
+            self.recent.left(k, self.now);
         }
     }
 
@@ -1601,11 +1613,15 @@ impl Scheduler {
         let (mesh, ground, lights, terrain) = match std::mem::replace(&mut e.state, TileState::Idle) {
             TileState::Ready(data) => {
                 let d = *data;
-                (d.mesh, Arc::new(d.ground), d.lights, d.terrain)
+                if kind != LayerKind::Landmarks {
+                    let kept = Kept::of(&d);
+                    self.recent.keep(k, kept, self.now);
+                }
+                (d.mesh, d.ground, d.lights, d.terrain)
             }
             other => {
                 e.state = other;
-                (MeshData::default(), e.ground.clone().unwrap_or_default(), e.lights.clone()?, None)
+                (Arc::default(), e.ground.clone().unwrap_or_default(), e.lights.clone()?, None)
             }
         };
         if !redelivery {
@@ -1643,7 +1659,7 @@ impl Scheduler {
             ring: 0,
             center: e.center,
             mesh: d.mesh,
-            ground: Arc::new(d.ground),
+            ground: d.ground,
             lights: d.lights,
             clustered,
             redelivery: false,

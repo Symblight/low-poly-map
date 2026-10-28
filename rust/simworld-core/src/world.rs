@@ -298,6 +298,8 @@ pub struct WorldStats {
     pub jobs: JobStats,
     /// Tile-box probes requested and not answered yet, both layers (`scheduler::boxes`).
     pub probes_pending: usize,
+    /// Recent-tile cache of both layers (`scheduler::recent`): hits, entries, bytes.
+    pub recent: crate::scheduler::RecentStats,
     /// The memory budget of the core's CPU-side pools (`World::memory`).
     pub memory: MemoryStats,
     /// Tiles v2 data tiles (vector layer, archive sources): decoded tiles resident now, and
@@ -581,11 +583,13 @@ impl World {
         let mut ids = std::mem::take(&mut self.cancel_buf);
         if let Some(s) = &mut self.scheduler {
             w.release(s.take_released_data()); // decoded data tiles are freed off the main thread
+            w.release(s.take_released_tiles());
             s.drain_cancelled(&mut ids);
             w.cancel(LayerKind::World, &ids);
             ids.clear();
         }
         if let Some(t) = &mut self.terrain_sched {
+            w.release(t.take_released_tiles());
             t.drain_cancelled(&mut ids);
             w.cancel(LayerKind::Terrain, &ids);
             ids.clear();
@@ -1244,6 +1248,10 @@ impl World {
             terrain_tris: tst.tris,
             jobs: self.worker.as_ref().map(|w| w.job_stats()).unwrap_or_default(),
             probes_pending: [self.scheduler.as_ref(), self.terrain_sched.as_ref()].into_iter().flatten().map(|s| s.probes_pending()).sum(),
+            recent: [self.scheduler.as_ref(), self.terrain_sched.as_ref()].into_iter().flatten().map(|s| s.recent_stats()).fold(
+                crate::scheduler::RecentStats::default(),
+                |a, b| crate::scheduler::RecentStats { hits: a.hits + b.hits, entries: a.entries + b.entries, bytes: a.bytes + b.bytes },
+            ),
             memory: self.memory.stats(),
             data_tiles_loaded: data.loaded,
             data_tiles_decoded: data.decoded,

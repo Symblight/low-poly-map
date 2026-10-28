@@ -1314,6 +1314,18 @@
           "type": "number",
           "minimum": 0,
           "maximum": 3600
+        },
+        "recent_tiles_mb": {
+          "description": "MiB per layer (vector, terrain) of recently delivered tile outputs (meshes, lights, terrain meshes) kept so a key that comes back soon, e.g. a coarsening parent after the camera passed, is delivered without fetching and meshing it again (0 = off). Entries of tiles the host still holds go first when it is full, then the oldest departures. Not part of budget_mb. Default 32.",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 65536
+        },
+        "recent_tiles_s": {
+          "description": "Seconds a kept tile output stays after the tile left the host (dropped behind its children or unloaded). Default 15.",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 600
         }
       },
       "additionalProperties": false

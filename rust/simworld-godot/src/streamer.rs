@@ -454,6 +454,12 @@ impl WorldStreamer {
         m.set("budget", mem.budget_bytes as f64 / MIB);
         m.set("over_budget", mem.over_budget_bytes as f64 / MIB);
         d.set("memory_mb", &m);
+        // api 1.11 (perf review 2): tiles delivered again from memory instead of rebuilt.
+        let mut rt = VarDictionary::new();
+        rt.set("hits", st.recent.hits.min(i64::MAX as u64) as i64);
+        rt.set("entries", st.recent.entries as i64);
+        rt.set("mb", st.recent.bytes as f64 / MIB);
+        d.set("recent_tiles", &rt);
         // Tiles v2 data tiles (step T2a): resident now / decoded since configure.
         d.set("data_tiles_loaded", st.data_tiles_loaded as i64);
         d.set("data_tiles_decoded", st.data_tiles_decoded.min(i64::MAX as u64) as i64);

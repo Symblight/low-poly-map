@@ -3,6 +3,7 @@ use super::*;
 use bytes::Bytes;
 use crate::fetch::{FetchError, Source};
 use crate::lights::LightSet;
+use crate::mesher::MeshData;
 use crate::terrain::tin::TerrainTile;
 use crate::worker::TileData;
 use crate::rings::{parent, ring_for_zoom, siblings, BandParams, LEAF_ZOOM, RING_COUNT, ROOT_ZOOM};
@@ -45,13 +46,13 @@ fn fake_data(k: TileKey, ring: usize) -> TileData {
     TileData {
         building_count: 0,
         lights: Arc::new(lights),
-        mesh: MeshData::default(),
+        mesh: Arc::default(),
         // One triangle, a different count per band, so re-deliveries can be checked.
-        ground: MeshData {
+        ground: Arc::new(MeshData {
             positions: vec![[0.0; 3]; 3 + ring],
             indices: vec![0, 1, 2],
             ..MeshData::default()
-        },
+        }),
         max_height: fake_height(k),
         cpu_us: 0,
         terrain: None,
@@ -62,7 +63,7 @@ fn fake_data(k: TileKey, ring: usize) -> TileData {
 fn fake_terrain(ring: usize) -> TileData {
     let mesh = MeshData { positions: vec![[0.0; 3]; 4 + ring], indices: vec![0, 1, 2, 0, 2, 3], ..MeshData::default() };
     TileData {
-        terrain: Some(Box::new(TerrainTile { mesh, surface_triangles: 2, ..TerrainTile::default() })),
+        terrain: Some(Arc::new(TerrainTile { mesh, surface_triangles: 2, ..TerrainTile::default() })),
         ..TileData::default()
     }
 }
@@ -165,7 +166,7 @@ impl FakeWorker {
                             let lmt: Option<&crate::data::DataTile> = if same { Some(&d) } else { other.as_deref() };
                             let result = crate::data::build_chunk_with(&d, lmt, key, ring, &p, &|| false).map(|o| o.expect("not stopped"));
                             if let Ok(t) = &result {
-                                self.chunk_meshes.insert(key, t.mesh.clone());
+                                self.chunk_meshes.insert(key, (*t.mesh).clone());
                             }
                             (2, WorkerMsg::Decoded { key, ring, job, result })
                         }

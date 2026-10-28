@@ -538,6 +538,12 @@ pub struct Memory {
     /// A decoded data tile no tile of the cover maps to is dropped after this long (s; review
     /// M3). 0 = at once. The budget still evicts by priority on top.
     pub data_idle_s: f64,
+    /// Recently delivered tiles kept in memory so a key that comes back (a coarsening parent
+    /// after the camera passed) is delivered without a rebuild (MiB per layer, 0 = off; perf
+    /// review 2 item 6, `scheduler::recent`). Separate from `budget_mb`.
+    pub recent_tiles_mb: f64,
+    /// How long a kept tile stays after it left the host (s).
+    pub recent_tiles_s: f64,
 }
 
 /// Procedural terrain (profile_version 5). Heights come from a seeded function
@@ -1275,7 +1281,7 @@ impl Default for Cache {
 
 impl Default for Memory {
     fn default() -> Self {
-        Self { budget_mb: 512.0, data_idle_s: 20.0 }
+        Self { budget_mb: 512.0, data_idle_s: 20.0, recent_tiles_mb: 32.0, recent_tiles_s: 15.0 }
     }
 }
 
@@ -1408,6 +1414,8 @@ pub const RANGES: &[(&str, f64, f64)] = &[
     ("cache.validate_retry_s", 1.0, 86_400.0),
     ("memory.budget_mb", 32.0, 65_536.0),
     ("memory.data_idle_s", 0.0, 3600.0),
+    ("memory.recent_tiles_mb", 0.0, 65_536.0),
+    ("memory.recent_tiles_s", 0.0, 600.0),
     ("terrain.seed", 0.0, 4_294_967_295.0),
     ("terrain.amplitude_m", 0.0, 3000.0),
     ("terrain.feature_size_m", 200.0, 200_000.0),

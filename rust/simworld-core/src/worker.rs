@@ -47,18 +47,19 @@ pub struct TileData {
     /// R2/R3: light points (single and clustered), Godot axes relative to the tile origin
     /// (tile center). Empty for R0/R1, which get windows instead.
     pub lights: Arc<LightSet>,
-    /// Merged building mesh (tile-root relative), clipped to the tile. Empty for R3.
-    pub mesh: MeshData,
+    /// Merged building mesh (tile-root relative), clipped to the tile. Empty for R3. Shared with
+    /// the recent-tile cache (`scheduler::recent`).
+    pub mesh: Arc<MeshData>,
     /// Merged ground mesh (areas + road strips, tile-root relative, no UV), clipped to the
     /// tile. Empty for tiles without ground features (every band has ground since api 1.3).
-    pub ground: MeshData,
+    pub ground: Arc<MeshData>,
     /// Highest roof top (m above ground) of any building decoded in the tile, including
     /// buffer copies owned by neighbours; 0 for an empty tile. Height of the slant-distance box.
     pub max_height: f32,
     /// Worker-side CPU time (decode + mesh + lights), microseconds.
     pub cpu_us: u64,
     /// Terrain layer only (api 1.5): the terrain mesh of the tile (`None` for vector tiles).
-    pub terrain: Option<Box<TerrainTile>>,
+    pub terrain: Option<Arc<TerrainTile>>,
 }
 
 impl TileData {
@@ -507,8 +508,8 @@ fn finish_tile(
     Some(TileData {
         building_count,
         lights: Arc::new(lights),
-        mesh,
-        ground,
+        mesh: Arc::new(mesh),
+        ground: Arc::new(ground),
         max_height,
         cpu_us: t0.elapsed().as_micros() as u64,
         terrain: None,
@@ -551,7 +552,7 @@ pub fn build_terrain_data_until(
     });
     let color = color.as_ref().map(|c| c as &dyn Fn(f64, f64) -> [f32; 4]);
     let Some(tile) = build_terrain_tile_until(key, ring, frame, terrain, profile, detail, color, stop)? else { return Ok(None) };
-    Ok(Some(TileData { terrain: Some(Box::new(tile)), cpu_us: t0.elapsed().as_micros() as u64, ..TileData::default() }))
+    Ok(Some(TileData { terrain: Some(Arc::new(tile)), cpu_us: t0.elapsed().as_micros() as u64, ..TileData::default() }))
 }
 
 fn panic_text(p: Box<dyn std::any::Any + Send>) -> String {

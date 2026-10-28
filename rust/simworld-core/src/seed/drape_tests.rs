@@ -133,7 +133,7 @@ fn drawn_runway_equals_ground_height_at_in_every_band() {
                 for ring in 0..4usize {
                     let step = p.ground_params(ring).unwrap().step_m as f64;
                     let key = tile_for(lat, lon, 16 - ring as u8);
-                    let m = tiles.entry((key, ring)).or_insert_with(|| build_seed_tile_on(key, ring, frame, t, w, p).unwrap().ground);
+                    let m = tiles.entry((key, ring)).or_insert_with(|| (*build_seed_tile_on(key, ring, frame, t, w, p).unwrap().ground).clone());
                     let Some(y) = surface_at(m, frame.tile_center(key), en, None) else {
                         panic!("{} runway {}: no ground at ({lat}, {lon}) in R{ring} ({key})", g.ident, g.runways[ri].key);
                     };
@@ -271,7 +271,7 @@ fn drape_margin_blends_over_the_shoulder() {
             let pt = [g.fence.c[0] + v[0] * o, g.fence.c[1] + v[1] * o];
             let (lat, lon) = g.frame.ll(pt);
             let key = tile_for(lat, lon, 16 - ring as u8);
-            let m = tiles.entry(key).or_insert_with(|| build_seed_tile_on(key, ring, frame, t, w, p).unwrap().ground);
+            let m = tiles.entry(key).or_insert_with(|| (*build_seed_tile_on(key, ring, frame, t, w, p).unwrap().ground).clone());
             let y = surface_at(m, frame.tile_center(key), frame.enu(lat, lon), None).expect("ground");
             let lifted = y - t.height(lat, lon);
             let wgt = t.lift_weight(lat, lon);

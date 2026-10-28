@@ -88,6 +88,10 @@ struct Run {
     pop_ms_per_tile: Vec<f64>,
     unloaded_at: HashMap<LayerKey, Instant>,
     churn: usize,
+    /// Churned keys by (layer, zoom, behind the camera when delivered again).
+    churn_kinds: std::collections::BTreeMap<(String, u8, bool), usize>,
+    /// Camera north (m, absolute ENU of the configure origin) for the classification.
+    north: f64,
     delivered: usize,
 }
 
@@ -109,6 +113,8 @@ impl Run {
             self.delivered += 1;
             if self.unloaded_at.get(&k).is_some_and(|u| now.duration_since(*u) < Duration::from_secs(10)) {
                 self.churn += 1;
+                let tile_north = crate::geo::Frame::new(VILNIUS.0, VILNIUS.1).tile_center(k.key)[1];
+                *self.churn_kinds.entry((k.layer.name().to_string(), k.key.z, tile_north < self.north)).or_default() += 1;
             }
         }
         let _ = w.drain_fades();
@@ -148,11 +154,13 @@ fn perf_stream_main_thread() {
         for _ in 0..(seconds() * 60.0) as usize {
             let ft = Instant::now();
             z -= speed / 60.0;
+            f.north += speed / 60.0;
             if let Some(s) = f.frame(&mut w, [0.0, 300.0, z], [0.0, 0.0, -speed]) {
                 z -= s[2];
             }
             std::thread::sleep(FRAME.saturating_sub(ft.elapsed()));
         }
+        eprintln!("[{name} run {run}] churn by (layer, zoom, behind the camera): {:?}", f.churn_kinds);
         let over3 = f.update_cpu_ms.iter().filter(|&&t| t > 3.0).count();
         let (u50, umax) = p50_max(&mut f.update_ms);
         let (c50, cmax) = p50_max(&mut f.update_cpu_ms);
@@ -160,13 +168,14 @@ fn perf_stream_main_thread() {
         eprintln!(
             "[{name} run {run}] first update_camera {:.2} ms wall / {:.2} ms CPU, settle max {settle_max:.2} ms CPU, all frames {settle_upd:.1} ms CPU, pop_ready per tile p50 {sp50:.3} / max {spmax:.2} ms ({settle_s:.1} s); flight {:.0} s: \
              update_camera wall p50 {u50:.3} / max {umax:.2} ms, CPU p50 {c50:.3} / max {cmax:.2} ms ({over3} frames > 3 ms CPU), pop_ready per tile p50 {p50:.3} / max {pmax:.2} ms, \
-             delivered {}, re-delivered within 10 s of unload {} ({:.1} / min)",
+             delivered {}, re-delivered within 10 s of unload {} ({:.1} / min), recent-tile cache {:?}",
             first.0,
             first.1,
             seconds(),
             f.delivered,
             f.churn,
-            f.churn as f64 / seconds() * 60.0
+            f.churn as f64 / seconds() * 60.0,
+            w.stats().recent
         );
         assert!(w.shutdown());
     }

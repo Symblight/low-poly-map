@@ -102,6 +102,7 @@ public partial class BenchArgs : Node
         if (FadeSelfTest.Requested()) { (View?.GetParent() ?? view).CallDeferred(Node.MethodName.AddChild, new FadeSelfTest { Name = "FadeSelfTest" }); return; }
         if (HoleDetector.Requested(out double holeSecs)) HoleDetector.Attach(view, View?.GetParent(), holeSecs);
         if (HoleFlight.Requested(out int holeSeed)) HoleFlight.Attach(view, View?.GetParent(), holeSeed);
+        if (HoleInject.Requested(out string holeInject)) HoleInject.Attach(view, View?.GetParent(), holeInject);
         if (LodSelfTest.Requested()) LodSelfTest.Attach(view, View?.GetParent());
         if (SeedSpots.Requested() is { } spot) SeedSpotDriver.Attach(view, View?.GetParent(), spot);
         if (SeedSelfTest.Requested()) SeedSelfTest.Attach(view, View?.GetParent());

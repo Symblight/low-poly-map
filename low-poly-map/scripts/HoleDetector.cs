@@ -125,6 +125,7 @@ public partial class HoleDetector : Node
         _frame++;
         if (!_view.Streamer.IsAvailable) return;
         CheckTiles();
+        CheckEngineCulling(delta);
         if (HoleFlight.DisruptionClock > 0) _metrics.IgnoreUntilT = System.Math.Max(_metrics.IgnoreUntilT, HoleFlight.DisruptionClock + 12.0); // a teleport or reconfigure starts a first fill
         _metrics.Frame(_t, _frame, string.Join(' ', _recent));
         _sample += delta;
@@ -166,10 +167,13 @@ public partial class HoleDetector : Node
         foreach (long r in _roots)
         {
             float c = Cov(r);
-            if (c >= 0.97f) { _rootGap.Remove(r); continue; }
+            int mask = Mask(r);
+            _maskChecks++;
+            if (c >= 0.97f && mask == 0xFFFF) { _rootGap.Remove(r); continue; }
             _rootGap.TryGetValue(r, out int f);
             _rootGap[r] = f + 1;
-            if (f == 0) { _holes++; Count("root-not-covered"); GD.Print($"[HOLE] {Stamp()} root-not-covered {TileKey.ToText(r)}: drawn {c * 100f:0}% of its area; recent events: {string.Join(' ', _recent)}"); }
+            string kind = c < 0.97f ? "root-not-covered" : "root-dither-gap";
+            if (f == 0) { _holes++; Count(kind); GD.Print($"[HOLE] {Stamp()} {kind} {TileKey.ToText(r)}: drawn {c * 100f:0}% of its area, dither mask 0x{mask:X4}; recent events: {string.Join(' ', _recent)}"); }
         }
     }
 
@@ -367,6 +371,7 @@ public partial class HoleDetector : Node
         foreach (var kv in _kinds) sb.Append(kv.Key).Append('=').Append(kv.Value).Append(' ');
         string line = $"{_t:0} s, {_frame} frames, {_checkedTiles} visible-tile checks, {_view.ReadyTotal} deliveries, {_view.ReplacedTotal} re-deliveries ({_emptyRedeliveries} empty), "
             + $"{_view.UnloadedTotal} unloads, {_view.OriginShiftCount} origin shifts, empty tiles among built-up neighbours (informational) frames {_emptyVisibleFrames}, holes {_holes} [{sb}]";
+        GD.Print($"[HoleCheck] engine cull checks (tiles with a surface point inside the frustum): {_cullChecked}, root dither-mask checks: {_maskChecks}");
         GD.Print("[HoleCheck] flicker and coverage metrics:\n" + _metrics.Summary(_t));
         GD.Print(_holes == 0 && _metrics.Problems == 0 ? $"HOLE CHECK PASS: {line}" : $"HOLE CHECK FAIL: {line}, pixel holes {_metrics.Problems}");
         GetTree().Quit(_holes == 0 && _metrics.Problems == 0 ? 0 : 1);

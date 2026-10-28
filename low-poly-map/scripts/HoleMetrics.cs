@@ -13,7 +13,7 @@ namespace LowPolyMap;
 /// precision), and (4) with <c>--hole-pixels</c> a pixel test: the background is magenta, the terrain and fallback plane are off, so any magenta below the horizon
 /// is a pixel where no vector tile was drawn, whatever the host state says (it catches what the GPU did, e.g. dither materials that discard everything).
 /// </summary>
-public sealed class HoleMetrics
+public sealed partial class HoleMetrics
 {
     private sealed class Tog { public bool Drawn; public double Last = double.NegativeInfinity; public int Quick, Changes; public long Seen; public readonly List<string> Hist = new(); }
 
@@ -38,21 +38,15 @@ public sealed class HoleMetrics
 
     // pixels
     public bool Pixels { get; }
-    private int _pxFrames, _pxBad, _pxWorst;
-    private readonly List<string> _pxLog = new();
-    private int _pxShots;
-    private readonly List<int> _pxRecent = new();
-    private readonly string _pxDir;
     public double IgnoreUntilT;
 
-    public int Problems => (Pixels && _pxBad > 0 ? 1 : 0);
+    public int Problems => PixelProblems;
 
     public HoleMetrics(WorldView view)
     {
         _view = view;
         Pixels = System.Linq.Enumerable.Contains(OS.GetCmdlineUserArgs(), "--hole-pixels");
-        _pxDir = ProjectSettings.GlobalizePath("user://hole_pixels");
-        if (Pixels) DirAccess.MakeDirRecursiveAbsolute(_pxDir);
+        InitPixels();
     }
 
     public void LearnRects(List<DebugTile> dbg)
@@ -143,7 +137,7 @@ public sealed class HoleMetrics
 
     // ---- (3) heights ---------------------------------------------------------------------------
 
-    private static bool Hit(Godot.Collections.Array arrays, Vector3 off, float x, float z, out float y)
+    internal static bool Hit(Godot.Collections.Array arrays, Vector3 off, float x, float z, out float y)
     {
         y = float.NegativeInfinity;
         if (arrays.Count <= (int)Mesh.ArrayType.Index) return false;
@@ -221,76 +215,6 @@ public sealed class HoleMetrics
             }
     }
 
-    // ---- (4) pixels ----------------------------------------------------------------------------
-
-    public void SetupPixels()
-    {
-        if (!Pixels) return;
-        var env = _view.GetViewport().FindWorld3D()?.Environment;
-        if (env == null) return;
-        env.BackgroundMode = Godot.Environment.BGMode.Color;
-        env.BackgroundColor = new Color(1f, 0f, 1f);
-        env.GlowEnabled = false;
-    }
-
-    private void PixelCheck(double t, string events)
-    {
-        SetupPixels();
-        var cam = _view.Camera;
-        if (cam == null || t < 15 || t < IgnoreUntilT) return;
-        // After an abrupt change of direction / fov the picture changes wholesale (data edge, horizon): restart the baseline instead of calling it a hole.
-        if (HoleFlight.ViewChangeClock > 0 && t - HoleFlight.ViewChangeClock < 1.5) { _pxRecent.Clear(); return; }
-        if (_view.Camera is FreeFlyCamera ffc && Input.IsPhysicalKeyPressed(Key.Z)) { _pxRecent.Clear(); return; }
-        var f = -cam.GlobalTransform.Basis.Z;
-        float pitch = Mathf.Asin(f.Y); // negative = down
-        float fov = Mathf.DegToRad(cam.Fov); // the picture's fov, not the LOD override (SetViewOverride does not change what is drawn)
-        if (-pitch - Mathf.DegToRad(5f) <= Mathf.DegToRad(2f)) return; // too level: the far edge of the data (about 1 deg under the horizon) would show
-        var img = _view.GetViewport().GetTexture().GetImage();
-        int w = img.GetWidth(), h = img.GetHeight();
-        // screen row of the ray 5 degrees under the horizon: y = h/2 - tan(e - pitch) / tan(fov/2) * h/2, e = -5 deg
-        float cy = h * 0.5f - Mathf.Tan(Mathf.DegToRad(-5f) - pitch) / Mathf.Tan(fov * 0.5f) * h * 0.5f;
-        int y0 = Mathf.Clamp((int)cy, 0, h - 1);
-        img.Resize(w / 4, h / 4, Image.Interpolation.Nearest);
-        int rows0 = Mathf.Clamp(y0 / 4, 0, img.GetHeight() - 1);
-        // Solid magenta blocks (4 x 4 reduced pixels, all magenta): cracks between ground polygons and road edges are thin slivers and never fill a block,
-        // a missing tile fills hundreds.
-        int bad = 0, iw = img.GetWidth(), ih = img.GetHeight();
-        var magenta = new bool[iw * ih];
-        for (int y = rows0; y < ih; y++)
-            for (int x = 0; x < iw; x++)
-            {
-                var c = img.GetPixel(x, y);
-                magenta[y * iw + x] = c.R > 0.5f && c.B > 0.5f && c.G < 0.3f * c.R;
-            }
-        for (int by = rows0; by + 4 <= ih; by += 4)
-            for (int bx = 0; bx + 4 <= iw; bx += 4)
-            {
-                bool solid = true;
-                for (int yy = 0; yy < 4 && solid; yy++)
-                    for (int xx = 0; xx < 4; xx++)
-                        if (!magenta[(by + yy) * iw + bx + xx]) { solid = false; break; }
-                if (solid) bad++;
-            }
-        _pxFrames++;
-        // Baseline: the data ends somewhere (magenta beyond it is legitimate). A hole is a spike over the median of the last second.
-        _pxRecent.Add(bad);
-        if (_pxRecent.Count > 60) _pxRecent.RemoveAt(0);
-        var sorted = new List<int>(_pxRecent);
-        sorted.Sort();
-        int median = sorted[sorted.Count / 2];
-        if (_pxRecent.Count < 20 || bad < median * 2 + 40) return;
-        _pxBad++;
-        if (bad > _pxWorst) _pxWorst = bad;
-        if (_pxLog.Count < 20) _pxLog.Add($"t={t:0.00}s f={_frame} solid magenta blocks (4x4 px) {bad} vs median {median} (of {(ih - rows0) / 4 * (iw / 4)}) of the frame rendered before this one; events: {events}");
-        if (_pxShots < 6)
-        {
-            _pxShots++;
-            GetImageSave(_view.GetViewport().GetTexture().GetImage(), $"{_pxDir}/hole_{_pxShots}_f{_frame}.png");
-        }
-    }
-
-    private static void GetImageSave(Image img, string path) => img.SavePng(path);
-
     // ---- per frame ----------------------------------------------------------------------------
 
     public void Frame(double t, long frame, string recentEvents)
@@ -326,11 +250,7 @@ public sealed class HoleMetrics
         _sep.Sort();
         string med = _sep.Count > 0 ? $"{_sep[_sep.Count / 2]:0.00}" : "-";
         sb.Append($"heights ({_hSamples} points under the drawn terrain, {_sep.Count} also under a drawn vector ground mesh): terrain above ground_height_at by > 0.2 m at {_hTerrainAbove} points (max {(_hSamples > 0 ? _hMaxAbove.ToString("0.00") : "-")} m); vector ground minus terrain: median {med} m, min |sep| {(_sep.Count > 0 ? _hMinSep.ToString("0.000") : "-")} m, |sep| < 5 cm {_hZ005}, < 25 cm {_hZ025}, < 1 m {_hZ1}\n");
-        if (Pixels)
-        {
-            sb.Append($"pixels: {_pxFrames} frames scanned, {_pxBad} with magenta (no vector ground drawn) below the horizon, worst {_pxWorst} px; PNGs in {_pxDir}\n");
-            foreach (var l in _pxLog) sb.Append("  ").Append(l).Append('\n');
-        }
+        PixelSummary(sb);
         return sb.ToString();
     }
 }

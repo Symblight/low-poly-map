@@ -59,7 +59,7 @@ pub struct Status {
 
 pub const MSG_NOT_CONFIGURED: &str = "not configured";
 pub const MSG_SHUT_DOWN: &str = "shut down";
-pub const MSG_OFFLINE: &str = "tile server unreachable and no cached tiles";
+pub const MSG_OFFLINE: &str = "tile server unreachable and no cached tiles served";
 pub const MSG_CACHED_ONLY: &str = "tile server unreachable; showing cached tiles only";
 pub const MSG_FAILURES: &str = "some tiles failed to load; retrying";
 pub const MSG_CACHE_DISABLED: &str = "disk cache disabled after write failures; streaming without it";

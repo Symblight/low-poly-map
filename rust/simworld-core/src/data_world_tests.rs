@@ -631,3 +631,49 @@ fn data_levels_are_recorded_in_the_disk_cache_for_offline_starts() {
     assert!(b.close_disk(Duration::from_secs(2)));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Review H1: a disk cache written before api 1.11 has no `levels` row. Offline, the levels are
+/// inferred from its z15 / z16 tiles (compatibility archive), so the cached tiles render and the
+/// status says `degraded` / cached tiles only instead of waiting forever for the archive.
+#[test]
+fn offline_start_on_a_cache_without_the_levels_row_renders_cached_tiles() {
+    let (url, _) = serve(archive());
+    let dir = std::env::temp_dir().join(format!("simworld-h1-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let with_cache = |u: &str| WorldOptions { cache_dir: dir.to_string_lossy().into_owned(), ..opts(u) };
+    let mut a = world();
+    assert!(a.configure_world(with_cache(&url)).ok);
+    let (warm, _) = settle(&mut a);
+    assert!(a.shutdown());
+    drop(a);
+    // Make it a pre-1.11 cache (no `levels` row) under an unreachable URL.
+    let dead = "http://127.0.0.1:9/t.pmtiles";
+    let db = dir.join(crate::fetch::cache_file_name(dead));
+    std::fs::rename(dir.join(crate::fetch::cache_file_name(&url)), &db).unwrap();
+    {
+        let c = rusqlite::Connection::open(&db).unwrap();
+        assert_eq!(c.execute("DELETE FROM meta WHERE k = 'levels'", []).unwrap(), 1, "the 1.11 cache recorded its levels");
+    }
+    let mut b = world();
+    assert!(b.configure_world(with_cache(dead)).ok);
+    let under = crate::geo::tile_for(VILNIUS.0, VILNIUS.1, 16);
+    let mut got = BTreeMap::new();
+    let t0 = Instant::now();
+    while !got.contains_key(&under) {
+        assert!(t0.elapsed() < Duration::from_secs(30), "no cached tile rendered offline: {:?} / {:?}", b.status(), b.stats());
+        b.update_camera([0.0, 300.0, 0.0], [0.0; 3], 300.0);
+        b.pop_ready(64, |t| {
+            if t.layer == LayerKind::World {
+                got.insert(t.key, (mesh_hash(t.mesh), mesh_hash(t.ground)));
+            }
+        });
+        let _ = b.drain_fades();
+        let _ = b.drain_unload();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(got.get(&under), warm.get(&under), "the offline tile equals the online one");
+    let st = b.status();
+    assert_eq!((st.state, st.message.as_str()), (crate::status::StatusState::Degraded, crate::status::MSG_CACHED_ONLY));
+    assert!(b.shutdown());
+    let _ = std::fs::remove_dir_all(&dir);
+}

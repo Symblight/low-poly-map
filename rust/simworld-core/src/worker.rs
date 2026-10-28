@@ -1019,15 +1019,20 @@ impl Worker {
                         return;
                     }
                     Err(e) => {
-                        if let Some(l) = f.cached_levels().await {
+                        let cached = f.cached_levels().await;
+                        if cached.is_some() {
                             let _ = tx.send(WorkerMsg::Info(format!(
-                                "archive unreachable ({}); using the data levels recorded in the disk cache",
+                                "archive unreachable ({}); using the data levels of the disk cache",
                                 e.message
                             )));
+                        }
+                        // Counted either way, so the status reads `degraded` (cached tiles
+                        // only) rather than `ok` while the archive is unreachable.
+                        let _ = tx.send(WorkerMsg::OpenFailed(e));
+                        if let Some(l) = cached {
                             let _ = tx.send(WorkerMsg::Levels(l));
                             return;
                         }
-                        let _ = tx.send(WorkerMsg::OpenFailed(e));
                         tokio::time::sleep(f.open_retry()).await;
                     }
                 }

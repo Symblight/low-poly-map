@@ -216,11 +216,39 @@ fn emit_area(
     water: bool,
     cut: bool,
 ) {
-    let (proj, rect, field) = (ctx.proj, ctx.rect, ctx.field);
+    let rect = ctx.rect;
     let bb = bbox(&rings[0]);
     if bb[2] <= rect.x0 || bb[0] >= rect.x1 || bb[3] <= rect.y0 || bb[1] >= rect.y1 {
         return;
     }
+    let needs_clip = bb[0] < rect.x0 || bb[2] > rect.x1 || bb[1] < rect.y0 || bb[3] > rect.y1;
+    if needs_clip && crate::polyclip::hole_crosses(rings, rect) {
+        // A hole reaches the clip boundary: clip the polygon as a whole so the hole notches
+        // the outer ring (per-ring clipping would cover it).
+        for piece in crate::polyclip::clip_polygon(rings, rect) {
+            emit_area_rings(m, s, &piece, ctx, tol_px, lift, color, water, cut, true);
+        }
+    } else {
+        emit_area_rings(m, s, rings, ctx, tol_px, lift, color, water, cut, false);
+    }
+}
+
+/// [`emit_area`] for one polygon; `pre_clipped`: the rings are already inside the rect
+/// ([`crate::polyclip::clip_polygon`]), vertices on the rect boundary stay locked.
+#[allow(clippy::too_many_arguments)]
+fn emit_area_rings(
+    m: &mut MeshData,
+    s: &mut Scratch,
+    rings: &[Vec<[f64; 2]>],
+    ctx: &AreaCtx<'_>,
+    tol_px: f64,
+    lift: f32,
+    color: [f32; 4],
+    water: bool,
+    cut: bool,
+    pre_clipped: bool,
+) {
+    let (proj, rect, field) = (ctx.proj, ctx.rect, ctx.field);
     s.flat.clear();
     s.hs.clear();
     s.pxs.clear();
@@ -230,8 +258,8 @@ fn emit_area(
         if ri > 0 && (rb[2] <= rect.x0 || rb[0] >= rect.x1 || rb[3] <= rect.y0 || rb[1] >= rect.y1) {
             continue; // hole entirely outside the tile
         }
-        let needs_clip = rb[0] < rect.x0 || rb[2] > rect.x1 || rb[1] < rect.y0 || rb[3] > rect.y1;
-        if needs_clip {
+        let needs_clip = pre_clipped || rb[0] < rect.x0 || rb[2] > rect.x1 || rb[1] < rect.y0 || rb[3] > rect.y1;
+        if needs_clip && !pre_clipped {
             clip_ring(ring, rect, &mut s.clip_a, &mut s.clip_b);
         } else {
             s.clip_a.clear();
@@ -1042,5 +1070,43 @@ mod tests {
         g.roads.push(road(ROAD_SECONDARY, false, true, vec![[0.0, 0.0], [1200.0, 3000.0], [4096.0, 3500.0]]));
         assert_eq!(mesh_ground(&g, &p, 0, &dp()), mesh_ground(&g, &p, 0, &dp()));
         assert_eq!(mesh_ground(&g, &p, 1, &dp()), mesh_ground(&g, &p, 1, &dp()));
+    }
+
+    /// Holes reaching the clip rect (a pond in landuse, an inner ring cut by a tile or chunk
+    /// edge): area = outer ∩ rect − holes ∩ rect, and the four z16 chunks of a z15 tile add up.
+    #[test]
+    fn holes_crossing_the_clip_rect_stay_open() {
+        use crate::polyclip::fixtures;
+        let key = tile_for(VILNIUS.0, VILNIUS.1, 15);
+        let (lat, lon) = key.center_lat_lon();
+        let parent = TileProjector::new(key, Frame::new(lat, lon), 4096.0);
+        for (name, outer, holes) in fixtures::cases() {
+            let g = GroundFeatures {
+                areas: vec![GroundArea { class: GROUND_GRASS, level: 0, id: 7, rings: fixtures::rings(outer, &holes), tint: 0, sub: 0, cut: false }],
+                roads: vec![],
+                ..Default::default()
+            };
+            let whole = mesh_ground(&g, &parent, 1, &dp());
+            let a = area_m2(&whole);
+            let expect = fixtures::expected_m2(&parent, [0.0, 0.0, 4096.0, 4096.0], outer, &holes);
+            assert!((a - expect).abs() / expect < 1e-6, "{name}: tile {a} vs {expect}");
+            assert!(all_up(&whole), "{name}");
+            let mut sum = 0.0;
+            for q in 0..4u32 {
+                let child = crate::geo::TileKey::new(key.z + 1, key.x * 2 + (q & 1), key.y * 2 + (q >> 1));
+                let p = parent.cut(child).unwrap();
+                let r = p.rect();
+                let m = mesh_ground(&g, &p, 0, &dp());
+                let am = area_m2(&m);
+                let e = fixtures::expected_m2(&p, [r.x0, r.y0, r.x1, r.y1], outer, &holes);
+                assert!((am - e).abs() <= 1e-6 * e.max(1.0), "{name} child {q}: {am} vs {e}");
+                assert!(all_up(&m), "{name} child {q}");
+                assert_eq!(m, mesh_ground(&g, &p, 0, &dp()), "{name}: deterministic");
+                sum += am;
+            }
+            // Exact in tile pixels (`expected_m2` checks it); in ENU the tile lacks the chunk seam
+            // vertices and a straight pixel edge bends slightly (~2e-6 of the area at z15): 1e-5.
+            assert!((sum - a).abs() / a < 1e-5, "{name}: chunks {sum} vs tile {a}");
+        }
     }
 }

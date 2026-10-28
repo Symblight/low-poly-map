@@ -33,6 +33,7 @@ pub mod lock;
 pub mod math;
 pub mod mesher;
 pub mod mvt;
+pub(crate) mod polyclip;
 pub mod profile;
 pub mod rings;
 pub mod scheduler;

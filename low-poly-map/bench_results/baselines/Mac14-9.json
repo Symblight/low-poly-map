@@ -1,57 +1,57 @@
 {
   "low-250@release": {
-    "frame_p95_ms": 12.5,
-    "frame_mean_ms": 8.341,
-    "avg_fps": 119.9,
+    "frame_p95_ms": 4,
+    "frame_mean_ms": 3.142,
+    "avg_fps": 318.2,
     "gpu_p95_ms": 0,
-    "draw_calls_mean": 977,
-    "process_mb_last": 888.5,
+    "draw_calls_mean": 437,
+    "process_mb_last": 1072.9,
     "seconds": 60,
     "library_flavour": "release",
-    "recorded_utc": "2026-10-28T17:33:19Z"
+    "recorded_utc": "2026-10-28T22:46:44Z"
   },
   "climb@release": {
-    "frame_p95_ms": 13.75,
-    "frame_mean_ms": 6.492,
-    "avg_fps": 154,
+    "frame_p95_ms": 4.25,
+    "frame_mean_ms": 3.137,
+    "avg_fps": 318.7,
     "gpu_p95_ms": 0,
-    "draw_calls_mean": 548,
-    "process_mb_last": 1041.5,
+    "draw_calls_mean": 254,
+    "process_mb_last": 1005.3,
     "seconds": 60,
     "library_flavour": "release",
-    "recorded_utc": "2026-10-28T17:34:41Z"
+    "recorded_utc": "2026-10-28T22:47:53Z"
   },
   "zoom@release": {
-    "frame_p95_ms": 11,
-    "frame_mean_ms": 4.016,
-    "avg_fps": 249,
+    "frame_p95_ms": 4.5,
+    "frame_mean_ms": 3.189,
+    "avg_fps": 313.6,
     "gpu_p95_ms": 0,
-    "draw_calls_mean": 539,
-    "process_mb_last": 1230,
+    "draw_calls_mean": 214,
+    "process_mb_last": 1279.9,
     "seconds": 60,
     "library_flavour": "release",
-    "recorded_utc": "2026-10-28T17:35:52Z"
+    "recorded_utc": "2026-10-28T22:49:02Z"
   },
   "night-low@release": {
-    "frame_p95_ms": 3,
-    "frame_mean_ms": 2.143,
-    "avg_fps": 466.7,
+    "frame_p95_ms": 3.5,
+    "frame_mean_ms": 2.918,
+    "avg_fps": 342.7,
     "gpu_p95_ms": 0,
-    "draw_calls_mean": 955,
-    "process_mb_last": 920.6,
+    "draw_calls_mean": 626,
+    "process_mb_last": 1052.3,
     "seconds": 60,
     "library_flavour": "release",
-    "recorded_utc": "2026-10-28T17:37:02Z"
+    "recorded_utc": "2026-10-28T22:50:11Z"
   },
   "reconfigure@release": {
-    "frame_p95_ms": 10.5,
-    "frame_mean_ms": 6.742,
-    "avg_fps": 148.3,
+    "frame_p95_ms": 4.25,
+    "frame_mean_ms": 3.148,
+    "avg_fps": 317.6,
     "gpu_p95_ms": 0,
-    "draw_calls_mean": 797,
-    "process_mb_last": 1508.4,
+    "draw_calls_mean": 395,
+    "process_mb_last": 1042.1,
     "seconds": 60,
     "library_flavour": "release",
-    "recorded_utc": "2026-10-28T17:38:13Z"
+    "recorded_utc": "2026-10-28T22:51:20Z"
   }
 }

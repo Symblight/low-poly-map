@@ -21,7 +21,6 @@ public static class TileKey
     public static int Z(long k) => (int)(k >> 48);
     public static int X(long k) => (int)((k >> 24) & 0xFFFFFF);
     public static int Y(long k) => (int)(k & 0xFFFFFF);
-    public static int RingOf(int z) => LeafZ - z;
 
     public static long Parent(long k) => Pack(Z(k) - 1, X(k) >> 1, Y(k) >> 1);
 

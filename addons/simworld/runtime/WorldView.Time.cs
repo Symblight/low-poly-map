@@ -6,6 +6,11 @@ namespace SimWorld;
 // Time of day: the shader globals, the lit-window shares, the window profile and the day / night switch of the light sprites.
 public partial class WorldView
 {
+    /// <summary>0 = day, 1 = night, as last given to <see cref="SetTime"/>.</summary>
+    public float NightFactor { get; private set; } = 1f;
+    /// <summary>Local solar hour as last given to <see cref="SetTime"/>.</summary>
+    public float Hour { get; private set; } = 12f;
+
     /// <summary>
     /// Time of day for the shaders: writes the global uniforms <c>simworld_hour</c> and <c>simworld_night_factor</c> (light sprites
     /// fade in with the night factor). The host owns the clock and calls this whenever it changes.

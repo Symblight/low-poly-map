@@ -18,9 +18,6 @@ internal sealed class PoolWriter
 
     private readonly Dictionary<int, float[]> _staging = new();
 
-    /// <summary>Buffer reallocations (InstanceCount changes) since start.</summary>
-    public int Reallocations { get; private set; }
-
     /// <summary>Writes <paramref name="points"/> (above 0) into <paramref name="mm"/>; a short colour array is padded with warm white.</summary>
     public void Fill(MultiMesh mm, Vector3[] points, Color[] colors)
     {
@@ -30,7 +27,6 @@ internal sealed class PoolWriter
         {
             cap = (System.Math.Max(need, cap + cap / 4) + Step - 1) / Step * Step;
             mm.InstanceCount = cap;
-            Reallocations++;
         }
         var buf = Staging(cap);
         var min = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);

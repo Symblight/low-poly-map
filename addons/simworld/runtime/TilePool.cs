@@ -48,7 +48,6 @@ public sealed partial class TilePool
     public ShaderMaterial BuildingMaterial => _buildingMaterial;
     /// <summary>The configured dither variants (templates; fading tiles use clones, see <see cref="FadeMaterials"/>).</summary>
     public ShaderMaterial BuildingFadeMaterial => _buildingFades.Template;
-    public ShaderMaterial GroundFadeMaterial => _groundFades.Template;
     public FadeMaterials BuildingFades => _buildingFades;
     /// <summary>The point sprite and street pool materials with their dither variants.</summary>
     public SpriteMaterials Sprites => _sprites;

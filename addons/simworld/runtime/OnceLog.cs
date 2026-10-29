@@ -15,9 +15,6 @@ public sealed class OnceLog
     /// <summary>Every occurrence, logged or not.</summary>
     public int Count { get; private set; }
 
-    /// <summary>Distinct keys that were logged.</summary>
-    public int Distinct => _seen.Count;
-
     /// <summary>Pushes an error the first time <paramref name="key"/> is seen; later calls only count.</summary>
     public void Error(string key, string message)
     {

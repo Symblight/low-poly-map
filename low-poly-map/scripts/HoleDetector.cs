@@ -76,8 +76,6 @@ public partial class HoleDetector : Node
     private readonly Queue<string> _recent = new();
     private double _lastSlotLog;
 
-    public int Holes => _holes;
-
     public override void _Ready()
     {
         ProcessPriority = 100; // after the view and the camera

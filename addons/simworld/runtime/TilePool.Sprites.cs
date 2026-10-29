@@ -17,9 +17,6 @@ public sealed partial class TilePool
     /// <summary>True while the sprites are shown (the night factor is above the switch-on level). See <see cref="SetSpritesVisible"/>.</summary>
     public bool SpritesOn => _spritesOn;
 
-    /// <summary>Pool MultiMesh buffer reallocations (a pool buffer had to grow) since start.</summary>
-    public int PoolReallocations => _poolWriter.Reallocations;
-
     /// <summary>
     /// Shows or hides the sprite container of every held tile (<paramref name="held"/>) and of every set acquired later. The light sprites, street lamp
     /// pools, beacons and airport lights all multiply their brightness by the night factor, so by day they only cost draw calls and additive black

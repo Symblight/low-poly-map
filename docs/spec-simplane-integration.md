@@ -96,10 +96,10 @@ Nothing here is a new `api_version`. Items that would be one (a geoid, `set_cloc
 | # | Item | Blocks |
 | --- | --- | --- |
 | S1 | Runtime origin: `WorldGeoReference` over the library's conversions, JSBSim duplicate removed, custom model shift-aware, `OriginShifted` subscribers (B1) | first flight |
-| S2 | `GroundHeightAt` wired, runway lift applied inside the strip (B2) | first flight |
-| S3 | `GameSession` world / airport / runway, spawn from `Airports`, menu page, `menu-map-spec.md` (B3) | first flight |
-| S4 | `World/SeedWorld.tscn`, `TestWorld` kept for checks, seed data and credits in the bundle (B4) | first flight |
-| S5 | Vendor the addon, nullable setting, shader globals (B5) | first flight |
+| S2 | `GroundHeightAt` wired, runway lift applied inside the strip (B2) | **done 2026-10-29** (section 7a) |
+| S3 | `GameSession` world / airport / runway, spawn from `Airports`, menu page, `menu-map-spec.md` (B3) | first flight (spawn from `airports()` done, hard-coded to EYVI 01; `GameSession.World` exists; the menu page and the airport choice remain) |
+| S4 | `World/SeedWorld` (built in code under `TestWorld`), `TestWorld` kept for checks, seed data and credits in the bundle (B4) | **done 2026-10-29** (section 7a) |
+| S5 | Vendor the addon (symlink for now), nullable pragmas in the addon, shader globals at runtime (B5) | **done 2026-10-29** |
 | S6 | `TimeOfDay` host clock, sun, `SetTime`, glow on the environment (N1, N2) | night |
 | S7 | Settings tier mapping, loading rule, restart shutdown (N5, N6, N7) | release |
 | S8 | Nav data regenerated for the Baltics (N8) | ND correctness |
@@ -122,6 +122,14 @@ Nothing here is a new `api_version`. Items that would be one (a geoid, `set_cloc
 - Nullable (B5): project-wide enable (proposed) or per-file pragmas in the addon.
 - Clouds versus night fog (N2): `SkyController` is the only fog writer (proposed).
 - Nav data (N8): regenerate the CSVs (proposed, keeps the ND independent of the world node) or read `Airports` at runtime.
+
+## 7a. Step 2 result (2026-10-29)
+
+Built in SimPlane (uncommitted there): `addons/simworld` is a symlink to this repo's addon (ignored in SimPlane's git; the release vendors a copy), `WorldData/two-cities/` copied in (1.5 MB; not `world/`: SimPlane's code folder is `World/` and the macOS file system merges the two, which would break a case-sensitive export), `CREDITS.md` rows for SimWorld, OpenStreetMap and OurAirports. `World/WorldKind.cs` (`WorldKind` Flat / Seed, `WorldSelect.Effective()`: `--world=seed|flat` after `--`, else `GameSession.World`), `World/IGroundSurface.cs` (group `ground_surface`, `HeightAt`), `World/SeedWorld.cs` (a `WorldView` built in code over `WorldData/two-cities/world.json`, origin = the EYVI runway 01 end from OurAirports, `CameraSwitchSource(() => GetViewport().GetCamera3D())`, `AutoStart` off and `Start()` after the source is set, `LandmarksEnabled` off; `HeightAt` = `ground_height_at` + `RunwayLift.X` inside a runway pavement from `airports()`; spawn = threshold + 60 m along the runway heading; an origin shift logs a warning and rebuilds the strips; `--world-shot=<png>` saves the viewport 180 frames after the first tile; a log line every 5 s for the first minute). `TestWorld` keeps every node path (`TestWorld/WorldEnvironment`, `SkyController`, `Windsock`) in both worlds: in the seed world it frees the flat `Ground` plane, builds no runway or trees, adds `SeedWorld`, lifts the windsock onto the terrain and writes the aircraft's `Position` / `StartHeadingDeg` before `AircraftController._Ready`. `AircraftController`: `Model.GroundHeightAt` from the `ground_surface` group right after the model is created (before the first reset), and SimPlane's own rebase is off when the world does not move with the origin (`TestWorld.MovesWithOrigin` false), so the aircraft node sits at true local metres. `GameSession.World`.
+
+Measured: headless and windowed (Metal, Forward+) runs of `Main.tscn -- --world=seed`: 28 airports loaded in 287 ms, spawn (22.5, 330.8, -55.6) heading 22 at EYVI 01, the A320 (JSBSim) parked with a steady CG height of 8.4 ft over 10 s, 497 / 605 tiles held, no error, the screenshot shows the aircraft on the drawn runway with markings, the windsock on the grass and Vilnius on the horizon; `WindsockChecks` and `SkyChecks` (flat world) unchanged. The material prewarm is skipped in this host because no camera exists when the view starts (the cameras are later siblings); the first fade therefore compiles its shaders. Not yet: the telemetry lat/lon still come from the 47 N 8 E origin (step 3), the ND shows the wrong place, Landing mission geometry assumes the flat runway heading north, `set_view` starts one frame late.
+
+**New finding, needs a decision:** the procedural relief puts EYVI at 330.8 m while the real field elevation is 197 m (648 ft); the altimeter reads 1094 ft on the ground. The height function treats `elevation_ft` as informational (spec-world-seed 5.1 step 9). Options: (a) the seed height function passes through the airport elevation at every strip (the runway profile anchored to `elevation_ft` instead of the field's own heights, blended over the shoulder), which keeps real altimeter settings and approach plates usable; (b) lower the relief amplitude for the Baltics so airports land within tens of metres of their elevation; (c) accept. (a) is the truthful one and a contract-visible output change (golden hashes, api minor); decide before step 5.
 
 ## 8. Order of work
 

@@ -150,7 +150,7 @@ The author flew the A320 out of EYVI in the seed world and reported artifacts, t
 
 Diagnostics kept in `World/SeedWorld.cs`: the 5 s "Seed world" log line now carries per-layer tile counts, deliveries and unloads since the last line, the origin shift count, `tau_eff` / quality / view / camera / velocity source, the worst frame time and the aircraft AGL; `--world-orbit` injects a chase-camera drag from 8 to 20 s; `--world-camvel` feeds the camera's own velocity; `--world-teleport=<km>` air-starts that far along the runway heading at 3 000 ft and 250 kt at 10 s; `--world-recenter=<m>` sets the re-centre distance (5000 reproduces the per-frame shift).
 
-**Consequence for the order of work:** step 3 (the frame, S1) is no longer "after the first flight"; it is the next thing, because every flight beyond 50 km of EYVI hits the same wall.
+**Consequence for the order of work:** step 3 (the frame, S1) is no longer "after the first flight"; it is the next thing, because every flight beyond 50 km of EYVI hits the same wall. Its design, verified against both code bases, is SimPlane's `docs/world-frame-spec.md` (2026-10-29): one geodetic truth, model space = the library's ENU frame at the configured origin (continuous, never shifted), render space = model space minus a render offset whose horizontal part is the library's `TotalShift` and whose vertical part is SimPlane's existing 512 m rule; the ENU formulas ported in double from `geo.rs`; the JSBSim bridge switched from geocentric to geodetic latitude (a 21 km error at 54.6 N otherwise). No library change.
 
 ## 8. Order of work
 

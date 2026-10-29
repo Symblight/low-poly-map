@@ -2,8 +2,11 @@ shader_type spatial;
 // Point sprites of a tile: building lights, street lamps, airport lights and aircraft warning beacons. The tile's lights are ONE mesh of PRIMITIVE_POINTS, one
 // vertex per light (20 bytes: position, COLOR, CUSTOM0), no billboard quad: the size comes from POINT_SIZE in pixels and the round falloff from POINT_COORD.
 // Per vertex: COLOR = rgb + weight (below); CUSTOM0 (RGBA8) = r: brightness scale x 32 / 255 (1 except for airport lights, whose Rust intensity weight scales it),
-// g: kind (KIND_*; above KIND_BEACON = padding vertex, not drawn), b / a: low / high byte of the light's index within its kind in the ready-tile arrays (seeds the
-// hashes below, so the light pattern does not depend on how the kinds are packed).
+// g: kind (KIND_*), b / a: low / high byte of the light's index within its kind in the ready-tile arrays (seeds the hashes below, so the light pattern does not
+// depend on how the kinds are packed).
+// Variant CELL (R2 / R3 tiles merged into one mesh per spatial cell, SpriteCell): g = kind | slot << 2, where slot (0..63) is the tile the point belongs to, and the
+// uniform slot_fade[slot] = tile shown ? tile fade : 0 (written once a frame by the host) scales the brightness like fade_mul does for a tile's own mesh; a slot at 0
+// collapses its points (no fill cost), so a tile hidden by the visibility rule, fading or unloaded changes with its root, whatever the mesh still holds.
 // Mobile-renderer compatible (Metal and Vulkan; D3D12 needs Godot's point size emulation). Additive, unshaded, no depth write; fog is applied by hand
 // (fog_disabled) because additive blending of a fogged colour would add the fog colour instead of dimming the light.
 // Energy model (like GTA V's distant light bulbs): a sprite stays a few pixels at every distance and its brightness falls with
@@ -115,6 +118,9 @@ uniform float fade_mul : hint_range(0.0, 1.0) = 1.0; // per fading tile (one mat
 #else
 const float fade_mul = 1.0;
 #endif
+#ifdef CELL
+uniform vec4 slot_fade[16]; // 64 slots, 4 per vector
+#endif
 
 varying vec3 v_col;
 varying float v_bright; // the whole brightness but fade_mul
@@ -122,8 +128,14 @@ varying float v_pow;    // exponent of the dot texture's alpha: sharp core close
 
 void vertex() {
 	int kind = int(CUSTOM0.g * 255.0 + 0.5);
-	float live = kind <= KIND_BEACON ? 1.0 : 0.0; // padding vertices of the tile's array are not drawn
-	kind = min(kind, KIND_BEACON);
+	float tile_fade = 1.0;
+	float live = 1.0;
+#ifdef CELL
+	int slot = kind >> 2;
+	kind &= 3;
+	tile_fade = slot_fade[slot >> 2][slot & 3];
+	live = tile_fade > 0.0 ? 1.0 : 0.0; // a hidden / unloaded tile's points are not drawn
+#endif
 	vec4 look = kind_look[kind];
 	// Earth curvature: drop the point in world space (via the view matrices, which hold no instance transform).
 	vec3 c = (MODELVIEW_MATRIX * vec4(VERTEX, 1.0)).xyz;
@@ -191,6 +203,8 @@ void vertex() {
 		v_pow = mix(1.35, 0.75, blur);
 	}
 
+	v_bright *= tile_fade;
+
 	// Stand the point on the roof (raise it by half its size along world up) so the own flat roof, which projects below it,
 	// does not cut it in half, and pull it a fixed lift_m towards the camera. The raise is about half a sprite on screen and
 	// the depth stays at the light, so buildings in front still occlude it (a size-scaled pull of up to ~130 m did not).
@@ -199,7 +213,7 @@ void vertex() {
 	centre += (VIEW_MATRIX * vec4(jit.x, 0.0, jit.y, 0.0)).xyz;
 	centre *= 1.0 - min(lift_m, d * 0.5) / max(length(centre), 0.1);
 
-	VERTEX = mix(vec3(0.0, 0.0, 1.0), centre, live); // a padding vertex goes behind the camera
+	VERTEX = mix(vec3(0.0, 0.0, 1.0), centre, live); // a point of a hidden tile goes behind the camera
 	POINT_SIZE = size_px * live;
 }
 

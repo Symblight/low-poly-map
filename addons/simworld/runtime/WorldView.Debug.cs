@@ -35,6 +35,23 @@ public partial class WorldView
 
     private readonly HashSet<ulong> _frustumIds = new();
 
+    /// <summary>Diagnostic (<c>--hole-check</c>): false, with the reason, when a tile the cover shows has point sprites that this frame would not draw (see <see cref="SpriteCells.LightsDrawn"/>).</summary>
+    public bool LightsDrawn(TileNodes tile, out string why)
+    {
+        why = "";
+        return _pool == null || _pool.Cells.LightsDrawn(tile, out why);
+    }
+
+    /// <summary>The merged point sprite cells of the R2 / R3 tiles (counters since start).</summary>
+    public SpriteCellStats SpriteCells
+    {
+        get
+        {
+            var c = _pool?.Cells;
+            return c == null ? default : new SpriteCellStats(c.CellCount, c.MemberCount, c.MeshPoints, c.DeadPoints, c.Rebuilds, c.RebuiltPoints, c.RebuildUs, c.RebuildUsMax, c.TableWrites);
+        }
+    }
+
     /// <summary>
     /// Counts what the camera can see (draw call estimate): terrain tiles that are visible by the cover rule and whose mesh AABB (plus the cull margin)
     /// intersects the camera frustum, as the renderer culls them. <paramref name="visibleByRule"/> = tiles shown by the visibility rule,
@@ -63,6 +80,8 @@ public partial class WorldView
             if (n.Points.Visible && _frustumIds.Contains(n.Points.GetInstanceId())) { points++; pointsByRing[System.Math.Clamp(n.Ring, 0, pointsByRing.Length - 1)]++; }
             if (n.Pools.Visible && _frustumIds.Contains(n.Pools.GetInstanceId())) pools++;
         }
+        foreach (var c in _pool!.Cells.Cells)
+            if (c.Shown && _frustumIds.Contains(c.Instance.GetInstanceId())) { points++; pointsByRing[System.Math.Clamp(c.Ring, 0, pointsByRing.Length - 1)]++; }
         return points;
     }
 
@@ -100,6 +119,29 @@ public partial class WorldView
     }
 
     /// <summary>
+    /// The merged point sprite cells against the cover: the cells' own bookkeeping (<see cref="SpriteCells.Verify"/>: fade table = what each tile shows, point accounting) and that
+    /// every held tile of a merging ring that has points has them in its cell, all of them (a lit tile whose lights are missing would be a hole in the light carpet).
+    /// </summary>
+    private int VerifySpriteCells(System.Text.StringBuilder report)
+    {
+        int errors = 0;
+        var problem = _pool!.Cells.Verify();
+        if (problem != null) { errors++; report.Append("sprite cells: ").Append(problem).Append('\n'); }
+        foreach (var n in Cover.All)
+        {
+            if (!_pool.Cells.Merges(n.Ring) || n.SpriteCount == 0) continue;
+            if (n.CellMember == null || n.CellMember.Data.Count != n.SpriteCount)
+            {
+                errors++;
+                report.Append("sprite cells: tile ").Append(n.Key).Append(" ring ").Append(n.Ring).Append(" has ").Append(n.SpriteCount).Append(" lights, its cell holds ")
+                      .Append(n.CellMember?.Data.Count ?? 0).Append('\n');
+            }
+            else if (n.Points.Visible) { errors++; report.Append("sprite cells: tile ").Append(n.Key).Append(" draws its own points besides its cell's\n"); }
+        }
+        return errors;
+    }
+
+    /// <summary>
     /// Periodic consistency check of the quadtree cover (every 5 s): stored visibility vs the rule, double cover,
     /// holes in settled roots, counters. Roots that still have pending tiles in Rust are skipped, and a hole must
     /// persist over two consecutive checks before it is reported. Pushes an error on any finding.
@@ -129,6 +171,7 @@ public partial class WorldView
         int errors = Cover.Verify(_pendingRoots, _suspectRoots, _report);
         if (TerrainActive) errors += TerrainCover.Verify(_pendingRootsT, _suspectRootsT, _report);
         errors += LandmarkCover.Verify(_report);
+        errors += VerifySpriteCells(_report);
         ConsistencyChecks++;
         if (errors > 0)
         {
@@ -139,7 +182,7 @@ public partial class WorldView
         {
             GD.Print($"[WorldView] cover consistent: {Cover.Loaded} tiles loaded, visible R0..R3 = "
                 + $"{Cover.VisibleByRing[0]}/{Cover.VisibleByRing[1]}/{Cover.VisibleByRing[2]}/{Cover.VisibleByRing[3]}, "
-                + $"hidden by children {Cover.HiddenByChildren}, waiting siblings {Cover.WaitingSiblings}");
+                + $"hidden by children {Cover.HiddenByChildren}, waiting siblings {Cover.WaitingSiblings}, sprite cells {_pool!.Cells.CellCount} ({_pool.Cells.MemberCount} tiles, {_pool.Cells.MeshPoints} points, {_pool.Cells.DeadPoints} dead)");
         }
     }
 }

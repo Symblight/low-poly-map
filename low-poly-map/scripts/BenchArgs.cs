@@ -42,6 +42,14 @@ public partial class BenchArgs : Node
         return list.Count > 1;
     }
 
+    /// <summary>--sprite-cell-zoom=&lt;R2 zoom&gt;,&lt;R3 zoom&gt;: the zoom of the cells that merge the R2 / R3 tiles' point sprites.</summary>
+    private static void ApplyCellZoom(WorldRenderSettings settings, string text)
+    {
+        var parts = text.Split(',');
+        if (parts.Length == 2 && int.TryParse(parts[0], out int r2) && int.TryParse(parts[1], out int r3)) { settings.SpriteCellZoomR2 = r2; settings.SpriteCellZoomR3 = r3; }
+        else GD.PushError($"[BenchArgs] --sprite-cell-zoom expects <R2 zoom>,<R3 zoom>, got '{text}'");
+    }
+
     private static bool TryNumber(string text, out double v) =>
         double.TryParse(text, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out v);
 
@@ -61,6 +69,8 @@ public partial class BenchArgs : Node
             else if (arg.StartsWith("--curvature=", System.StringComparison.Ordinal) && TryNumber(arg.Substring(12), out var cv)) view.Curvature = Mathf.Max((float)cv, 0f);
             else if (arg.StartsWith("--light-alpha=", System.StringComparison.Ordinal) && TryNumber(arg.Substring(14), out var la)) settings.DebugLightAlpha = (float)la;
             else if (arg.StartsWith("--gc-quiet=", System.StringComparison.Ordinal) && TryNumber(arg.Substring(11), out var gq)) settings.GcQuietBudgetMb = (int)gq; // MB the collector may skip between collections (GcPacer); 0 = off
+            else if (arg.StartsWith("--sprite-cells=", System.StringComparison.Ordinal) && TryNumber(arg.Substring(15), out var sc)) settings.SpriteCellMinRing = (int)sc; // first ring with merged point sprites (2 default, 4 = off)
+            else if (arg.StartsWith("--sprite-cell-zoom=", System.StringComparison.Ordinal)) ApplyCellZoom(settings, arg.Substring(19)); // "<R2 zoom>,<R3 zoom>" of the merged sprite cells
             else if (arg == "--no-engine-surfaces") settings.EngineSurfaces = false; // api 1.11: Godot packs the mesh Arrays on the main thread (A/B of the library's engine surfaces)
             else if (arg == "--no-building-lights") settings.BuildingLightSprites = false;
             else if (arg == "--no-upload-burst") settings.UploadBudgetBurstUs = 0;

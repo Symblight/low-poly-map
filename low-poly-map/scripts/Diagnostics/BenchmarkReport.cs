@@ -182,6 +182,16 @@ public static class BenchmarkReport
             j.Field($"sprite_fill_r{r}_mean_ms", n == 0 ? 0 : Math.Round(b.View.SpriteFillUsSum[r] / 1000.0 / n, 3));
             j.Field($"sprite_fill_r{r}_max_ms", Math.Round(b.View.SpriteFillUsMax[r] / 1000.0, 3));
         }
+        var cells = b.View.SpriteCells; // merged point sprite cells (R2 / R3), counters since the start of the run
+        j.Field("sprite_cells", cells.Cells);
+        j.Field("sprite_cell_tiles", cells.Tiles);
+        j.Field("sprite_cell_points", cells.Points);
+        j.Field("sprite_cell_dead_points", cells.DeadPoints);
+        j.Field("sprite_cell_rebuilds", cells.Rebuilds);
+        j.Field("sprite_cell_rebuilt_points", cells.RebuiltPoints);
+        j.Field("sprite_cell_rebuild_total_ms", Math.Round(cells.RebuildUs / 1000.0, 2));
+        j.Field("sprite_cell_rebuild_max_ms", Math.Round(cells.RebuildUsMax / 1000.0, 3));
+        j.Field("sprite_cell_table_writes", cells.TableWrites);
         j.End();
     }
 

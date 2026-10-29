@@ -12,14 +12,14 @@ public readonly record struct WarmupMaterial(Material Material, WarmupKind Kind)
 public sealed partial class TilePool
 {
     /// <summary>
-    /// The plain and the dithering variant (<see cref="FadeMaterials.Template"/>) of the building, ground, point sprite and street pool materials: the 8 shader
+    /// The plain and the dithering variant (<see cref="FadeMaterials.Template"/>) of the building, ground, point sprite and street pool materials: the 9 shader
     /// permutations a tile meets, the dither ones only on its first fade.
     /// </summary>
     public WarmupMaterial[] WarmupMaterials() => new WarmupMaterial[]
     {
         new(_buildingMaterial, WarmupKind.Building), new(_buildingFades.Template, WarmupKind.Building),
         new(_groundMaterial, WarmupKind.Ground), new(_groundFades.Template, WarmupKind.Ground),
-        new(_sprites.Point, WarmupKind.Points), new(_sprites.PointFades.Template, WarmupKind.Points),
+        new(_sprites.Point, WarmupKind.Points), new(_sprites.PointFades.Template, WarmupKind.Points), new(_sprites.CellFades.Template, WarmupKind.Points),
         new(_sprites.Pool, WarmupKind.Pools), new(_sprites.PoolFades.Template, WarmupKind.Pools),
     };
 }

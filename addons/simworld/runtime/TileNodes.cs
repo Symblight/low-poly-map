@@ -6,7 +6,8 @@ namespace SimWorld;
 /// The pooled node set that represents one streamed tile: a building MeshInstance3D, a ground MeshInstance3D and the point sprites (building lights, street
 /// lamps, airport lights and beacons in ONE mesh of points, <see cref="Points"/>, plus on the tiles that can show them the street lamp pools, a MultiMesh of ground
 /// quads, <see cref="Pools"/>) under one <see cref="Sprites"/> container, all children of one root (so one Visible flag and one origin shift cover them; the
-/// container is the one switch that hides every sprite by day).
+/// container is the one switch that hides every sprite by day). The R2 / R3 tiles' points are not drawn from <see cref="Points"/> but from a merged
+/// <see cref="SpriteCell"/> (<see cref="CellMember"/>).
 /// </summary>
 public class TileNodes
 {
@@ -21,9 +22,13 @@ public class TileNodes
     public Node3D Sprites = null!;
     /// <summary>Whether <see cref="Sprites"/> is currently shown (mirrors the node so the pool does not read it back).</summary>
     public bool SpritesShown = true;
-    /// <summary>The tile's point sprites, one vertex each: <see cref="LightCount"/> building lights, then <see cref="StreetLightCount"/> street lamps, <see cref="AirportLightCount"/> airport lights and <see cref="BeaconCount"/> beacons (see <see cref="SpriteKind"/>), in <see cref="PointsMesh"/> (reused: ClearSurfaces + AddSurfaceFromArrays).</summary>
+    /// <summary>The tile's point sprites, one vertex each: <see cref="LightCount"/> building lights, then <see cref="StreetLightCount"/> street lamps, <see cref="AirportLightCount"/> airport lights and <see cref="BeaconCount"/> beacons (see <see cref="SpriteKind"/>), in <see cref="PointsMesh"/> (reused: one engine surface set per tile, see <see cref="PointSurface"/>) for the tiles of R0 / R1; the R2 / R3 tiles' points are in a merged cell.</summary>
     public MeshInstance3D Points = null!;
     public ArrayMesh PointsMesh = null!;
+    /// <summary>Whether <see cref="PointsMesh"/> holds a surface (the tile draws its own points).</summary>
+    public bool PointsFilled;
+    /// <summary>The tile's points live in a merged <see cref="SpriteCell"/> (R2 / R3) instead of <see cref="PointsMesh"/>; its fade and visibility reach them through the cell's slot table.</summary>
+    internal CellMember? CellMember;
     /// <summary>Light pools on the ground under the street lamps: a MultiMesh with one instance per lamp, filled only on rings up to <see cref="WorldRenderSettings.StreetPoolMaxRing"/> and drawn only while <see cref="PoolsInRange"/>.</summary>
     public MultiMeshInstance3D Pools = null!;
     public MultiMesh PoolsMm = null!;

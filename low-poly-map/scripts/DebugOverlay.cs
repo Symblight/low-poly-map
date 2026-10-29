@@ -243,6 +243,7 @@ public partial class DebugOverlay : Control
             var c = Bridge.Cover;
             sb.Append("tiles uploaded ").Append(c.Loaded).Append("  pool free ").Append(Bridge.PoolFree).Append('/').Append(Bridge.PoolCreated).Append(" (trimmed ").Append(Bridge.PoolTrimmed)
               .Append(")  terrain pool free ").Append(Bridge.TerrainPoolFree).Append('/').Append(Bridge.TerrainPoolCreated).Append(" (trimmed ").Append(Bridge.TerrainPoolTrimmed).Append(")\n");
+            sb.Append(Bridge.SpriteCells.ToString()).Append('\n');
             sb.Append("visible  R0 ").Append(c.VisibleByRing[0]).Append("  R1 ").Append(c.VisibleByRing[1])
               .Append("  R2 ").Append(c.VisibleByRing[2]).Append("  R3 ").Append(c.VisibleByRing[3]).Append('\n');
             sb.Append("hidden by children ").Append(c.HiddenByChildren).Append("  waiting siblings ").Append(c.WaitingSiblings).Append('\n');

@@ -20,6 +20,7 @@ public sealed partial class TilePool
     private readonly System.Action<TileNodes> _destroy, _finishRetired;
     private readonly SpriteMaterials _sprites;
     private readonly PointPacker _packer;
+    private readonly SpriteCells _cells;
     private readonly PoolWriter _poolWriter = new();
     private readonly int _maxRetainedSprites, _streetPoolMaxRing;
     private readonly bool _buildingLights;
@@ -57,14 +58,17 @@ public sealed partial class TilePool
     /// Copy of <paramref name="path"/>'s shader with <c>#define LOD_DITHER</c> inserted after the shader_type line. The copy has no
     /// path of its own, so relative <c>#include</c>s are made absolute against the original's folder.
     /// </summary>
-    internal static Shader LoadDitherVariant(string path)
+    internal static Shader LoadDitherVariant(string path) => LoadVariant(path, "LOD_DITHER");
+
+    /// <summary>Copy of <paramref name="path"/>'s shader with <c>#define <paramref name="define"/></c> after the shader_type line (see <see cref="LoadDitherVariant"/>).</summary>
+    internal static Shader LoadVariant(string path, string define)
     {
         var src = GD.Load<Shader>(path);
         var dir = path.Substring(0, path.LastIndexOf('/'));
         var code = System.Text.RegularExpressions.Regex.Replace(src.Code, "#include \"(?!res://)([^\"]+)\"", m => $"#include \"{dir}/{m.Groups[1].Value}\"");
         int nl = code.IndexOf('\n', code.IndexOf("shader_type", System.StringComparison.Ordinal));
-        var variant = new Shader { Code = code.Insert(nl + 1, "#define LOD_DITHER\n") };
-        variant.ResourceName = path + " (LOD_DITHER)";
+        var variant = new Shader { Code = code.Insert(nl + 1, $"#define {define}\n") };
+        variant.ResourceName = $"{path} ({define})";
         return variant;
     }
 
@@ -83,6 +87,7 @@ public sealed partial class TilePool
 
         _sprites = new SpriteMaterials(settings, shaders, textures);
         _packer = new PointPacker(settings) { DebugAlpha = DebugLightAlpha };
+        _cells = new SpriteCells(container, _sprites, settings, SpriteCullPad);
         _maxRetainedSprites = settings.SpriteMaxRetainedInstances;
         _streetPoolMaxRing = settings.StreetPoolMaxRing;
         _buildingLights = settings.BuildingLightSprites;
@@ -247,6 +252,7 @@ public sealed partial class TilePool
     public void Release(TileNodes t)
     {
         t.Root.Visible = false;
+        _cells.Remove(t);
         EndFade(t);
         t.Fade = 1f;
         t.Fading = false;

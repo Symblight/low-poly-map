@@ -444,24 +444,6 @@ public partial class SeedSelfTest : Node
         return h;
     }
 
-    /// <summary>Hashes the first <paramref name="count"/> lights of a tile's points mesh: position, colour, kind and index within the kind (the padding vertices are left out).</summary>
-    private static ulong HashSprites(ulong h, ArrayMesh mesh, int count)
-    {
-        h = Mix(h, (ulong)count);
-        if (count == 0 || mesh.GetSurfaceCount() == 0) return h;
-        var arrays = mesh.SurfaceGetArrays(0);
-        var pos = arrays[(int)Mesh.ArrayType.Vertex].AsVector3Array();
-        var col = arrays[(int)Mesh.ArrayType.Color].AsColorArray();
-        var custom = arrays[(int)Mesh.ArrayType.Custom0].AsByteArray();
-        for (int i = 0; i < count && i < pos.Length; i++)
-        {
-            h = Mix(h, Q(pos[i].X)); h = Mix(h, Q(pos[i].Y)); h = Mix(h, Q(pos[i].Z));
-            h = Mix(h, (ulong)col[i].ToRgba32());
-            for (int k = 0; k < 4; k++) h = Mix(h, custom[i * 4 + k]);
-        }
-        return h;
-    }
-
     /// <summary>FNV-1a over every held tile of both layers in key order: key, ring, quantized meshes, lights. Frame-dependent values (tile origins) are left out.</summary>
     private ulong HashTiles()
     {
@@ -475,7 +457,7 @@ public partial class SeedSelfTest : Node
             h = Mix(h, (ulong)n.Ring);
             h = HashMesh(h, n.Mesh);
             h = HashMesh(h, n.GroundMesh);
-            h = HashSprites(h, n.PointsMesh, n.SpriteCount);
+            h = HashSprites(h, n);
         }
         var tlist = new List<TileNodes>(_view.TerrainCover.Loaded);
         foreach (var n in _view.TerrainCover.All) tlist.Add(n);

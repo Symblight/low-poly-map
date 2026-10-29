@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use super::*;
+use crate::seed::schema;
 
 /// The shared two-cities world (spec 11a.1): the bench scene and `cargo test` read one copy.
 const DIR: &str = "low-poly-map/world/two-cities/";

@@ -12,3 +12,4 @@ low-poly-map/shots/
 low-poly-map/bench_results/*
 !low-poly-map/bench_results/baselines/
 !low-poly-map/bench_results/.gdignore
+.claude/worktrees/

@@ -1,3 +1,4 @@
+#nullable enable
 namespace SimWorld;
 
 /// <summary>Counters of the merged point sprite cells (<see cref="SpriteCells"/>), for the overlay and the benchmark report: cells and tiles in them, points in the cell meshes (dead = of tiles that left, not yet rebuilt away), rebuilds since start and what they cost.</summary>

@@ -1,3 +1,4 @@
+#nullable enable
 using System.Collections.Generic;
 using System.Text;
 using Godot;
@@ -35,7 +36,7 @@ public partial class WorldView : Node3D
     [Export] public string CacheDir { get; set; } = "cache://simworld/tiles";
     /// <summary>World profile JSON file (<c>res://</c>, <c>user://</c> or an OS path); empty = compiled-in defaults. Needs api 0.6.</summary>
     [Export(PropertyHint.File, "*.json")] public string ProfilePath { get; set; } = "";
-    /// <summary>Camera used for the field of view (sprite size) and the far plane. Also the pose source unless <see cref="CameraSource"/> is set.</summary>
+    /// <summary>Camera used for the field of view (sprite size) and the far plane. Also the pose source unless <see cref="CameraSource"/> is set; a source that is an <see cref="IWorldCameraProvider"/> (<see cref="CameraSwitchSource"/>) supplies the camera itself and this export may stay empty.</summary>
     [Export] public Camera3D? Camera { get; set; }
     /// <summary>Tuning of the rendering side; null = defaults.</summary>
     [Export] public WorldRenderSettings? Settings { get; set; }
@@ -145,7 +146,7 @@ public partial class WorldView : Node3D
 
         // Curved vertices sink below the flat tile AABBs, so tiles are culled with a margin: sized per tile from its distance (CullMargins, refreshed 4 times a
         // second). The static margin below only serves the helpers that are not tiles (the runway markings).
-        float far = System.Math.Min(Camera?.Far ?? 30000f, 32000f);
+        float far = System.Math.Min(ViewCamera?.Far ?? 30000f, 32000f);
         TilePool.CurveCullMargin = (float)(far * (double)far * Curvature / (2.0 * EarthRadiusM));
 
         _tileRoot = new Node3D { Name = "Tiles" };
@@ -158,9 +159,9 @@ public partial class WorldView : Node3D
         _terrainRoot = new Node3D { Name = "TerrainTiles" };
         AddChild(_terrainRoot);
         _terrainPool = new TerrainPool(_terrainRoot, _settings);
-        if (_settings.PrewarmMaterials && Camera != null && DisplayServer.GetName() != "headless")
+        if (_settings.PrewarmMaterials && ViewCamera != null && DisplayServer.GetName() != "headless")
         {
-            _prewarm = new MaterialPrewarm(Camera, _pool, _terrainPool);
+            _prewarm = new MaterialPrewarm(ViewCamera!, _pool, _terrainPool);
             GD.Print($"[WorldView] material prewarm: {_prewarm.MaterialCount} materials drawn for {MaterialPrewarm.Frames} frames (shader and pipeline compile before the first fade)");
         }
         _markings = new AirportMarkings(this, _settings, AddonPaths.Root + "/shaders");

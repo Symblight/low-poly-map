@@ -1,3 +1,4 @@
+#nullable enable
 using Godot;
 
 namespace SimWorld;
@@ -21,6 +22,9 @@ public partial class WorldView
     private float _lastFov = -1f, _lastHeight = -1f;
     private int _viewLogs;
 
+    /// <summary>The camera the view is measured from: the source's current camera when the source names one (<see cref="IWorldCameraProvider"/>), else the <see cref="Camera"/> export.</summary>
+    public Camera3D? ViewCamera => (_source as IWorldCameraProvider)?.CurrentCamera ?? Camera;
+
     /// <summary>
     /// Test aid: replaces the camera's vertical fov (degrees) and / or the render height (pixels, used as is: neither the 3D render scale nor
     /// <see cref="WorldRenderSettings.LodPixelScale"/> applies) that go into set_view; null = measure again. Takes effect with the next frame.
@@ -35,8 +39,9 @@ public partial class WorldView
     /// <summary>Tells the sprite shader how many metres one pixel spans per metre of depth (changes with fov / render size; a sprite is a few pixels of the rendered image).</summary>
     private void UpdateSpriteScale()
     {
-        if (Camera == null || _pool == null) return;
-        if (!CameraViewReader.TryRead(Camera, this, out var v)) return;
+        var cam = ViewCamera;
+        if (cam == null || _pool == null) return;
+        if (!CameraViewReader.TryRead(cam, this, out var v)) return;
         float h = v.RenderHeightPx;
         if (h < 1f) h = 720f;
         if (v.FovYDeg == _lastFov && h == _lastHeight) return;
@@ -53,10 +58,11 @@ public partial class WorldView
     /// </summary>
     private void UpdateView()
     {
-        if (!CameraViewReader.TryRead(Camera, this, out var v)) return;
+        var cam = ViewCamera;
+        if (cam == null || !CameraViewReader.TryRead(cam, this, out var v)) return;
         float fov = _viewFovOverride ?? v.FovYDeg;
         int hp = _viewHOverride ?? Mathf.Max(1, Mathf.RoundToInt(v.RenderHeightPx * _settings.LodPixelScale));
-        var fwd = -Camera!.GlobalTransform.Basis.Z;
+        var fwd = -cam.GlobalTransform.Basis.Z;
         fwd = fwd.LengthSquared() > 1e-8f ? fwd.Normalized() : Vector3.Forward;
         ViewFovYDeg = fov;
         ViewHeightPx = hp;

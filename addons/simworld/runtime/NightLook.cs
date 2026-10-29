@@ -1,3 +1,4 @@
+#nullable enable
 using Godot;
 
 namespace SimWorld;
@@ -37,6 +38,12 @@ public partial class NightLook : Resource
     // ---- fog ------------------------------------------------------------------------------------
     /// <summary>Depth fog is pow(smoothstep(begin, end, slant distance), curve): ~5 % at the R1/R2 border (2.5 km), ~80 % at 7 km.</summary>
     [ExportGroup("Fog")]
+    /// <summary>
+    /// Whether <see cref="ApplyStatic"/> and <see cref="Update"/> write the fog (depth fog plus the ground haze) at all. A host with its own fog writer
+    /// (a weather system that sets the environment's fog from visibility) turns this off and takes only the glow and the thresholds; the night look then
+    /// never touches a fog property, and the two systems do not overwrite each other on the same <see cref="Godot.Environment"/>.
+    /// </summary>
+    [Export] public bool ApplyFog { get; set; } = true;
     [Export] public float FogBeginM { get; set; } = 1500f;
     [Export] public float FogEndM { get; set; } = 9000f;
     [Export] public float FogCurve { get; set; } = 1.0f;
@@ -82,6 +89,7 @@ public partial class NightLook : Resource
         int levels = Mathf.Clamp(GlowLevels, 1, GlowLevelStrengths.Length);
         for (int i = 0; i < levels; i++) env.SetGlowLevel(i, GlowLevelStrengths[i]);
 
+        if (!ApplyFog) return;
         env.FogEnabled = true;
         env.FogMode = Godot.Environment.FogModeEnum.Depth;
         env.FogDensity = 1.0f;
@@ -99,14 +107,14 @@ public partial class NightLook : Resource
     /// <summary>Per frame: glow threshold from the night factor and glow intensity from the altitude above ground.</summary>
     public void Update(Godot.Environment env, float nightFactor, float altitudeAgl, float terrainReachM = 0f)
     {
-        if (terrainReachM > 0f)
+        if (ApplyFog && terrainReachM > 0f)
         {
             float dayEnd = Mathf.Max(terrainReachM * TerrainDayFogEndShare, TerrainDayFogBeginM + 1000f);
             env.FogDepthBegin = Mathf.Lerp(TerrainDayFogBeginM, FogBeginM, nightFactor);
             env.FogDepthEnd = Mathf.Lerp(dayEnd, FogEndM, nightFactor);
             env.FogDepthCurve = Mathf.Lerp(TerrainDayFogCurve, FogCurve, nightFactor);
         }
-        else
+        else if (ApplyFog)
         {
             env.FogDepthBegin = FogBeginM;
             env.FogDepthEnd = FogEndM;

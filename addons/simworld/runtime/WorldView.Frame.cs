@@ -1,3 +1,4 @@
+#nullable enable
 using Godot;
 
 namespace SimWorld;
@@ -12,7 +13,7 @@ public partial class WorldView
         if (_prewarm != null && _prewarm.Tick()) _prewarm = null;
         if (_source != null && Streamer.IsAvailable)
         {
-            _adapter?.Tick(delta);
+            (_source as IWorldCameraTick)?.Tick(delta);
             // A queued reconfigure runs first, so this frame's update_camera already carries the new origin and camera position.
             if (_pendingOverrides != null) RunReconfigure();
             // Height above ground = camera y - terrain height under it (0 unless the terrain layer is active).

@@ -81,13 +81,13 @@ Untested. Expected to work (the shaders use the Mobile subset, dither fades, `_s
 
 | # | Item | Contract change | Size |
 | --- | --- | --- | --- |
-| L1 | Forward+ run of the bench self-tests (B6) | none | hours |
-| L2 | `NightLook.ApplyFog` switch (N2; confirmed conflict with the weather fog) | none | small |
-| L3 | A camera source that follows a switching camera: either a tiny `FuncCameraSource(Func<Camera3D>)` in the addon or just a documented pattern for the host (B1) | none | small |
-| L4 | Document the runway surface rule for physics hosts: `ground_height_at + RunwayLift` inside the strip (B2) | doc only | small |
-| L5 | `tools/build_addon.sh --release` verified to produce a `bin/macos/` that a fresh project loads (B5; the fresh-project check of P5 was never run for the game) | none | hours |
+| L1 | Forward+ run of the bench self-tests (B6) | none | **done 2026-10-29**: bench switched to `forward_plus` (Metal, M2 Pro); `--fade-selftest`, `--window-selftest`, `--lod-selftest` headless, a windowed smoke run, `--hole-check=40 --hole-pixels` (4740 frames, 2984 scanned, 0 holes, no `Too many instances` line) and `--seed-selftest` (both cities) all PASS, no shader or script error. Budgets were not measured under Forward+ (the game's first measurement does that) |
+| L2 | `NightLook.ApplyFog` switch (N2; confirmed conflict with the weather fog) | none | **done 2026-10-29** |
+| L3 | A camera source that follows a switching camera: `CameraSwitchSource` + `IWorldCameraTick` / `IWorldCameraProvider`, `WorldView.ViewCamera` (B1) | none | **done 2026-10-29** |
+| L4 | Document the runway surface rule for physics hosts: `ground_height_at + RunwayLift` inside the strip (B2) | doc only | **done 2026-10-29** (contract 9 "Airports", physics hosts) |
+| L5 | `tools/build_addon.sh` verified to produce a `bin/macos/` that a fresh project loads (B5) | none | **done 2026-10-29**: an empty Godot 4.7.2 .NET project in SimPlane's configuration (Forward+, `net8.0`, `<Nullable>disable</Nullable>`), the addon folder copied in with `bin/` and its own `simworld.gdextension`, a `Camera3D` + `WorldView` (synthetic city) + a 30-line clock script driving `CameraSwitchSource`, `SetTime` and `OriginShifted`: `dotnet build` 0 warnings, library api 1.11 loaded, 362 tiles held, status ok, clean shutdown (`FRESH CHECK PASS`). The scaffold is reusable: `project.godot`, `FreshCheck.csproj`, `Main.tscn`, `Clock.cs` (kept outside the repo; recreate from this description). **Known Godot 4.7.2 quirk, not ours:** the very first `--headless --import` of a fresh project (no `.godot/` yet) that contains any GDExtension exits with signal 11 / code 134 inside `mvk::SPIRVToMSLConverter` after `loading_editor_layout`, i.e. after the import finished; the `.godot/` folder is complete, the next `--import` exits 0 and the project runs. Reproduced with SimPlane's own JSBSim extension in the same bare project, under Mobile and Forward+, with `reloadable` on and off, debug and release libraries; a project without an extension never crashes. Scripts that run `--import` on a fresh checkout should not treat that first exit code as a failure (run it twice, or check for `.godot/imported`) |
 | L6 | ~~Shutdown on exit~~ confirmed present (`WorldView._ExitTree`), nothing to do (N7) | none | done |
-| L7 | Addon files compile with `Nullable` disabled: no file carries `#nullable enable` today, so either SimPlane enables nullable or every addon file gets the pragma (B5) | none | small |
+| L7 | Addon files compile with `Nullable` disabled: every addon file now starts with `#nullable enable` (B5) | none | **done 2026-10-29** |
 
 Nothing here is a new `api_version`. Items that would be one (a geoid, `set_clock`, the airport fence in `airports()`) are recorded as not needed for the first flight.
 

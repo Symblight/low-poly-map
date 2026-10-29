@@ -231,8 +231,8 @@ public partial class WorldView : Node3D
     public bool ReconfigurePending => _pendingOverrides != null;
     /// <summary>Highest number of pooled tile node sets in use at once (vector tiles plus landmark tiles, since both come from the same pool; checked against the pool size by the settings self-test).</summary>
     public int PeakActiveTiles { get; private set; }
-    /// <summary>Node sets (tile roots) under the pool container: created sets, in use or free.</summary>
-    public int TileRootCount => _tileRoot?.GetChildCount() ?? 0;
+    /// <summary>Node sets (tile roots) under the pool container: created sets, in use or free (the pool's own helper nodes, the merged sprite cells' root, are not counted).</summary>
+    public int TileRootCount => (_tileRoot?.GetChildCount() ?? 0) - (_pool?.HelperNodes ?? 0);
     /// <summary>Every node under the vector and terrain pool containers (roots and their children). Diagnostic walk (self-tests): scene node count minus this = nodes that do not belong to the tile pools.</summary>
     public int PooledNodeCount()
     {

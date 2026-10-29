@@ -5,7 +5,8 @@ namespace SimWorld;
 /// <summary>
 /// The materials of a tile's point sprites: one for the sprites themselves (<c>light_sprite.gdshader</c>: building lights, street lamps, airport lights and
 /// beacons, told apart per vertex) and one for the street lamp pools (<c>street_light_pool.gdshader</c>, a MultiMesh of quads under the lamps), each with its
-/// dither variant for the tiles in a LOD fade (<see cref="FadeMaterials"/>). Every parameter change goes to the plain material, the template and all clones.
+/// dither variant for the tiles in a LOD fade (<see cref="FadeMaterials"/>), plus the variant of the points shader for the merged cells of R2 / R3 tiles
+/// (<see cref="CellFades"/>: one clone per <see cref="SpriteCell"/>, the tiles' fades come from its slot table). Every parameter change goes to the plain material, the template and all clones.
 /// </summary>
 public sealed class SpriteMaterials
 {
@@ -15,6 +16,8 @@ public sealed class SpriteMaterials
     public ShaderMaterial Pool { get; }
     public FadeMaterials PointFades { get; }
     public FadeMaterials PoolFades { get; }
+    /// <summary>The points shader compiled with <c>CELL</c> (tile slot and fade table in the vertex stage); a clone per merged cell.</summary>
+    public FadeMaterials CellFades { get; }
 
     private readonly Vector4[] _gate;
 
@@ -36,7 +39,8 @@ public sealed class SpriteMaterials
             return m;
         }
         Point = MakePoint(plain);
-        PointFades = new FadeMaterials(MakePoint(TilePool.LoadDitherVariant(shaders + "/light_sprite.gdshader")));
+        PointFades = new FadeMaterials(MakePoint(TilePool.LoadVariant(shaders + "/light_sprite.gdshader", "LOD_DITHER")));
+        CellFades = new FadeMaterials(MakePoint(TilePool.LoadVariant(shaders + "/light_sprite.gdshader", "CELL")));
         string poolPath = shaders + "/street_light_pool.gdshader";
         Pool = MakePool(GD.Load<Shader>(poolPath));
         PoolFades = new FadeMaterials(MakePool(TilePool.LoadDitherVariant(poolPath)));
@@ -48,6 +52,7 @@ public sealed class SpriteMaterials
     {
         Point.SetShaderParameter(name, value);
         PointFades.Set(name, value);
+        CellFades.Set(name, value);
     }
 
     private void SetPool(StringName name, Variant value)

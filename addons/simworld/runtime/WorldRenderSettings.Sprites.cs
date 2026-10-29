@@ -6,6 +6,17 @@ namespace SimWorld;
 public partial class WorldRenderSettings
 {
     /// <summary>
+    /// Rings (R0..R3) from this one up have their point sprites merged into one mesh per spatial cell (<see cref="SpriteCell"/>), so the far, many tiles cost a few draw calls instead of
+    /// one each; finer rings keep a points mesh per tile (few tiles, their fades are per tile). 2 = R2 and R3, 4 = off (every tile its own mesh).
+    /// </summary>
+    [Export(PropertyHint.Range, "0,4,1")] public int SpriteCellMinRing { get; set; } = 2;
+    /// <summary>Zoom of the cell that merges R2 tiles (z14) and R3 tiles (z13): a tile of that zoom, 10..14 (at most 3 below the tile's zoom: the cell's fade table has 64 slots). Bigger cells = fewer draws but more points rebuilt when one tile joins and drawn while the cell is partly in view.</summary>
+    [Export(PropertyHint.Range, "10,14,1")] public int SpriteCellZoomR2 { get; set; } = 12;
+    [Export(PropertyHint.Range, "10,13,1")] public int SpriteCellZoomR3 { get; set; } = 11;
+    /// <summary>A cell whose mesh still holds the points of tiles that left is rebuilt once those dead points are this share of it (they are drawn collapsed until then).</summary>
+    [Export(PropertyHint.Range, "0.05,1,0.05")] public float SpriteCellCompactShare { get; set; } = 0.3f;
+
+    /// <summary>
     /// Per sprite kind (<see cref="SpriteKind"/> order: light, street, airport, beacon) the <c>kind_look</c> uniform of the point sprite shader:
     /// x = size in pixels close, y = size in pixels far, z = intensity, w = colour variation (building lights only; street lamps vary per road in Rust,
     /// airport lights have fixed colours).

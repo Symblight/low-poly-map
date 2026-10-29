@@ -30,6 +30,7 @@ public partial class WorldView
                 TotalShift += shift;
                 _source.ApplyOriginShift(shift);
                 Cover.Shift(shift);
+                _pool!.ShiftSprites(shift);
                 TerrainCover.Shift(shift);
                 LandmarkCover.Shift(shift);
                 _collision?.Shift(shift);
@@ -47,6 +48,7 @@ public partial class WorldView
             long tu = (long)Time.GetTicksUsec();
             for (int i = 0; i < unload.Length; i++) UnloadTile(unload[i]);
             _unloadApplyUs += (long)Time.GetTicksUsec() - tu;
+            _pool!.SyncSprites(_source.GlobalPosition, InvTwoR); // after every show / hide / fade / unload of the frame, before it is drawn
             UploadUsLastFrame = (long)Time.GetTicksUsec() - t0;
             if (n0 != ReadyTotal + LandmarkReadyTotal) { UploadFrames++; if (UploadUsLastFrame > _budget!.BudgetUs) UploadFramesOverBudget++; }
             if (UploadUsLastFrame > _secUploadMax) _secUploadMax = UploadUsLastFrame;

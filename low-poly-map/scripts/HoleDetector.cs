@@ -178,6 +178,7 @@ public partial class HoleDetector : Node
     }
 
     private readonly Dictionary<long, int> _rootGap = new();
+    private string _lightsWhy = "";
 
     private void CheckTiles()
     {
@@ -210,6 +211,7 @@ public partial class HoleDetector : Node
                 if (!n.Root.IsVisibleInTree()) kind = "root-not-visible-in-tree";
                 else if (n.HasMesh && (!n.MeshInstance.Visible || n.Mesh.GetSurfaceCount() == 0)) kind = "building-mesh-not-drawn";
                 else if (n.HasGround && (!n.GroundInstance.Visible || n.GroundMesh.GetSurfaceCount() == 0)) kind = "ground-mesh-not-drawn";
+                else if (!_view.LightsDrawn(n, out string lightsWhy)) { kind = "lights-not-drawn"; _lightsWhy = lightsWhy; }
                 else if (n.Fading && n.Fade <= 0.02f) kind = "fade-stuck-at-0";
                 else if (n.Fading && n.Fade < 1f && n.FadeMaterialActive == false) kind = "fading-without-dither-material";
                 else if (!n.Fading && n.FadeMaterialActive) kind = "dither-material-after-fade";
@@ -226,7 +228,7 @@ public partial class HoleDetector : Node
             if (strict ? ep.Frames >= 1 && !ep.Reported : ep.Frames > FrameLimit && _t - ep.StartT > limitS && !ep.Reported)
             {
                 ep.Reported = true;
-                Report(n, kind, $"for {ep.Frames} frames / {_t - ep.StartT:0.00} s");
+                Report(n, kind, $"for {ep.Frames} frames / {_t - ep.StartT:0.00} s{(kind == "lights-not-drawn" ? ": " + _lightsWhy : "")}");
             }
         }
         if (_episodes.Count > 0)

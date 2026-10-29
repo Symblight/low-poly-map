@@ -10,7 +10,7 @@ public sealed partial class TilePool
     private static readonly StringName PFadeMul = new("fade_mul");
 
     /// <summary>
-    /// Applies a poll_fades value (0..1, below 1) to a tile: gives each of its four drawn nodes (building, ground, point sprites, street pools) its own clone of
+    /// Applies a poll_fades value (0..1, below 1) to a tile: gives each of its drawn nodes (building, ground and, unless its points are in a merged cell, point sprites and street pools) its own clone of
     /// the dithering variant (<see cref="FadeMaterials"/>) and writes fade / fade_parity (parity = z &amp; 1 of the key) into them as plain uniforms.
     /// The light sprites never dither; their brightness is scaled by the same value instead (<c>fade_mul</c>), so the two additive sides of a swap
     /// sum to constant brightness (no double-bright flash while R3/R2 lights overlap).
@@ -25,18 +25,22 @@ public sealed partial class TilePool
             m[1] = _groundFades.Rent();
             m[0]!.SetShaderParameter(PFadeParity, parity);
             m[1]!.SetShaderParameter(PFadeParity, parity);
-            m[2] = _sprites.PointFades.Rent();
-            m[3] = _sprites.PoolFades.Rent();
             t.MeshInstance.MaterialOverride = m[0];
             t.GroundInstance.MaterialOverride = m[1];
-            t.Points.MaterialOverride = m[2];
-            t.Pools.MaterialOverride = m[3];
+            // A tile whose points live in a merged cell has no sprite nodes of its own to scale: the cell's slot table carries its fade.
+            if (t.CellMember == null)
+            {
+                m[2] = _sprites.PointFades.Rent();
+                m[3] = _sprites.PoolFades.Rent();
+                t.Points.MaterialOverride = m[2];
+                t.Pools.MaterialOverride = m[3];
+            }
             t.FadeMaterialActive = true;
         }
         m[0]!.SetShaderParameter(PFade, fade);
         m[1]!.SetShaderParameter(PFade, fade);
-        m[2]!.SetShaderParameter(PFadeMul, fade);
-        m[3]!.SetShaderParameter(PFadeMul, fade);
+        m[2]?.SetShaderParameter(PFadeMul, fade);
+        m[3]?.SetShaderParameter(PFadeMul, fade);
     }
 
     /// <summary>Nodes of a tile set that dither or scale with a fade: building, ground, point sprites, street pools.</summary>
@@ -49,12 +53,15 @@ public sealed partial class TilePool
         var m = t.FadeMats;
         t.MeshInstance.MaterialOverride = _buildingMaterial;
         t.GroundInstance.MaterialOverride = _groundMaterial;
-        t.Points.MaterialOverride = _sprites.Point;
-        t.Pools.MaterialOverride = _sprites.Pool;
         _buildingFades.Return(m[0]!);
         _groundFades.Return(m[1]!);
-        _sprites.PointFades.Return(m[2]!);
-        _sprites.PoolFades.Return(m[3]!);
+        if (m[2] != null)
+        {
+            t.Points.MaterialOverride = _sprites.Point;
+            t.Pools.MaterialOverride = _sprites.Pool;
+            _sprites.PointFades.Return(m[2]!);
+            _sprites.PoolFades.Return(m[3]!);
+        }
         for (int i = 0; i < FadeNodes; i++) m[i] = null;
         t.FadeMaterialActive = false;
     }

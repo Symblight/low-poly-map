@@ -3,10 +3,11 @@ using Godot;
 
 namespace SimWorld;
 
-// The point sprites of a tile: creation, the upload into its one points mesh (PointPacker) and its pool MultiMesh (PoolWriter), the day / night switch.
+// The point sprites of a tile: creation, the upload into its one points mesh or its merged cell (PointPacker, SpriteCells) and its pool MultiMesh (PoolWriter), the day / night switch.
 public sealed partial class TilePool
 {
     private bool _spritesOn = true;
+    private readonly PointBuffers _tileBuf = new();
     private static readonly Vector3[] NoPoints = System.Array.Empty<Vector3>();
     private static readonly Color[] NoColors = System.Array.Empty<Color>();
 
@@ -29,6 +30,7 @@ public sealed partial class TilePool
     {
         if (on == _spritesOn) return 0;
         _spritesOn = on;
+        _cells.SetVisible(on);
         int n = 0;
         foreach (var t in held)
         {
@@ -84,11 +86,17 @@ public sealed partial class TilePool
     /// </summary>
     private void ClearSprites(TileNodes t)
     {
-        if (t.SpriteCount > 0) t.PointsMesh.ClearSurfaces();
+        ClearOwnPoints(t);
         t.Clustered = false;
         t.LightCount = t.StreetLightCount = t.AirportLightCount = t.BeaconCount = 0;
-        t.Points.Visible = false;
         ClearPools(t);
+    }
+
+    private void ClearOwnPoints(TileNodes t)
+    {
+        if (t.PointsFilled) t.PointsMesh.ClearSurfaces();
+        t.PointsFilled = false;
+        t.Points.Visible = false;
     }
 
     private void ClearPools(TileNodes t)
@@ -100,35 +108,43 @@ public sealed partial class TilePool
     }
 
     /// <summary>
-    /// Fills the tile's point sprites (building lights, street lamps, airport lights and beacons of the ready tile) into its one points mesh, and, when the tile's ring can
-    /// show pools, the pool MultiMesh with its street lamps. Colour rgb = light colour, alpha = intensity weight (0.125 single light .. 1 big cluster; for a beacon the
-    /// blink phase; Rust sends airport lights with their intensity weight, which scales the brightness instead). See <see cref="PointPacker"/>.
+    /// Fills the tile's point sprites (building lights, street lamps, airport lights and beacons of the ready tile): R0 / R1 tiles into their own points mesh, R2 / R3 tiles (rings
+    /// from <see cref="WorldRenderSettings.SpriteCellMinRing"/>) into the merged <see cref="SpriteCell"/> of their area, whose rebuild <see cref="SyncSprites"/> does at the end of the
+    /// frame; and, when the tile's ring can show pools, the pool MultiMesh with its street lamps. Colour rgb = light colour, alpha = intensity weight (0.125 single light .. 1 big cluster;
+    /// for a beacon the blink phase; Rust sends airport lights with their intensity weight, which scales the brightness instead). See <see cref="PointPacker"/>.
     /// </summary>
     public void SetSprites(TileNodes t, in ReadyTile tile)
     {
         var lights = _buildingLights ? tile.Lights ?? NoPoints : NoPoints;
         var street = tile.StreetLights ?? NoPoints;
-        var airport = tile.AirportLights ?? NoPoints;
-        var beacons = tile.BeaconLights ?? NoPoints;
-        int total = lights.Length + street.Length + airport.Length + beacons.Length;
-        if (t.SpriteCount > 0) t.PointsMesh.ClearSurfaces();
+        int total = lights.Length + street.Length + (tile.AirportLights?.Length ?? 0) + (tile.BeaconLights?.Length ?? 0);
         t.LightCount = lights.Length;
         t.StreetLightCount = street.Length;
-        t.AirportLightCount = airport.Length;
-        t.BeaconCount = beacons.Length;
+        t.AirportLightCount = tile.AirportLights?.Length ?? 0;
+        t.BeaconCount = tile.BeaconLights?.Length ?? 0;
         t.Clustered = false;
-        t.Points.Visible = total > 0;
-        if (total > 0)
+        int missing = 0;
+        if (total > 0 && _cells.Merges(t.Ring) && _cells.TryPlace(t, tile.Origin, out var member, out var offset))
         {
-            _packer.Begin(total);
-            int missing = _packer.Add(SpriteKind.Light, lights, tile.LightColors ?? NoColors);
-            missing += _packer.Add(SpriteKind.Street, street, tile.StreetLightColors ?? NoColors);
-            missing += _packer.Add(SpriteKind.Airport, airport, tile.AirportLightColors ?? NoColors);
-            missing += _packer.Add(SpriteKind.Beacon, beacons, tile.BeaconLightColors ?? NoColors);
-            t.PointsMesh.AddSurfaceFromArrays(Mesh.PrimitiveType.Points, _packer.Finish());
-            t.Clustered = _packer.Clustered;
-            if (missing > 0) Problems.Warn("short-colours", $"[TilePool] tile {t.Key}: {missing} light colours missing for {total} light points; the rest are drawn warm white (the library must send one colour per point)");
+            ClearOwnPoints(t);
+            missing = Pack(member.Data, total, member.Slot, offset, lights, in tile);
+            t.Clustered = member.Data.Clustered;
+            _cells.Commit(member);
         }
+        else
+        {
+            _cells.Remove(t);
+            if (total > 0)
+            {
+                missing = Pack(_tileBuf, total, -1, default, lights, in tile);
+                PointSurface.Set(t.PointsMesh, _tileBuf);
+                t.PointsFilled = true;
+                t.Clustered = _tileBuf.Clustered;
+                t.Points.Visible = true;
+            }
+            else ClearOwnPoints(t);
+        }
+        if (missing > 0) Problems.Warn("short-colours", $"[TilePool] tile {t.Key}: {missing} light colours missing for {total} light points; the rest are drawn warm white (the library must send one colour per point)");
         if (street.Length > 0 && t.Ring <= _streetPoolMaxRing)
         {
             _poolWriter.Fill(t.PoolsMm, street, tile.StreetLightColors ?? NoColors);
@@ -137,6 +153,35 @@ public sealed partial class TilePool
         }
         else ClearPools(t);
     }
+
+    private int Pack(PointBuffers into, int total, int slot, Vector3 offset, Vector3[] lights, in ReadyTile tile)
+    {
+        _packer.Begin(into, total, slot, offset);
+        int missing = _packer.Add(SpriteKind.Light, lights, tile.LightColors ?? NoColors);
+        missing += _packer.Add(SpriteKind.Street, tile.StreetLights ?? NoPoints, tile.StreetLightColors ?? NoColors);
+        missing += _packer.Add(SpriteKind.Airport, tile.AirportLights ?? NoPoints, tile.AirportLightColors ?? NoColors);
+        missing += _packer.Add(SpriteKind.Beacon, tile.BeaconLights ?? NoPoints, tile.BeaconLightColors ?? NoColors);
+        return missing;
+    }
+
+    /// <summary>
+    /// End of the frame's tile updates, before drawing: rebuilds the merged cells that gained or changed a tile (a tile's points are in their cell in the frame its root is shown), writes
+    /// the cells' per-tile fade tables (<c>shown ? fade : 0</c>) and, a few times a second, their cull margins. <paramref name="camera"/> and <paramref name="invTwoR"/> as for <see cref="CullMargins"/>.
+    /// </summary>
+    public void SyncSprites(Vector3 camera, float invTwoR)
+    {
+        _cells.Flush();
+        _cells.Sync(camera, invTwoR);
+    }
+
+    /// <summary>The floating origin moved by <paramref name="shift"/>: moves the merged cells with the tile roots.</summary>
+    public void ShiftSprites(Vector3 shift) => _cells.Shift(shift);
+
+    /// <summary>Children of the container that are not tile roots (the root of the merged sprite cells).</summary>
+    public int HelperNodes => 1;
+
+    /// <summary>The merged point sprite cells (counters for the overlay and the benchmark, consistency checks).</summary>
+    internal SpriteCells Cells => _cells;
 
     /// <summary>
     /// Shows the tile's pools only while the tile is within the fade range of the camera: <paramref name="nearestM"/> is the distance to the tile's nearest point; beyond

@@ -1,8 +1,8 @@
 //! Tests of the water index and the terrain-water rule (section 5.2a) on a synthetic coast.
 
 use super::*;
-use crate::seed::files::{q7, WaterFile, WaterPolygon};
-use crate::seed::geom::{point_in_ring, simplify_ring};
+use crate::seed::files::{q7, q_cm, Outside, WaterFile, WaterPolygon};
+use crate::seed::geom::{m_per_deg_lon, point_in_ring, simplify_ring, M_PER_DEG};
 use crate::seed::hash::{unit, Seed};
 
 const COAST_LON: f64 = 20.8;

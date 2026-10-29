@@ -252,7 +252,7 @@ fn assemble(
         (pc[2] - pa[2]) as f64 * (pb[0] - pa[0]) as f64 - (pc[0] - pa[0]) as f64 * (pb[2] - pa[2]) as f64
     };
     m.indices.reserve(tris.len() + 64);
-    for t in tris.chunks_exact(3) {
+    for t in tris.as_chunks::<3>().0 {
         let (a, b, c) = (t[0], t[1], t[2]);
         if up(&m, a, b, c) >= 0.0 {
             m.indices.extend_from_slice(&[a as i32, b as i32, c as i32]);
@@ -265,7 +265,7 @@ fn assemble(
     // Smooth normals: area-weighted (unnormalized cross products) over the surface triangles.
     if smooth {
         let mut acc = vec![[0.0f64; 3]; surface_vertices];
-        for t in m.indices.chunks_exact(3) {
+        for t in m.indices.as_chunks::<3>().0 {
             let [a, b, c] = [t[0] as usize, t[1] as usize, t[2] as usize];
             let (pa, pb, pc) = (m.positions[a], m.positions[b], m.positions[c]);
             let u = [(pc[0] - pa[0]) as f64, (pc[1] - pa[1]) as f64, (pc[2] - pa[2]) as f64];

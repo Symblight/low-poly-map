@@ -28,7 +28,7 @@ fn true_error(h: &[f32], n: usize, d: &Delatin<'_>) -> f64 {
     let c = d.coords();
     let mut area2 = 0i64;
     let mut worst = 0.0f64;
-    for t in d.triangles().chunks_exact(3) {
+    for t in d.triangles().as_chunks::<3>().0 {
         let (a, b, p) = (c[t[0] as usize], c[t[1] as usize], c[t[2] as usize]);
         let o = orient(a, b, p);
         assert!(o > 0, "triangle {t:?} not positively oriented");
@@ -128,8 +128,7 @@ fn triangle_cap_is_respected() {
 }
 
 fn terrain_profile(t: TerrainProfile) -> (Profile, Terrain) {
-    let mut w = crate::profile::WorldProfile::default();
-    w.terrain = TerrainProfile { enabled: true, ..t };
+    let w = crate::profile::WorldProfile { terrain: TerrainProfile { enabled: true, ..t }, ..Default::default() };
     let p = Profile::new(w).unwrap();
     let terrain = Terrain::from_profile(&p, VILNIUS.0, VILNIUS.1);
     (p, terrain)
@@ -159,7 +158,7 @@ fn terrain_tiles_wind_clockwise_and_stay_inside_their_tile() {
         assert!(m.normals.is_empty() && m.colors.is_empty() && m.uvs.is_empty(), "flat shading: VERTEX + INDEX only");
         assert!(tile.surface_triangles >= 2 && tile.surface_triangles as usize <= p.terrain.bands[ring].max_triangles as usize);
         // Surface triangles face up (Godot front face clockwise from above).
-        for tri in m.indices[..tile.surface_triangles as usize * 3].chunks_exact(3) {
+        for tri in m.indices[..tile.surface_triangles as usize * 3].as_chunks::<3>().0 {
             let (a, b, c) = (m.positions[tri[0] as usize], m.positions[tri[1] as usize], m.positions[tri[2] as usize]);
             let ny = (c[2] - a[2]) as f64 * (b[0] - a[0]) as f64 - (c[0] - a[0]) as f64 * (b[2] - a[2]) as f64;
             assert!(ny > 0.0, "{k}: surface triangle faces down");
@@ -204,7 +203,7 @@ fn skirts_are_closed_and_face_outwards() {
         let bottoms = m.vertex_count() - first_bottom;
         assert_eq!(quads, bottoms, "{k}: a closed ring has as many edges as vertices");
         let mut uses = vec![0usize; bottoms];
-        for q in skirt.chunks_exact(6) {
+        for q in skirt.as_chunks::<6>().0 {
             let mut seen = std::collections::BTreeSet::new();
             for &i in q {
                 if (i as usize) >= first_bottom {
@@ -215,7 +214,7 @@ fn skirts_are_closed_and_face_outwards() {
             for s in seen {
                 uses[s] += 1;
             }
-            for tri in q.chunks_exact(3) {
+            for tri in q.as_chunks::<3>().0 {
                 let (a, b, c) = (m.positions[tri[0] as usize], m.positions[tri[1] as usize], m.positions[tri[2] as usize]);
                 let u = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
                 let v = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];

@@ -6,6 +6,10 @@ namespace SimWorld;
 /// <summary>The per-frame driver: the call order of docs/contract.md section 3 and the upload budget.</summary>
 public partial class WorldView
 {
+    private ulong _lastShiftFrame = ulong.MaxValue - 1;
+    private int _shiftRun;
+    private bool _shiftRunReported;
+
     public override void _Process(double delta)
     {
         using var probe = AllocProbe.Measure(AllocSite.ViewFrame);
@@ -33,6 +37,16 @@ public partial class WorldView
             {
                 OriginShiftCount++;
                 TotalShift += shift;
+                // A host that does not move its vehicle and cameras by the shift (contract section 2, origin_shifted) is farther than the re-centre distance again next frame: the origin
+                // then moves every frame and the whole world jumps back and forth (SimPlane, 2026-10-29: 5 km per frame, "everything is blinking"). Said once, as an error, after three frames in a row.
+                ulong frame = Engine.GetProcessFrames();
+                _shiftRun = frame == _lastShiftFrame + 1 ? _shiftRun + 1 : 1;
+                _lastShiftFrame = frame;
+                if (_shiftRun == 3 && !_shiftRunReported)
+                {
+                    _shiftRunReported = true;
+                    GD.PushError("[WorldView] origin shifted on 3 consecutive frames: the host does not apply the shift to its camera or vehicle (origin_shifted / IWorldCameraSource.ApplyOriginShift), so the camera is beyond origin.recenter_distance_m again every frame and the world jumps each frame. Apply the shift, or raise origin.recenter_distance_m until the host can.");
+                }
                 _source.ApplyOriginShift(shift);
                 Cover.Shift(shift);
                 _pool!.ShiftSprites(shift);

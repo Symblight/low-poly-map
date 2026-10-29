@@ -66,6 +66,8 @@ public partial class Benchmark : Node
     public int GcGen1 { get; private set; }
     public int GcGen2 { get; private set; }
     public long AllocatedBytes { get; private set; }
+    /// <summary>Main-thread allocation by site over the measured part.</summary>
+    public AllocReport Allocs { get; } = new();
     /// <summary>The view's churn / upload counters when the measurement started (the report subtracts them from the end values).</summary>
     public ViewTotals StartTotals { get; private set; }
     /// <summary>How busy the machine was before the run and after it (load average, other busy processes): numbers from a loaded machine are noisy.</summary>
@@ -170,6 +172,7 @@ public partial class Benchmark : Node
     public override void _Process(double delta)
     {
         if (_phase == Phase.Done) return;
+        using var probe = AllocProbe.Measure(AllocSite.HostBench);
         if (_phase == Phase.Settle)
         {
             _settleSeconds += delta;
@@ -218,6 +221,8 @@ public partial class Benchmark : Node
         GcGen1 = GC.CollectionCount(1);
         GcGen2 = GC.CollectionCount(2);
         AllocatedBytes = GC.GetTotalAllocatedBytes();
+        Allocs.Begin();
+        if (HasArg("--gc-trace")) _gcTrace = new GcTrace();   // debug: the pause of every collection split into suspend / mark / work
         var stats = new StreamerStats();
         _view.Streamer.DebugStats(stats);
         LibraryVersion = stats.Version;
@@ -283,9 +288,12 @@ public partial class Benchmark : Node
 
     string StatusLine() => $"bench {_def.Name} {_phase} {(_phase == Phase.Settle ? _settleSeconds : MeasuredSeconds):0} s";
 
+    GcTrace? _gcTrace;
+
     void Finish()
     {
         _phase = Phase.Done;
+        _gcTrace?.Print();
         NoiseEnd = MachineInfo.NoiseJson();
         string path = BenchmarkFiles.OutputPath(_args.Out, _def.Name);
         try

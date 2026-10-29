@@ -38,6 +38,12 @@ public static class ShaderGlobals
     /// <summary>Curvature / (2 R) in 1/m; 0 = flat.</summary>
     public const string CurveInv2R = "simworld_curve_inv_2r";
 
+    // The per-frame writes use these: converting the const strings above to a StringName on every call allocated a finalizable object per write.
+    internal static readonly StringName NightFactorName = new(NightFactor);
+    internal static readonly StringName HourName = new(Hour);
+    internal static readonly StringName CurveCenterName = new(CurveCenter);
+    internal static readonly StringName CurveInv2RName = new(CurveInv2R);
+
     public readonly record struct Def(string Name, RenderingServer.GlobalShaderParameterType Type, string SettingsType, Variant Default);
 
     public static readonly Def[] All =

@@ -27,7 +27,9 @@ public sealed partial class WorldStreamerFacade
     /// <summary>The engine surface under <paramref name="key"/>, or null when the entry has none (no geometry, or the option is off).</summary>
     private static Dictionary? Surface(Dictionary d, StringName key, ref string? problem)
     {
-        if (!d.TryGetValue(key, out var v) || v.VariantType == Variant.Type.Nil) return null;
+        if (!d.TryGetValue(key, out var v)) return null;
+        using var owner = v; // the wrapper below holds its own reference
+        if (v.VariantType == Variant.Type.Nil) return null;
         if (v.VariantType != Variant.Type.Dictionary)
         {
             problem ??= $"'{key}' is a {v.VariantType}, expected a Dictionary";

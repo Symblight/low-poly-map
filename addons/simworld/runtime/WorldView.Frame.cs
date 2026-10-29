@@ -7,6 +7,8 @@ public partial class WorldView
 {
     public override void _Process(double delta)
     {
+        using var probe = AllocProbe.Measure(AllocSite.ViewFrame);
+        if (_settings.GcQuietBudgetMb > 0) (GcPacing ??= new GcPacer(_settings.GcQuietBudgetMb)).Tick();
         if (_prewarm != null && _prewarm.Tick()) _prewarm = null;
         if (_source != null && Streamer.IsAvailable)
         {
@@ -15,14 +17,15 @@ public partial class WorldView
             if (_pendingOverrides != null) RunReconfigure();
             // Height above ground = camera y - terrain height under it (0 unless the terrain layer is active).
             var pos = _source.GlobalPosition;
-            CameraGroundHeight = Streamer.GroundHeightAt(pos.X, pos.Z);
+            using (AllocProbe.Measure(AllocSite.GroundHeight)) CameraGroundHeight = Streamer.GroundHeightAt(pos.X, pos.Z);
             _source.SetGroundHeight(CameraGroundHeight);
-            UpdateView(); // before the camera update (also on the external path), so the cover of this frame already uses the new view
+            using (AllocProbe.Measure(AllocSite.UpdateView)) UpdateView(); // before the camera update (also on the external path), so the cover of this frame already uses the new view
             if (ExternalCameraUpdate != null) ExternalCameraUpdate(delta);
-            else Streamer.UpdateCamera(_source.GlobalPosition, _source.Velocity, _source.AltitudeAgl);
+            else using (AllocProbe.Measure(AllocSite.UpdateCamera)) Streamer.UpdateCamera(_source.GlobalPosition, _source.Velocity, _source.AltitudeAgl);
 
             // Shift first so tiles polled below (already in the new frame) are not shifted twice.
-            var shift = Streamer.TakeOriginShift();
+            Vector3 shift;
+            using (AllocProbe.Measure(AllocSite.TakeOriginShift)) shift = Streamer.TakeOriginShift();
             LastShift = shift;
             if (shift != Vector3.Zero)
             {
@@ -36,30 +39,42 @@ public partial class WorldView
                 if (SeedWorldActive) RefreshSeed(false); // airport positions follow the floating origin
                 OriginShifted?.Invoke(shift);
             }
-            RenderingServer.GlobalShaderParameterSet(ShaderGlobals.CurveCenter, _source.GlobalPosition);
-            RenderingServer.GlobalShaderParameterSet(ShaderGlobals.CurveInv2R, (float)(Curvature / (2.0 * EarthRadiusM)));
+            using (AllocProbe.Measure(AllocSite.ShaderGlobals))
+            {
+                RenderingServer.GlobalShaderParameterSet(ShaderGlobals.CurveCenterName, _source.GlobalPosition);
+                RenderingServer.GlobalShaderParameterSet(ShaderGlobals.CurveInv2RName, (float)(Curvature / (2.0 * EarthRadiusM)));
+            }
 
             long t0 = (long)Time.GetTicksUsec();
             int n0 = ReadyTotal + LandmarkReadyTotal;
             UploadReady(t0);
             PollFades();
-            var unload = Streamer.PollUnload();
+            string[] unload;
+            using (AllocProbe.Measure(AllocSite.PollUnload)) unload = Streamer.PollUnload();
             long tu = (long)Time.GetTicksUsec();
-            for (int i = 0; i < unload.Length; i++) UnloadTile(unload[i]);
+            using (AllocProbe.Measure(AllocSite.UnloadApply)) for (int i = 0; i < unload.Length; i++) UnloadTile(unload[i]);
             _unloadApplyUs += (long)Time.GetTicksUsec() - tu;
             UploadUsLastFrame = (long)Time.GetTicksUsec() - t0;
             if (n0 != ReadyTotal + LandmarkReadyTotal) { UploadFrames++; if (UploadUsLastFrame > _budget!.BudgetUs) UploadFramesOverBudget++; }
             if (UploadUsLastFrame > _secUploadMax) _secUploadMax = UploadUsLastFrame;
-            DrainRetired();
-            UpdateCollision();
-            _pool!.Trim(delta);
-            _terrainPool!.Trim(delta);
-            _markings?.Update(_source.GlobalPosition, delta);
+            using (AllocProbe.Measure(AllocSite.PoolMaintenance))
+            {
+                DrainRetired();
+                UpdateCollision();
+                _pool!.Trim(delta);
+                _terrainPool!.Trim(delta);
+                _markings?.Update(_source.GlobalPosition, delta);
+            }
             _lodReadT += delta;
-            if (_lodReadT >= LodReadIntervalS) { _lodReadT = 0; ReadLod(); RefreshCullMargins(); }
+            if (_lodReadT >= LodReadIntervalS)
+            {
+                _lodReadT = 0;
+                using (AllocProbe.Measure(AllocSite.LodRead)) ReadLod();
+                using (AllocProbe.Measure(AllocSite.CullRefresh)) RefreshCullMargins();
+            }
         }
 
-        UpdateSpriteScale();
+        using (AllocProbe.Measure(AllocSite.SpriteScale)) UpdateSpriteScale();
         if (TerrainDebugLog && TerrainActive) LogTerrainState(delta);
 
         _sinceCheck += delta;
@@ -82,6 +97,9 @@ public partial class WorldView
         }
     }
 
+    /// <summary>The collector pacer while <see cref="WorldRenderSettings.GcQuietBudgetMb"/> is above 0 (counters for diagnostics); null otherwise.</summary>
+    public GcPacer? GcPacing { get; private set; }
+    private readonly System.Collections.Generic.List<ReadyTile> _readyBuf = new(4);
     private double _tileCostEmaUs = 500;
     private UploadBudget? _budget;
 
@@ -100,21 +118,23 @@ public partial class WorldView
         bool limited = true;
         for (int n = 0; n < budget.MaxTiles; n++)
         {
-            var ready = Streamer.PollReady(1);
-            if (ready.Count == 0) { limited = false; break; }
+            int count = Streamer.PollReady(1, _readyBuf);
+            if (count == 0) { limited = false; break; }
             long c0 = (long)Time.GetTicksUsec();
-            foreach (var d in ready)
+            for (int i = 0; i < count; i++)
             {
-                if (!WorldStreamerFacade.TryParseReady(d, out var tile))
+                var tile = _readyBuf[i];
+                if (!tile.Usable)
                 {
-                    var what = WorldStreamerFacade.DescribeEntry(d);
-                    UploadProblems.Error("entry#" + what, $"[WorldView] poll_ready entry without a usable key {what}; the library holds a tile the host cannot place");
+                    UploadProblems.Error("entry#" + tile.Problem, $"[WorldView] poll_ready entry without a usable key {tile.Problem}; the library holds a tile the host cannot place");
                     continue;
                 }
                 if (tile.IsTerrain) UploadTerrainTile(in tile);
                 else if (tile.IsLandmark) UploadLandmarkTile(in tile);
                 else UploadTile(in tile);
+                tile.ReleaseHandles();
             }
+            _readyBuf.Clear();
             long now = (long)Time.GetTicksUsec();
             _tileCostEmaUs += ((now - c0) - _tileCostEmaUs) * 0.2;
             if (now - frameStartUs >= budget.BudgetUs || now - frameStartUs + _tileCostEmaUs > budget.BudgetUs) break;

@@ -60,6 +60,7 @@ public partial class BenchArgs : Node
             else if (arg == "--no-landmarks") view.LandmarksEnabled = false; // api 1.11: do not opt in to the landmark layer; the landmarks stay folded into the vector tiles
             else if (arg.StartsWith("--curvature=", System.StringComparison.Ordinal) && TryNumber(arg.Substring(12), out var cv)) view.Curvature = Mathf.Max((float)cv, 0f);
             else if (arg.StartsWith("--light-alpha=", System.StringComparison.Ordinal) && TryNumber(arg.Substring(14), out var la)) settings.DebugLightAlpha = (float)la;
+            else if (arg.StartsWith("--gc-quiet=", System.StringComparison.Ordinal) && TryNumber(arg.Substring(11), out var gq)) settings.GcQuietBudgetMb = (int)gq; // MB the collector may skip between collections (GcPacer); 0 = off
             else if (arg == "--no-engine-surfaces") settings.EngineSurfaces = false; // api 1.11: Godot packs the mesh Arrays on the main thread (A/B of the library's engine surfaces)
             else if (arg == "--no-building-lights") settings.BuildingLightSprites = false;
             else if (arg == "--no-upload-burst") settings.UploadBudgetBurstUs = 0;
@@ -189,6 +190,7 @@ public partial class BenchArgs : Node
 
     public override void _Process(double delta)
     {
+        using var probe = AllocProbe.Measure(AllocSite.HostUi);
         UpdateTerrainCamera();
         // The big fallback plane drops to -30 m while the terrain layer runs, so it only shows through missing tiles.
         if (_fallback == null || View == null) return;

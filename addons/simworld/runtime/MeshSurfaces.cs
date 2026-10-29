@@ -8,7 +8,7 @@ namespace SimWorld;
 /// worker threads, so this is a hand-over) or, for an older library or with <see cref="WorldRenderSettings.EngineSurfaces"/> off, a <c>Mesh.ARRAY_MAX</c> Array
 /// that Godot packs here. Main thread only.
 /// </summary>
-public static class MeshSurfaces
+public sealed class MeshSurfaces
 {
     // ArrayMesh's own storage property: one call clears the mesh, adds the surface and keeps the surface list and the AABB right
     // (RenderingServer.MeshAddSurface on an ArrayMesh would leave both stale).
@@ -16,12 +16,18 @@ public static class MeshSurfaces
     private static readonly StringName KIndexCount = new("index_count");
     private static readonly StringName KVertexCount = new("vertex_count");
 
+    // The one-element Array handed to ArrayMesh's _surfaces property, reused for every tile of the owning pool (the mesh copies what it needs while the property is set).
+    // An instance, not a static: a static wrapper would be finalized after the engine is gone.
+    private readonly Array _holder = new();
+
     /// <summary>Replaces the mesh's single surface with <paramref name="surface"/> (an engine surface) or, when that is null, with <paramref name="arrays"/>. False when Godot rejected it (it prints its own error, without the tile).</summary>
-    public static bool Fill(ArrayMesh mesh, Array? arrays, Dictionary? surface)
+    public bool Fill(ArrayMesh mesh, Array? arrays, Dictionary? surface)
     {
         if (surface != null)
         {
-            mesh.Set(SurfacesProperty, new Array { surface }); // one small Array per delivered tile; a static one would be finalized after the engine is gone
+            using (var item = (Variant)surface) _holder.Add(item);
+            using (var holder = (Variant)_holder) mesh.Set(SurfacesProperty, holder);
+            _holder.Clear(); // drops the reference to the delivered vertex bytes
         }
         else if (arrays != null) mesh.AddSurfaceFromArrays(Mesh.PrimitiveType.Triangles, arrays);
         return mesh.GetSurfaceCount() > 0;

@@ -29,6 +29,7 @@ public sealed partial class TilePool
     // Dithering variants of the two opaque materials: the same shader source compiled with LOD_DITHER, so the discard
     // (and its loss of early depth rejection) exists only while a tile is in a fade. Per-tile values are instance uniforms.
     private readonly FadeMaterials _buildingFades, _groundFades;
+    private readonly MeshSurfaces _surfaces = new();
 
     /// <summary>Debug (user arg --light-alpha=&lt;v&gt;): force every light's weight, ignoring Rust's alpha. Negative = off.</summary>
     public static float DebugLightAlpha { get; set; } = -1f;
@@ -346,7 +347,7 @@ public sealed partial class TilePool
     {
         ClearMesh(t);
         if (arrays == null && surface == null) return true;
-        if (!MeshSurfaces.Fill(t.Mesh, arrays, surface)) return false;
+        if (!_surfaces.Fill(t.Mesh, arrays, surface)) return false;
         t.Tris = MeshSurfaces.Triangles(t.Mesh);
         t.HasMesh = true;
         t.MeshInstance.Visible = true;
@@ -362,7 +363,7 @@ public sealed partial class TilePool
     {
         ClearGround(t);
         if (arrays == null && surface == null) return true;
-        if (!MeshSurfaces.Fill(t.GroundMesh, arrays, surface)) return false;
+        if (!_surfaces.Fill(t.GroundMesh, arrays, surface)) return false;
         t.GroundTris = MeshSurfaces.Triangles(t.GroundMesh);
         t.HasGround = true;
         t.GroundInstance.Visible = true;

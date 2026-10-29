@@ -181,6 +181,7 @@ public partial class FreeFlyCamera : Camera3D, IWorldCameraSource
 
     public override void _Process(double delta)
     {
+        using var probe = AllocProbe.Measure(AllocSite.HostUi);
         if (Scripted) return;
         Move(delta);
         float fov = Input.IsPhysicalKeyPressed(Key.Z) ? BaseFov / ZoomFactor : BaseFov;

@@ -21,6 +21,7 @@ public partial class WorldView
 
     private void UploadTile(in ReadyTile tile)
     {
+        using var probe = AllocProbe.Measure(AllocSite.UploadVector);
         long t0 = (long)Time.GetTicksUsec();
         if (!TileKey.TryParse(tile.Key, out long packed))
         {
@@ -61,7 +62,7 @@ public partial class WorldView
         }
         long tm1b = (long)Time.GetTicksUsec();
         // Building lights exist on the bands lights.min_ring..R3 (R1..R3 by default); street lamps on every band. All four kinds go into one MultiMesh.
-        pool.SetSprites(nodes, in tile);
+        using (AllocProbe.Measure(AllocSite.SetSprites)) pool.SetSprites(nodes, in tile);
 
         long tm2 = (long)Time.GetTicksUsec();
         int fr = System.Math.Clamp(tile.Ring, 0, 3);
@@ -107,6 +108,7 @@ public partial class WorldView
 
     private void UploadTerrainTile(in ReadyTile tile)
     {
+        using var probe = AllocProbe.Measure(AllocSite.UploadTerrain);
         long t0 = (long)Time.GetTicksUsec();
         TerrainKeysSeen++;
         if (!TileKey.TryParse(tile.Key, out long packed, out TileLayer tileLayer) || tileLayer != TileLayer.Terrain)
@@ -163,6 +165,7 @@ public partial class WorldView
 
     private void UploadLandmarkTile(in ReadyTile tile)
     {
+        using var probe = AllocProbe.Measure(AllocSite.UploadLandmark);
         long t0 = (long)Time.GetTicksUsec();
         LandmarkKeysSeen++;
         if (!TileKey.TryParse(tile.Key, out long packed, out TileLayer layer) || layer != TileLayer.Landmarks)
@@ -189,7 +192,7 @@ public partial class WorldView
         if (!pool.SetMesh(nodes, tile.Mesh, tile.MeshSurface)) ReportRejectedMesh(in tile, "landmark", tile.Mesh, tile.MeshSurface);
         // Lights like R1 (the shared sprite material cross-fades them with the building windows) and the beacons; a landmark tile has no ground
         // and no street or airport lights (empty in the entry), so its sprite MultiMesh holds lights and beacons only.
-        pool.SetSprites(nodes, in tile);
+        using (AllocProbe.Measure(AllocSite.SetSprites)) pool.SetSprites(nodes, in tile);
         InitCullMargin(nodes);
         if (replace)
         {

@@ -35,12 +35,16 @@ public partial class DiagnosticsNode : Node
     /// <summary>The longest frames since the last reset with their GC pause and per-call wall / CPU time (<see cref="StallLog"/>).</summary>
     public StallLog Stalls { get; } = new();
 
+    /// <summary>Every garbage collection of the measured part with its generation, pause and survivors (<see cref="GcEvents"/>).</summary>
+    public GcEvents Collections { get; } = new();
+
     /// <summary>Forgets the cost figures (the benchmark does it when the warm-up ends).</summary>
     public void ResetCosts()
     {
         FrameCost.Reset();
         SecondCost.Reset();
         Stalls.Reset();
+        Collections.Reset();
         FrameAllocatedBytes = 0;
     }
 
@@ -81,12 +85,14 @@ public partial class DiagnosticsNode : Node
         PerfMonitor.BeginProcess();
         FrameAllocatedBytes += GC.GetAllocatedBytesForCurrentThread() - allocated;
         FrameCost.Add((Stopwatch.GetTimestamp() - start) * MsPerTick);
+        Collections.Poll(Seconds);
 
         _sinceSample += delta;
         if (_sinceSample < SamplePeriodS) return;
         _sinceSample = 0;
         long second = Stopwatch.GetTimestamp();
-        var values = _sampler.Sample(Seconds);
+        double[] values;
+        using (AllocProbe.Measure(AllocSite.HostSampler)) values = _sampler.Sample(Seconds);
         SecondCost.Add((Stopwatch.GetTimestamp() - second) * MsPerTick);
         Sampled?.Invoke(Seconds, values);
     }

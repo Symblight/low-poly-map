@@ -190,11 +190,26 @@ public static class BenchmarkReport
     {
         double allocatedMb = (GC.GetTotalAllocatedBytes() - b.AllocatedBytes) / 1048576.0;
         j.BeginObject("gc");
+        j.Field("server_gc", System.Runtime.GCSettings.IsServerGC);
+        j.Field("latency_mode", System.Runtime.GCSettings.LatencyMode.ToString());
+        j.Field("concurrent_switch", AppContext.GetData("System.GC.Concurrent")?.ToString() ?? "unset");
+        j.Field("gc_count_total", GC.CollectionCount(0));
+        if (b.View.GcPacing is { } pacer)
+        {
+            j.Field("pacer_budget_mb", pacer.BudgetBytes >> 20);
+            j.Field("pacer_starts", pacer.Starts);
+            j.Field("pacer_rotations", pacer.Rotations);
+            j.Field("pacer_early_exits", pacer.EarlyExits);
+            j.Field("pacer_refused", pacer.Refused);
+            j.Field("pacer_rotation_ms_max", Math.Round(pacer.RotationMsMax, 2));
+        }
         j.Field("collections_gen0", GC.CollectionCount(0) - b.GcGen0);
         j.Field("collections_gen1", GC.CollectionCount(1) - b.GcGen1);
         j.Field("collections_gen2", GC.CollectionCount(2) - b.GcGen2);
         j.Field("allocated_mb", Math.Round(allocatedMb, 2));
         j.Field("allocated_mb_per_s", Math.Round(allocatedMb / Math.Max(PerfMonitor.Session.DurationS, 1e-3), 4));
+        b.Allocs.WriteFields(j, PerfMonitor.Session.DurationS, PerfMonitor.Session.Frames);
+        b.Diagnostics.Collections.WriteFields(j);
         j.End();
     }
 

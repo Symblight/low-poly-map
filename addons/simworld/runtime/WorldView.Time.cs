@@ -15,8 +15,8 @@ public partial class WorldView
         Hour = localHour;
         NightFactor = nightFactor;
         ShaderGlobals.EnsureRegistered();
-        RenderingServer.GlobalShaderParameterSet(ShaderGlobals.Hour, localHour);
-        RenderingServer.GlobalShaderParameterSet(ShaderGlobals.NightFactor, nightFactor);
+        RenderingServer.GlobalShaderParameterSet(ShaderGlobals.HourName, localHour);
+        RenderingServer.GlobalShaderParameterSet(ShaderGlobals.NightFactorName, nightFactor);
         UpdateWindowShares(false);
         UpdateSpriteSwitch(nightFactor);
     }

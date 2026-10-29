@@ -11,6 +11,8 @@ public struct ReadyTile
     /// <summary>Why a mesh array of the entry was dropped (not an Array, or its vertex slot is not a PackedVector3Array); null when the entry is well formed. The view logs it once per key.</summary>
     public string? Problem;
     public string Key;
+    /// <summary>False for an entry without a usable key: only <see cref="Problem"/> (the keys and types it carried) is set.</summary>
+    public readonly bool Usable => Key != null;
     /// <summary>True for a terrain-layer entry (api 1.5: layer "terrain", key "t/z/x/y"); false for the vector layer.</summary>
     public bool IsTerrain;
     /// <summary>True for a landmark-layer entry (api 1.11: layer "landmarks", key "l/z/x/y", ring 0): it carries the vector keys (mesh with windows, lights, beacons; no ground), drawn like a vector tile but kept in the landmark tile map.</summary>
@@ -42,4 +44,18 @@ public struct ReadyTile
     public bool HasGroundKey;
     /// <summary>Ground mesh Array (VERTEX, NORMAL, COLOR, INDEX), relative to <see cref="Origin"/>. Null when absent or empty (R3).</summary>
     public Godot.Collections.Array? Ground;
+
+    /// <summary>
+    /// Releases the mesh handles (Arrays and surface Dictionaries) the entry carried, right after the meshes went into their <see cref="ArrayMesh"/>: they own finalizable wrappers and the
+    /// delivered vertex data, which would otherwise wait for a garbage collection and its finalizer thread. Call once per tile; the light arrays are plain managed arrays.
+    /// </summary>
+    public readonly void ReleaseHandles()
+    {
+        Terrain?.Dispose();
+        Mesh?.Dispose();
+        Ground?.Dispose();
+        MeshSurface?.Dispose();
+        GroundSurface?.Dispose();
+        TerrainSurface?.Dispose();
+    }
 }

@@ -122,9 +122,18 @@ public partial class DaylightMenu : PanelContainer
         }
     }
 
+    // What the widgets show now: the clock changes only when it runs, a preset is chosen or a launch argument sets it, so a frame without a change does no widget work.
+    private readonly record struct Shown(double Hour, int Day, float Night, bool Override, double Speed, double Elevation, double Azimuth, float SunNight, double Utc, double Lat, double Lon);
+    private Shown? _shown;
+
     public override void _Process(double delta)
     {
+        using var probe = AllocProbe.Measure(AllocSite.HostUi);
         if (!Visible || Clock == null) return;
+        var now = new Shown(Clock.LocalHour, Clock.DayOfYear, Clock.NightFactor, Clock.OverrideNight, Clock.TimeSpeed, Clock.SunElevationDeg, Clock.SunAzimuthDeg,
+            Clock.SunNightFactor, Clock.UtcOffset, Clock.Latitude, Clock.Longitude);
+        if (_shown == now) return;
+        _shown = now;
         // Mirror the clock (it advances on its own and can be changed by launch args or presets).
         _syncing = true;
         _time.SetValueNoSignal(Clock.LocalHour);
@@ -132,7 +141,8 @@ public partial class DaylightMenu : PanelContainer
         _night.SetValueNoSignal(Clock.NightFactor);
         _override.SetPressedNoSignal(Clock.OverrideNight);
         _syncing = false;
-        int si = System.Array.FindIndex(Speeds, s => s.Speed == Clock.TimeSpeed);
+        int si = -1;
+        for (int i = 0; i < Speeds.Length; i++) if (Speeds[i].Speed == Clock.TimeSpeed) { si = i; break; }
         if (si >= 0 && _speed.Selected != si) _speed.Select(si);
 
         _timeLabel.Text = Clock.TimeText;

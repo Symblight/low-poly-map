@@ -59,7 +59,8 @@ public sealed class SecondSampler
     void ReadLibrary()
     {
         // Without the stats (library missing) the library metrics stay NaN, which the series ignore.
-        bool ok = _view.Streamer.DebugStats(_stats);
+        bool ok;
+        using (AllocProbe.Measure(AllocSite.DebugStats)) ok = _view.Streamer.DebugStats(_stats, latency: false);
         _values[(int)Metric.LibMemoryMb] = ok ? _stats.Memory("total") : double.NaN;
         _values[(int)Metric.LibDataTilesMb] = ok ? _stats.Memory("data_tiles") : double.NaN;
         _values[(int)Metric.LibHeightTilesMb] = ok ? _stats.Memory("height_tiles") : double.NaN;

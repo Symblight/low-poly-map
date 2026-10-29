@@ -23,6 +23,7 @@ public sealed class TerrainNodes : TileNodes
 public sealed class TerrainPool
 {
     private readonly Node3D _container;
+    private readonly MeshSurfaces _surfaces = new();
     private readonly Stack<TerrainNodes> _free = new();
     private readonly RetireQueue<TerrainNodes> _retiring = new(); // released, mesh not freed yet (see TilePool.DrainRetired)
     private readonly PoolTrimmer _trimmer;
@@ -194,7 +195,7 @@ public sealed class TerrainPool
         t.HMin = hMin;
         t.HMax = hMax;
         if (arrays == null && surface == null) return true;
-        if (!MeshSurfaces.Fill(t.Mesh, arrays, surface)) return false; // rejected by Godot
+        if (!_surfaces.Fill(t.Mesh, arrays, surface)) return false; // rejected by Godot
         t.Tris = MeshSurfaces.Triangles(t.Mesh);
         t.HasMesh = true;
         t.MeshInstance.Visible = true;

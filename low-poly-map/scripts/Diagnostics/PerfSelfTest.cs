@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.Text.Json;
 using Godot;
+using SimWorld;
 
 namespace LowPolyMap.Diagnostics;
 
@@ -115,6 +116,26 @@ public static class PerfSelfTest
         PerfMarker.EndFrame();
         PerfMarker.Reset();
         check("marker scope", scopeBytes == 0 && scopeNs < 1000, $"{scopeNs:0} ns each, {scopeBytes} bytes allocated over {N}");
+
+        // The allocation probe books the bytes of a nested scope once, and its own scopes allocate nothing.
+        AllocProbe.Enabled = true;
+        AllocProbe.Reset();
+        allocated = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < N; i++) using (AllocProbe.Measure(AllocSite.UpdateCamera)) using (AllocProbe.Measure(AllocSite.GroundHeight)) { }
+        long probeBytes = GC.GetAllocatedBytesForCurrentThread() - allocated;
+        AllocProbe.Reset();
+        long expected = 0;
+        using (AllocProbe.Measure(AllocSite.UpdateCamera))
+        {
+            var a = new byte[1000];
+            using (AllocProbe.Measure(AllocSite.GroundHeight)) { var b = new byte[2000]; GC.KeepAlive(b); }
+            GC.KeepAlive(a);
+        }
+        expected = AllocProbe.BytesOf(AllocSite.UpdateCamera) + AllocProbe.BytesOf(AllocSite.GroundHeight);
+        bool nestedOk = AllocProbe.BytesOf(AllocSite.GroundHeight) is >= 2000 and < 2100 && AllocProbe.BytesOf(AllocSite.UpdateCamera) is >= 1000 and < 1100;
+        AllocProbe.Enabled = false;
+        AllocProbe.Reset();
+        check("AllocProbe", probeBytes == 0 && nestedOk && expected < 3300, $"{probeBytes} bytes allocated over {N} nested scopes; nested sites book {expected} bytes for 3000 allocated (exclusive)");
 
         var stats = new PerfStats();
         var sample = new PerfSample { FrameMs = 5, ProcessMs = 4, DrawCalls = 900, Primitives = 1000000 };

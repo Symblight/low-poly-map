@@ -38,13 +38,15 @@ public partial class WorldView
     private void PollFades()
     {
         var pool = _pool!;
-        var fades = Streamer.PollFades();
+        Godot.Collections.Dictionary? fades;
+        using (AllocProbe.Measure(AllocSite.PollFades)) fades = Streamer.PollFades();
+        using var probe = AllocProbe.Measure(AllocSite.FadeApply);
         long applyStart = (long)Time.GetTicksUsec(); // the library call is the "fades" marker, what follows is fade_apply
         _fadeFrame++;
         int entries = fades?.Count ?? 0;
         if (entries > 0)
         {
-            if (!ReadKnownFades(fades!)) ReadFadesAfresh(fades!);
+            using (AllocProbe.Measure(AllocSite.FadeRead)) if (!ReadKnownFades(fades!)) ReadFadesAfresh(fades!);
             for (int i = 0; i < _fadeKeys.Count; i++) ApplyFade(_fadeKeys[i], _fadeValues[i]);
         }
         else ClearFadeKeys();
@@ -74,6 +76,7 @@ public partial class WorldView
         }
         Cover.ReleaseAwaiting();
         TerrainCover.ReleaseAwaiting();
+        fades?.Dispose(); // the remembered key Variants above hold their own references
         _fadeApplyUs += (long)Time.GetTicksUsec() - applyStart;
     }
 

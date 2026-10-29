@@ -125,7 +125,7 @@ mod tests {
             ".ln_1p()", ".exp_m1()",
         ];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut stack = vec![root];
+        let mut stack = vec![root.clone()];
         let mut bad = Vec::new();
         while let Some(dir) = stack.pop() {
             for e in std::fs::read_dir(&dir).unwrap() {
@@ -135,7 +135,9 @@ mod tests {
                     continue;
                 }
                 let name = p.file_name().unwrap().to_string_lossy().to_string();
-                if !name.ends_with(".rs") || name.contains("tests") || name == "math.rs" {
+                // Test files: `*tests*.rs` and everything inside a `*tests*` folder.
+                let in_tests = p.strip_prefix(&root).unwrap().components().any(|c| c.as_os_str().to_string_lossy().contains("tests"));
+                if !name.ends_with(".rs") || in_tests || name == "math.rs" {
                     continue;
                 }
                 let text = std::fs::read_to_string(&p).unwrap();

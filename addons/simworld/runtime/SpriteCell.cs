@@ -100,7 +100,7 @@ internal sealed class SpriteCell
     /// <summary>
     /// Rebuilds the mesh from the members' cached bytes into <paramref name="scratch"/> (a reusable buffer) and frees the dead slots. An empty cell clears its mesh.
     /// </summary>
-    public void Rebuild(PointBuffers scratch)
+    public void Rebuild(PointBuffers scratch, PointSurface surface)
     {
         int total = 0;
         for (int i = 0; i < Members.Count; i++) total += Members[i].Data.Count;
@@ -128,7 +128,7 @@ internal sealed class SpriteCell
             at += d.Count;
         }
         scratch.Count = total;
-        PointSurface.Set(Mesh, scratch.PosBytes, scratch.AttrBytes, total, min, max);
+        surface.Set(Mesh, scratch.PosBytes, scratch.AttrBytes, total, min, max);
         MeshPoints = total;
         BoxMin = min;
         BoxMax = max;

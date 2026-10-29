@@ -8,7 +8,7 @@ public partial class WorldView
     public override void _Process(double delta)
     {
         using var probe = AllocProbe.Measure(AllocSite.ViewFrame);
-        if (_settings.GcQuietBudgetMb > 0) (GcPacing ??= new GcPacer(_settings.GcQuietBudgetMb)).Tick();
+        if (_settings.GcQuietBudgetMb > 0) (GcPacing ??= GcPacer.Acquire(_settings.GcQuietBudgetMb)).Tick();
         if (_prewarm != null && _prewarm.Tick()) _prewarm = null;
         if (_source != null && Streamer.IsAvailable)
         {
@@ -99,7 +99,7 @@ public partial class WorldView
         }
     }
 
-    /// <summary>The collector pacer while <see cref="WorldRenderSettings.GcQuietBudgetMb"/> is above 0 (counters for diagnostics); null otherwise.</summary>
+    /// <summary>The process's collector pacer while <see cref="WorldRenderSettings.GcQuietBudgetMb"/> is above 0 (counters for diagnostics; released in <c>_ExitTree</c>); null otherwise.</summary>
     public GcPacer? GcPacing { get; private set; }
     private readonly System.Collections.Generic.List<ReadyTile> _readyBuf = new(4);
     private double _tileCostEmaUs = 500;

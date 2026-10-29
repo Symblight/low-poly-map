@@ -34,7 +34,8 @@ public static class BenchmarkFiles
 
     public static string BaselinePath() => Path.Combine(ResultsDir(), "baselines", MachineInfo.Key() + ".json");
 
-    public static string BaselineKey(string name, string libraryFlavour) => $"{name}@{libraryFlavour}";
+    /// <summary><c>&lt;benchmark&gt;@&lt;flavour&gt;</c>, plus <c>@gcq&lt;MB&gt;</c> when the collector pacer ran: a paced run never compares with, or overwrites, an unpaced baseline.</summary>
+    public static string BaselineKey(string name, string libraryFlavour, int gcQuietMb) => gcQuietMb > 0 ? $"{name}@{libraryFlavour}@gcq{gcQuietMb}" : $"{name}@{libraryFlavour}";
 
     /// <summary>Compares the run with the entry <paramref name="key"/> of this machine's baseline: the <c>baseline</c> object of the result
     /// (with <c>regression</c> true when the frame p95 grew by more than 10 %), or <c>null</c> without a baseline.</summary>

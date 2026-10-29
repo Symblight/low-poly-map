@@ -21,6 +21,7 @@ internal sealed class SpriteCells
     private readonly Stack<SpriteCell> _free = new();
     private readonly Stack<CellMember> _spareMembers = new();
     private readonly PointBuffers _scratch = new();
+    private readonly PointSurface _surface = new();
     private bool _on = true;
     /// <summary>Something changed since the last <see cref="Sync"/> (a tile placed, committed or removed): the cells are not up to date until the frame's sync.</summary>
     private bool _unsynced;
@@ -145,7 +146,7 @@ internal sealed class SpriteCells
     private void Rebuild(SpriteCell cell)
     {
         long t0 = Stopwatch.GetTimestamp();
-        cell.Rebuild(_scratch);
+        cell.Rebuild(_scratch, _surface);
         long us = (Stopwatch.GetTimestamp() - t0) * 1_000_000 / Stopwatch.Frequency;
         Rebuilds++;
         RebuiltPoints += cell.MeshPoints;

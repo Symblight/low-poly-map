@@ -8,6 +8,7 @@ public sealed partial class TilePool
 {
     private bool _spritesOn = true;
     private readonly PointBuffers _tileBuf = new();
+    private readonly PointSurface _pointSurface = new();
     private static readonly Vector3[] NoPoints = System.Array.Empty<Vector3>();
     private static readonly Color[] NoColors = System.Array.Empty<Color>();
 
@@ -134,7 +135,7 @@ public sealed partial class TilePool
             if (total > 0)
             {
                 missing = Pack(_tileBuf, total, -1, default, lights, in tile);
-                PointSurface.Set(t.PointsMesh, _tileBuf);
+                _pointSurface.Set(t.PointsMesh, _tileBuf);
                 t.PointsFilled = true;
                 t.Clustered = _tileBuf.Clustered;
                 t.Points.Visible = true;

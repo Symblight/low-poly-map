@@ -231,6 +231,8 @@ public partial class WorldView : Node3D
 
     public override void _ExitTree()
     {
+        GcPacing?.Release();   // the last view ends the no-GC region: the collector is back on its own schedule
+        GcPacing = null;
         // Deterministic stop before the node is freed: waits (bounded 1 s) for cache I/O and releases the cache_dir lock.
         if (Streamer.IsAvailable)
         {
@@ -239,6 +241,12 @@ public partial class WorldView : Node3D
             if (Streamer.HasHostApi) GD.Print("[WorldView] shutdown (releasing the cache lock)");
             Streamer.Shutdown();
         }
+    }
+
+    public override void _Notification(int what)
+    {
+        // iOS / Android: the OS wants memory back. The pacer ends its region, collects and stays out for a while (GcPacer.MemoryWarningHoldS).
+        if (what == NotificationOsMemoryWarning) GcPacing?.OnMemoryWarning();
     }
 
     private void OnStatusChanged(StreamerStatus st)

@@ -54,7 +54,7 @@ public static class BenchmarkReport
         j.Field("after", new RawJson(b.NoiseEnd));
         j.Field("note", "numbers measured while other processes were busy are noisy; write baselines only on an idle machine");
         j.End();
-        j.Field("baseline", BenchmarkFiles.Compare(BenchmarkFiles.BaselineKey(b.Def.Name, b.LibraryFlavour), session));
+        j.Field("baseline", BenchmarkFiles.Compare(BenchmarkFiles.BaselineKey(b.Def.Name, b.LibraryFlavour, b.GcQuietMb), session));
         j.Field("output", outputPath);
         j.End();
         return j.Pretty();
@@ -212,6 +212,8 @@ public static class BenchmarkReport
             j.Field("pacer_early_exits", pacer.EarlyExits);
             j.Field("pacer_refused", pacer.Refused);
             j.Field("pacer_rotation_ms_max", Math.Round(pacer.RotationMsMax, 2));
+            j.Field("pacer_memory_warnings", pacer.MemoryWarnings);
+            j.Field("pacer_users", GcPacer.Users);
         }
         j.Field("collections_gen0", GC.CollectionCount(0) - b.GcGen0);
         j.Field("collections_gen1", GC.CollectionCount(1) - b.GcGen1);

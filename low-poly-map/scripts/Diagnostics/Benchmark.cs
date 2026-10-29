@@ -76,6 +76,8 @@ public partial class Benchmark : Node
     /// <summary>The library's version string ("simworld-godot 0.5.0 (build release @...)") and its build flavour, read when the measurement starts.</summary>
     public string LibraryVersion { get; private set; } = "";
     public string LibraryFlavour => MachineInfo.LibraryFlavour(LibraryVersion);
+    /// <summary>The collector pacer budget this run used (0 = off), part of the baseline key.</summary>
+    public int GcQuietMb => (int)((View.GcPacing?.BudgetBytes ?? 0) >> 20);
 
     Benchmark(BenchmarkDef def, BenchmarkArgs args, WorldView view, DiagnosticsNode diagnostics)
     {
@@ -302,7 +304,7 @@ public partial class Benchmark : Node
             System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(path)!);
             System.IO.File.WriteAllText(path, json + "\n");
             if (_args.UpdateBaseline)
-                GD.Print("[Benchmark] baseline written: " + BenchmarkFiles.Update(BenchmarkFiles.BaselineKey(_def.Name, LibraryFlavour), BenchmarkReport.BaselineEntry(this)));
+                GD.Print("[Benchmark] baseline written: " + BenchmarkFiles.Update(BenchmarkFiles.BaselineKey(_def.Name, LibraryFlavour, GcQuietMb), BenchmarkReport.BaselineEntry(this)));
         }
         catch (Exception e) when (e is System.IO.IOException or UnauthorizedAccessException)
         {

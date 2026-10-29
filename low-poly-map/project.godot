@@ -11,9 +11,9 @@ config_version=5
 [application]
 
 config/name="LowPolyMap"
-config/features=PackedStringArray("4.7", "Mobile")
-config/icon="res://icon.svg"
 run/main_scene="res://scenes/CitySpike.tscn"
+config/features=PackedStringArray("4.7", "C#", "Mobile")
+config/icon="res://icon.svg"
 
 [display]
 

@@ -30,11 +30,8 @@ public sealed class PoolTrimmer
 
     /// <summary>Sets freed since start.</summary>
     public int Trimmed { get; private set; }
-    /// <summary>Sets still to free of the current surplus.</summary>
-    public int Pending => _pending;
-    /// <summary>The free-list margin of the last closed window, and the decayed peak in use it came from.</summary>
+    /// <summary>The free-list margin of the last closed window.</summary>
     public int Margin => _margin;
-    public int PeakInUse => _peakInUse;
 
     public PoolTrimmer(string name, WorldRenderSettings s)
     {

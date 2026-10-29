@@ -88,13 +88,6 @@ internal sealed class SpriteCell
 
     public bool HasDeadSlots => _deadSlots != 0;
 
-    /// <summary>The member of a tile, or null.</summary>
-    public CellMember? MemberOf(TileNodes t)
-    {
-        for (int i = 0; i < Members.Count; i++) if (Members[i].Tile == t) return Members[i];
-        return null;
-    }
-
     /// <summary>The tile left: its slot goes dead until the next rebuild, its points stay in the mesh (drawn at 0). Returns the member's buffers to the caller to recycle.</summary>
     public void Remove(CellMember m)
     {

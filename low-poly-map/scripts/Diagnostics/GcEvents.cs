@@ -23,8 +23,6 @@ public sealed class GcEvents
     readonly Event[] _events = new Event[Max];
     int _count, _lastCollections;
 
-    public int Recorded => _count;
-
     public void Reset()
     {
         _count = 0;

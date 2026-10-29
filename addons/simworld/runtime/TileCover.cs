@@ -186,8 +186,6 @@ public sealed class TileCover
 
     // ---- the rule --------------------------------------------------------------------------
 
-    private bool Has(long k) => _tiles.ContainsKey(k);
-
     /// <summary>
     /// A tile counts as present when it is uploaded, or (after Rust refined it and unloaded it) when all 4 of its
     /// children are present. With a literal "sibling uploaded" test, refining one tile of a sibling group would

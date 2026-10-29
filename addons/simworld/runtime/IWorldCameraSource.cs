@@ -89,11 +89,16 @@ public sealed class Camera3DSource : IWorldCameraSource, IWorldCameraTick, IWorl
 /// a speed), and the next frame measures again. An origin shift moves every camera the host listed in <paramref name="all"/>, or only the
 /// current one when the list is null: a camera the host recomputes from its aircraft every frame needs no shift, one that keeps its own
 /// position in local space must be listed (or shifted by the host through <see cref="WorldView.OriginShifted"/>).
+/// <para><b>Velocity.</b> The library's cover looks ahead by velocity x <c>bands.look_ahead_s</c> (20 s, clamped per band). A chase or orbit camera
+/// swinging on its arm reports hundreds of metres per second that are not travel, and every swing then moves the whole streamed set (tiles
+/// stream in and out and fade: "everything blinks when I move the camera"). A host with a vehicle passes its velocity through
+/// <paramref name="velocity"/>; without one the camera's own position change is used, as <see cref="Camera3DSource"/> does.</para>
 /// </summary>
 public sealed class CameraSwitchSource : IWorldCameraSource, IWorldCameraTick, IWorldCameraProvider
 {
     private readonly Func<Camera3D?> _current;
     private readonly IReadOnlyList<Camera3D>? _all;
+    private readonly Func<Vector3>? _velocity;
     private Camera3D? _camera;
     private Vector3 _last;
     private bool _haveLast;
@@ -101,10 +106,12 @@ public sealed class CameraSwitchSource : IWorldCameraSource, IWorldCameraTick, I
 
     /// <param name="current">Returns the camera that is looking now (null = none yet; the pose then holds the last camera's position).</param>
     /// <param name="all">Every camera to move on an origin shift; null = only the current one.</param>
-    public CameraSwitchSource(Func<Camera3D?> current, IReadOnlyList<Camera3D>? all = null)
+    /// <param name="velocity">The travel velocity in local axes (m/s), e.g. the aircraft's; null = the camera's own position change.</param>
+    public CameraSwitchSource(Func<Camera3D?> current, IReadOnlyList<Camera3D>? all = null, Func<Vector3>? velocity = null)
     {
         _current = current;
         _all = all;
+        _velocity = velocity;
     }
 
     public Camera3D? CurrentCamera => _camera;
@@ -143,7 +150,7 @@ public sealed class CameraSwitchSource : IWorldCameraSource, IWorldCameraTick, I
         }
         if (_camera == null) { Velocity = Vector3.Zero; return; }
         var p = _camera.GlobalPosition;
-        Velocity = _haveLast && delta > 1e-6 ? (p - _last) / (float)delta : Vector3.Zero;
+        Velocity = _velocity != null ? _velocity() : _haveLast && delta > 1e-6 ? (p - _last) / (float)delta : Vector3.Zero;
         _last = p;
         _haveLast = true;
     }

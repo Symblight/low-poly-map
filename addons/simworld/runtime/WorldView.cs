@@ -96,6 +96,18 @@ public partial class WorldView : Node3D
     private WorldRenderSettings _settings = new();
     private IWorldCameraSource? _source;
     private Camera3DSource? _adapter;
+    private bool _prewarmPending;
+
+    /// <summary>Starts the material prewarm once a camera exists (at Start, or on the first frame that has one). Without it the first tile draw and the first fade compile the shaders and pipelines inside a frame: measured 4.7 s on Metal Forward+ in SimPlane.</summary>
+    private void StartPrewarmIfReady()
+    {
+        if (!_prewarmPending || _pool == null) return;
+        var cam = ViewCamera;
+        if (cam == null) return;
+        _prewarmPending = false;
+        _prewarm = new MaterialPrewarm(cam, _pool, _terrainPool);
+        GD.Print($"[WorldView] material prewarm: {_prewarm.MaterialCount} materials drawn for {MaterialPrewarm.Frames} frames (shader and pipeline compile before the first fade)");
+    }
     private readonly List<long> _dropScratch = new(256);
     private TilePool? _pool;
     private TerrainPool? _terrainPool;
@@ -159,11 +171,9 @@ public partial class WorldView : Node3D
         _terrainRoot = new Node3D { Name = "TerrainTiles" };
         AddChild(_terrainRoot);
         _terrainPool = new TerrainPool(_terrainRoot, _settings);
-        if (_settings.PrewarmMaterials && ViewCamera != null && DisplayServer.GetName() != "headless")
-        {
-            _prewarm = new MaterialPrewarm(ViewCamera!, _pool, _terrainPool);
-            GD.Print($"[WorldView] material prewarm: {_prewarm.MaterialCount} materials drawn for {MaterialPrewarm.Frames} frames (shader and pipeline compile before the first fade)");
-        }
+        // The prewarm needs a camera to draw in front of; a host whose cameras enter the tree after this node (SimPlane) has none yet, so it starts on the first frame that has one (StartPrewarmIfReady).
+        _prewarmPending = _settings.PrewarmMaterials && DisplayServer.GetName() != "headless";
+        StartPrewarmIfReady();
         _markings = new AirportMarkings(this, _settings, AddonPaths.Root + "/shaders");
 
         Streamer = WorldStreamerFacade.Create();

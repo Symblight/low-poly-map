@@ -10,6 +10,7 @@ public partial class WorldView
     {
         using var probe = AllocProbe.Measure(AllocSite.ViewFrame);
         if (_settings.GcQuietBudgetMb > 0) (GcPacing ??= GcPacer.Acquire(_settings.GcQuietBudgetMb)).Tick();
+        if (_prewarmPending) StartPrewarmIfReady();
         if (_prewarm != null && _prewarm.Tick()) _prewarm = null;
         if (_source != null && Streamer.IsAvailable)
         {

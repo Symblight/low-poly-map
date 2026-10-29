@@ -97,7 +97,7 @@ Nothing here is a new `api_version`. Items that would be one (a geoid, `set_cloc
 | --- | --- | --- |
 | S1 | Runtime origin: `WorldGeoReference` over the library's conversions, JSBSim duplicate removed, custom model shift-aware, `OriginShifted` subscribers (B1) | first flight |
 | S2 | `GroundHeightAt` wired, runway lift applied inside the strip (B2) | **done 2026-10-29** (section 7a) |
-| S3 | `GameSession` world / airport / runway, spawn from `Airports`, menu page, `menu-map-spec.md` (B3) | first flight (spawn from `airports()` done, hard-coded to EYVI 01; `GameSession.World` exists; the menu page and the airport choice remain) |
+| S3 | `GameSession` world / airport / runway, spawn from `Airports`, menu page, `menu-map-spec.md` (B3) | **partly done 2026-10-29**: a **City** dropdown on the start menu's Flight setup page (`StartMenu.Cities`: Vilnius = seed world at EYVI 01, TestDev = flat; `GameSession.World` / `WorldChosen`; Vilnius is picked when the menu opens, a scene started without the menu stays flat; `menu-map-spec.md` updated; `WeatherPickerChecks` pass through it). Remaining: the airport and runway choice inside a city, the Landing mission geometry on a heading other than north |
 | S4 | `World/SeedWorld` (built in code under `TestWorld`), `TestWorld` kept for checks, seed data and credits in the bundle (B4) | **done 2026-10-29** (section 7a) |
 | S5 | Vendor the addon (symlink for now), nullable pragmas in the addon, shader globals at runtime (B5) | **done 2026-10-29** |
 | S6 | `TimeOfDay` host clock, sun, `SetTime`, glow on the environment (N1, N2) | night |

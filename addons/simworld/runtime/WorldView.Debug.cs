@@ -6,6 +6,13 @@ namespace SimWorld;
 /// <summary>Debug aids: cover verification, terrain state log, frustum counts.</summary>
 public partial class WorldView
 {
+    /// <summary>Debug aid: false hides the whole vector layer (buildings, ground, lights) so the terrain can be inspected on its own; the streaming is unchanged.</summary>
+    public bool VectorVisible
+    {
+        get => _tileRoot?.Visible ?? true;
+        set { if (_tileRoot != null) _tileRoot.Visible = value; }
+    }
+
     /// <summary>Debug: log the terrain layer's state once a second (held, visible, holes, camera against the terrain).</summary>
     public bool TerrainDebugLog { get; set; }
     private double _terrainLogT;

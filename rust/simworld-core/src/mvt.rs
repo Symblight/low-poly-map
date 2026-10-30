@@ -39,7 +39,7 @@ pub use ground::{
 };
 pub use landuse::{point_in_rings, LanduseIndex};
 pub use overview::{decode_overview_on, landmark_flags, light_point, DecodedOverview, LightAttrs};
-pub use projector::{TileProjector, BASE_EDGE_STEP_M, BASE_LATTICE_LEVEL};
+pub use projector::{footprint_base, tile_m_per_px, TileProjector, BASE_EDGE_STEP_M, BASE_LATTICE_LEVEL};
 pub use stack::stack_raised_parts;
 
 pub const BUILDINGS_LAYER: &str = "buildings";

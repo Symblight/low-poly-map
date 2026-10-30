@@ -21,3 +21,7 @@ geo = { version = "0.33.1", default-features = false }
 pmtiles = { version = "0.25.0", default-features = false, features = ["write"] }
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 rayon = "1.12"
+
+# `seed gallery`: process peak RSS through getrusage (already in the lock through other crates).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -26,10 +26,12 @@ use super::geom::{m_per_deg_lon, M_PER_DEG};
 use super::hash::{airport_seed, Seed};
 use crate::profile::SeedProfile;
 
+mod approach;
 mod layout;
 mod lights;
 mod strips;
 
+pub use approach::{limit_of, ApproachIndex, ApproachSurface};
 pub use strips::{runway_planes, StripIndex};
 
 use layout::{layout, runway_geo};

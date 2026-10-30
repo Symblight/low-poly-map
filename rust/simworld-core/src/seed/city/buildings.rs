@@ -10,14 +10,41 @@
 //! and clear of arterials and radials. An old town's first cell turns its `landmarks` most
 //! central buildings into a church and a tower.
 
+use crate::geo::{lat_to_tile_y, lon_to_tile_x, TileKey};
 use crate::math::{exp, ln};
+use crate::mvt::{centroid_px, footprint_base, tile_m_per_px, PxPolygons};
+use crate::rings::{LEAF_ZOOM, ROOT_ZOOM};
+use crate::seed::world::{px_of, SeedWorld, EXTENT};
 use crate::seed::city::hex::{add, DIRS};
 use crate::seed::city::lines::{bilinear, boxes_overlap, dist_to_line, grow, len};
 use crate::seed::city::lots::{LotShape, Lots};
 use crate::seed::city::network::local::LocalNetwork;
 use crate::seed::city::{CellInput, RoadKind, StageHash};
+use crate::seed::airport::{ApproachSurface, LocalFrame};
 use crate::seed::geom::{point_in_ring, signed_area};
 use crate::seed::hash::{unit, Seed};
+
+/// Plan metres the approach-surface query box grows past the cell box. A footprint's corners
+/// may lie in a same-district neighbour cell, outside the cell box (the centroid stays in the
+/// cell; with the default styles the largest overhang on the two-cities world is 44.6 m, pinned
+/// by `every_building_lies_inside_its_cells_approach_box`). Profile ranges allow lots of hundreds
+/// of metres, so a footprint whose plan box leaves the grown box queries the surfaces with its
+/// own box instead: correct for any profile, the margin only keeps that path rare.
+pub const APPROACH_MARGIN_M: f64 = 100.0;
+
+/// Headroom (m) under an approach cap for the mesher's base: [`mesh_base`] rebuilds the base in
+/// the tile of the first vertex only, the mesher in every tile the footprint overlaps, and the
+/// edge split there can differ by one (`m_per_px` differs by ~8e-5 relative between neighbouring
+/// tiles), which puts the meshed base up to centimetres higher.
+const BASE_MARGIN_M: f64 = 0.05;
+
+/// The approach query box of a cell (plan box [x0, y0, x1, y1]) grown by [`APPROACH_MARGIN_M`]:
+/// lat/lon [w, s, e, n] (the frame is equirectangular, so the box maps exactly).
+pub fn approach_box(frame: &LocalFrame, cell_bbox: [f64; 4]) -> [f64; 4] {
+    let b = grow(cell_bbox, APPROACH_MARGIN_M);
+    let ((s, w), (n, e)) = (frame.ll([b[0], b[1]]), frame.ll([b[2], b[3]]));
+    [w, s, e, n]
+}
 
 /// A generated building (counter-clockwise ring, plane offsets from the cell centre).
 #[derive(Clone, Debug, PartialEq)]
@@ -38,6 +65,29 @@ pub fn hash(buildings: &[PlanBuilding]) -> u64 {
         h.u(b.id).s(&b.kind).f32(b.height_m).f32(b.levels).u(b.capped as u64).pts32(&b.ring);
     }
     h.finish()
+}
+
+/// The base the mesher will give a footprint (plan ring, `ll` = plan -> (lat, lon)): its base
+/// rule ([`footprint_base`], contract section 7 "[1.7] Per-vertex walls", the highest exact
+/// terrain under the footprint) in the pixels of the tile of its first vertex at every zoom with
+/// a building mesh (R2-R0), the highest of them. The rule samples global points, so tiles and
+/// zooms agree but for rounding and the edge split ([`BASE_MARGIN_M`]); `px` is scratch.
+fn mesh_base(w: &SeedWorld, ring: &[[f64; 2]], ll: &mut dyn FnMut([f64; 2]) -> (f64, f64), px: &mut PxPolygons) -> f64 {
+    let mut hi = f64::NEG_INFINITY;
+    for z in ROOT_ZOOM + 1..=LEAF_ZOOM {
+        let pts = &mut px[0][0];
+        pts.clear();
+        let mut key = None;
+        for p in ring {
+            let (lat, lon) = ll(*p);
+            let k = *key.get_or_insert_with(|| TileKey::new(z, lon_to_tile_x(lon, z) as u32, lat_to_tile_y(lat, z) as u32));
+            pts.push(px_of(k, lat, lon));
+        }
+        let Some(k) = key else { return 0.0 };
+        let Some(c) = centroid_px(px) else { continue };
+        hi = hi.max(footprint_base(&w.height, k, EXTENT, tile_m_per_px(k, EXTENT), px, c));
+    }
+    hi
 }
 
 /// The buildings of one cell's lots, sorted by id.
@@ -67,11 +117,16 @@ pub fn build(inp: &CellInput, net: &LocalNetwork, lots: &Lots) -> Vec<PlanBuildi
         let (la, lo) = frame.ll(p);
         [lo, la]
     };
-    let (sw, ne) = (ll([cell.bbox[0], cell.bbox[1]]), ll([cell.bbox[2], cell.bbox[3]]));
-    let approach = w.approach.within([sw[0], sw[1], ne[0], ne[1]]);
+    // Surfaces near the cell, its box grown by `APPROACH_MARGIN_M`; a footprint leaving that
+    // box queries its own (`wide_hit`: one of them met a surface, which also bars landmarks).
+    let grown = grow(cell.bbox, APPROACH_MARGIN_M);
+    let approach = w.approach.within(approach_box(&frame, cell.bbox));
+    let mut wide_hit = false;
     let corner_ok = |p: [f64; 2]| (inp.in_cell(p) || same.iter().any(|r| point_in_ring(p, r))) && !inp.wet(p) && roads.iter().all(|(l, c)| dist_to_line(p, l) >= *c);
     let floor_m = cp.floor_m;
-    let make = |id: u64, kind: &str, floors: f64, ring: Vec<[f64; 2]>, out: &mut Vec<PlanBuilding>| {
+    // Pixel ring scratch of `mesh_base` (one footprint at a time).
+    let mut px: PxPolygons = vec![vec![Vec::with_capacity(8)]];
+    let mut make = |id: u64, kind: &str, floors: f64, ring: Vec<[f64; 2]>, out: &mut Vec<PlanBuilding>| {
         let n = ring.len() as f64;
         let c = [ring.iter().map(|p| p[0]).sum::<f64>() / n, ring.iter().map(|p| p[1]).sum::<f64>() / n];
         if !inp.in_cell(c) || !ring.iter().all(|p| corner_ok(*p)) {
@@ -83,23 +138,23 @@ pub fn build(inp: &CellInput, net: &LocalNetwork, lots: &Lots) -> Vec<PlanBuildi
         }
         let mut height = floors * floor_m;
         let mut capped = false;
-        if !approach.is_empty() {
-            let cap = ring
-                .iter()
-                .filter_map(|p| {
-                    let (la, lo) = frame.ll(*p);
-                    crate::seed::airport::limit_of(approach.iter().copied(), la, lo)
-                })
-                .fold(f64::INFINITY, f64::min);
+        let rb = ring.iter().fold([f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY], |m, p| {
+            [m[0].min(p[0]), m[1].min(p[1]), m[2].max(p[0]), m[3].max(p[1])]
+        });
+        let own;
+        let near: &[&ApproachSurface] = if rb[0] >= grown[0] && rb[1] >= grown[1] && rb[2] <= grown[2] && rb[3] <= grown[3] {
+            &approach
+        } else {
+            let (sw, ne) = (ll([rb[0], rb[1]]), ll([rb[2], rb[3]]));
+            own = w.approach.within([sw[0], sw[1], ne[0], ne[1]]);
+            wide_hit |= !own.is_empty();
+            &own
+        };
+        if !near.is_empty() {
+            let cap = near.iter().filter_map(|s| s.cap_over(ring.iter().map(|p| frame.ll(*p)))).fold(f64::INFINITY, f64::min);
             if cap.is_finite() {
-                let base = ring
-                    .iter()
-                    .map(|p| {
-                        let (la, lo) = frame.ll(*p);
-                        (w.height.height(la, lo) * 100.0).round() / 100.0
-                    })
-                    .fold(f64::INFINITY, f64::min);
-                let allowed = cap - base;
+                let base = mesh_base(w, &ring, &mut |p| frame.ll(p), &mut px);
+                let allowed = cap - base - BASE_MARGIN_M;
                 if allowed < w.params.airport.approach.min_building_m {
                     return;
                 }
@@ -167,7 +222,7 @@ pub fn build(inp: &CellInput, net: &LocalNetwork, lots: &Lots) -> Vec<PlanBuildi
     }
     // An old town's landmarks: its most central buildings in the first cell.
     // Not under an approach surface: a landmark is taller than the cap there.
-    if d.landmarks > 0 && d.cells.first() == Some(&inp.a) && approach.is_empty() {
+    if d.landmarks > 0 && d.cells.first() == Some(&inp.a) && approach.is_empty() && !wide_hit {
         let mut idx: Vec<usize> = (0..out.len()).collect();
         let dist2 = |b: &PlanBuilding| {
             let n = b.ring.len() as f32;

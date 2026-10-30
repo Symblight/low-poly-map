@@ -1,9 +1,11 @@
 //! `simworld-cli seed ...`: the seed world's offline tools (docs/spec-world-seed.md section 3.2).
-//! S0: `airports`, `water`, `validate`. Later phases add `preview`, `roads`, `export`,
-//! `import-edits`.
+//! S0: `airports`, `water`, `validate`; S2: `preview`; generator 4 phase C0: `preview --layers`,
+//! `gallery`. Later phases add `roads`, `export`, `import-edits`.
 
 pub mod airports;
 pub mod csv;
+pub mod gallery;
+pub mod preview;
 pub mod validate;
 pub mod water;
 
@@ -21,7 +23,17 @@ pub const USAGE: &str = "\
                           [--source-date YYYY-MM-DD] -o water.json
       build the low-poly water file from GeoJSON polygons (see `seed water --help`)
   simworld-cli seed validate <world.json> [--res-root DIR] [--raster-n 64] [--blend-m 400]
-      load a seed world like the library does: errors (exit 1), warnings, summary, water index size";
+      load a seed world like the library does: errors (exit 1), warnings, summary, water index size
+  simworld-cli seed preview <world.json> --city ID [--layers L,...] [--extent LON,LAT,KM] [--detail]
+                            [--m-per-px 10] [--res-root DIR] -o city.svg
+      2D plan of a generated city; layers footprint,zones,major,local,buildings (default: zones and
+      major roads, --detail adds local and buildings); --extent crops to a KM-wide square and builds
+      only the district plans in it; prints the plan's counts and warnings
+  simworld-cli seed gallery -o DIR [--world <world.json>] [--res-root DIR]
+      generator inspection (pipeline spec section 9): per city full / streets / buildings SVGs, one
+      sheet, gallery.json and gallery.md (median build ms per level and district-plan stage, plan
+      bytes, tile ms, triangles and KB per band over every tile of each city's bbox, counts, max
+      RSS, user CPU); without --world a built-in flat world of three old_center_hex cities";
 
 const WATER_HELP: &str = "\
 seed water inputs are GeoJSON Polygon / MultiPolygon features (no GIS library in the CLI). Typical
@@ -83,6 +95,8 @@ pub fn run(args: &[String]) -> Result<bool, String> {
         Some("airports") => cmd_airports(&args[1..]),
         Some("water") => cmd_water(&args[1..]),
         Some("validate") => cmd_validate(&args[1..]),
+        Some("preview") => cmd_preview(&args[1..]),
+        Some("gallery") => cmd_gallery(&args[1..]),
         _ => Err(format!("usage:\n{USAGE}")),
     }
 }
@@ -216,6 +230,82 @@ fn cmd_validate(args: &[String]) -> Result<bool, String> {
     Ok(ok)
 }
 
+fn cmd_preview(args: &[String]) -> Result<bool, String> {
+    let (mut manifest, mut res_root, mut city, mut out, mut detail, mut scale) = (None, None, None, None, false, None);
+    let (mut layers, mut extent) = (None, None);
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].clone();
+        match a.as_str() {
+            "--res-root" => res_root = Some(PathBuf::from(arg_value(args, &mut i, &a)?)),
+            "--city" => city = Some(arg_value(args, &mut i, &a)?.to_string()),
+            "--detail" => detail = true,
+            "--layers" => layers = Some(preview::Layers::parse(arg_value(args, &mut i, &a)?)?),
+            "--extent" => {
+                let v = arg_value(args, &mut i, &a)?;
+                let n: Vec<f64> = v.split(',').map(|x| x.trim().parse::<f64>()).collect::<Result<_, _>>().map_err(|_| format!("--extent {v}: LON,LAT,KM"))?;
+                match n.as_slice() {
+                    [lon, lat, km] if *km > 0.0 => extent = Some([*lon, *lat, *km]),
+                    _ => return Err(format!("--extent {v}: LON,LAT,KM with KM > 0")),
+                }
+            }
+            "--m-per-px" => scale = Some(arg_value(args, &mut i, &a)?.parse::<f64>().ok().filter(|v| *v > 0.0).ok_or("--m-per-px: a positive number")?),
+            "-o" => out = Some(arg_value(args, &mut i, "-o")?.to_string()),
+            a if a.starts_with('-') => return Err(format!("seed preview: unknown option {a}\n{USAGE}")),
+            a => manifest = Some(PathBuf::from(a)),
+        }
+        i += 1;
+    }
+    let (Some(manifest), Some(city), Some(out)) = (manifest, city, out) else {
+        return Err(format!("seed preview: need <world.json>, --city and -o\n{USAGE}"));
+    };
+    if layers.is_some() && detail {
+        return Err("seed preview: --detail is the old form of --layers; use one".into());
+    }
+    let t = std::time::Instant::now();
+    let (w, ci) = preview::load(&manifest, res_root, &city)?;
+    let plan = w.city_plan(ci);
+    let ext = extent.map(|[lon, lat, km]| preview::extent_box(&plan, lon, lat, km));
+    // An extent defaults to about 1000 px across.
+    let scale = scale.unwrap_or_else(|| extent.map_or(10.0, |e| (e[2]).max(0.1)));
+    write_out(&out, &preview::svg(&w, &plan, layers.unwrap_or(preview::Layers::legacy(detail)), ext, scale))?;
+    let st = &plan.stats;
+    eprintln!(
+        "{out}: {} land / {} water / {} airport cells, {} districts {:?}, {} arterial edges ({} components), {} bridges, {} radials ({} to airports), plan {:.1} ms, total {:.1} s",
+        st.land_cells, st.water_cells, st.airport_cells, st.districts, st.cells_by_type, st.arterial_edges, st.arterial_components,
+        st.bridges, st.radials, st.airport_access, st.build_ms, t.elapsed().as_secs_f64()
+    );
+    for wn in &plan.warnings {
+        eprintln!("warning: {wn}");
+    }
+    Ok(true)
+}
+
+fn cmd_gallery(args: &[String]) -> Result<bool, String> {
+    let (mut world, mut res_root, mut out) = (None, None, None);
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].clone();
+        match a.as_str() {
+            "--world" => world = Some(PathBuf::from(arg_value(args, &mut i, &a)?)),
+            "--res-root" => res_root = Some(PathBuf::from(arg_value(args, &mut i, &a)?)),
+            "-o" => out = Some(PathBuf::from(arg_value(args, &mut i, "-o")?)),
+            a => return Err(format!("seed gallery: unknown argument {a}\n{USAGE}")),
+        }
+        i += 1;
+    }
+    let out = out.ok_or_else(|| format!("seed gallery: need -o DIR\n{USAGE}"))?;
+    let t = std::time::Instant::now();
+    let loaded = match &world {
+        Some(m) => preview::load_world(m, res_root)?,
+        None => gallery::fixture_world()?,
+    };
+    let label = world.as_ref().map_or_else(|| "built-in fixture".to_string(), |m| m.display().to_string());
+    let rep = gallery::run(&loaded, &label, &out)?;
+    eprintln!("{}: {} cities, {:.1} s", out.display(), rep.cities, t.elapsed().as_secs_f64());
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +317,32 @@ mod tests {
         assert!(check_date("2026-10-27").is_ok() && check_date("27.10.2026").is_err());
         let d = file_date(env!("CARGO_MANIFEST_DIR"));
         assert!(check_date(&d).is_ok() && d.as_str() > "2020-01-01", "{d}");
+    }
+
+    #[test]
+    fn preview_writes_the_city_plan() {
+        let dir = std::env::temp_dir().join(format!("simworld-seed-preview-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("kaunas.svg");
+        let world = format!("{}/../../low-poly-map/world/two-cities/world.json", env!("CARGO_MANIFEST_DIR"));
+        let args: Vec<String> = ["preview", &world, "--city", "kaunas", "-o", out.to_str().unwrap()].iter().map(|s| s.to_string()).collect();
+        assert!(run(&args).unwrap());
+        let svg = std::fs::read_to_string(&out).unwrap();
+        assert!(svg.starts_with("<svg") && svg.contains("<polygon") && svg.contains("<polyline"));
+        assert!(run(&["preview".into(), world.clone(), "--city".into(), "nowhere".into(), "-o".into(), "x.svg".into()]).is_err());
+        // Layers and an extent: only the named layers, cropped to a 1 km square at the centre.
+        let out2 = dir.join("kaunas-centre.svg");
+        let args: Vec<String> = ["preview", &world, "--city", "kaunas", "--layers", "footprint,local,buildings", "--extent", "23.9036,54.8985,1", "-o", out2.to_str().unwrap()]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(run(&args).unwrap());
+        let crop = std::fs::read_to_string(&out2).unwrap();
+        assert!(crop.starts_with(r#"<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="1000""#), "{}", &crop[..120]);
+        assert!(crop.contains("stroke=\"#333333\"") && crop.contains("fill=\"#6b5d52\"") && !crop.contains("#d08a2c"));
+        let bad: Vec<String> = ["preview", &world, "--city", "kaunas", "--layers", "lots", "-o", "x.svg"].iter().map(|s| s.to_string()).collect();
+        assert!(run(&bad).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

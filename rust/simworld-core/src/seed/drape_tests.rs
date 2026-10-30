@@ -257,8 +257,13 @@ fn drape_margin_blends_over_the_shoulder() {
     let frame = Frame::new(VILNIUS.0, VILNIUS.1);
     let g = w.airport("EYVI").unwrap();
     let shoulder = p.seed.airport.shoulder_m;
-    // From the fence centre across the long side (+v), past the shoulder.
-    let v = g.fence.v();
+    // From the fence centre across a long side, past the shoulder.
+    // Across the long side facing away from the city (since S2 the city's ground and its access
+    // road reach the fence on the other side).
+    let v0 = g.fence.v();
+    let city = g.frame.xy(w.cities()[0].center.lat, w.cities()[0].center.lon);
+    let toward = (city[0] - g.fence.c[0]) * v0[0] + (city[1] - g.fence.c[1]) * v0[1];
+    let v = if toward > 0.0 { [-v0[0], -v0[1]] } else { v0 };
     let mut terr: HashMap<(TileKey, usize), (MeshData, usize)> = HashMap::new();
     let (mut worst_h, mut worst_tin) = (f64::INFINITY, f64::INFINITY);
     for ring in 0..3usize {

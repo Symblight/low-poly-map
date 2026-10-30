@@ -14,7 +14,7 @@ Goals, in order:
 
 **Out of scope (deliberately):** cars beyond R1 (the far "light rivers" seen from cruise altitude on R2 / R3 roads), intersections, lane changes, traffic lights, several lanes per direction, trucks, parked cars, sounds, a car mesh asset. Cars pass through each other at junctions and that is accepted.
 
-**Status:** proposed, 2026-10-28, no code. **Owners:** `rust/` (runs, profile keys, tests) → `rust-world-streamer`; `TrafficPool`, shader, bench → `godot-csharp-integrator`; measurement → `open-world-perf-reviewer`.
+**Status:** proposed, 2026-10-28, no code. **Owners:** `rust/` (runs, profile keys, tests) → `rust-world-streamer`; `TrafficPool`, shader, bench → `godot-csharp-integrator`; measurement → `/bench-measure` (+ `code-critic` for the cost review).
 
 ## Today
 
@@ -137,7 +137,7 @@ Godot `--traffic-selftest` (headless): a delivered R0 tile with roads has a traf
 | --- | --- | --- | --- |
 | **R1 Runs** | rust-world-streamer | `traffic.rs`, profile block + schema + `default.json` (profile_version 8), `traffic_cars`, `debug_stats` / `debug_tiles`, contract 1.12 + CHANGELOG, tests | `cargo test` green, goldens unchanged |
 | **C1 Cars** | godot-csharp-integrator | `TrafficMesh` (body + lamp surfaces, lamp-only mesh), `TrafficPool`, `traffic_car.gdshader` + `traffic_lamp.gdshader`, the two globals, `TrafficEnabled` / `TrafficDensityScale`, bench switches, F1 line, settings, `--traffic-selftest` | boxes drive on the roads by day; at night white and red dots move on every R0 / R1 road and the windows glow yellow up close; self-test passes |
-| **P1 Measure** | open-world-perf-reviewer | section 8 plan and acceptance | numbers under "Status and measured results" |
+| **P1 Measure** | `/bench-measure` | section 8 plan and acceptance | numbers under "Status and measured results" |
 | **T0 Oneway** (optional) | rust-world-streamer | `oneway` in the schema and `bake`, rebuild the archives | dual carriageways carry one direction each |
 
 _Status and measured results: to be filled after each phase._

@@ -11,6 +11,8 @@
 //! like decoded MVT, so the mesher, the ground mesher, the lights and the sibling swap work
 //! unchanged:
 //!
+//! * cities (S2-S4, [`super::city`]): district areas, arterials, radials, local streets and
+//!   buildings;
 //! * ground in **all four bands**: countryside patches (forest / farmland / meadow + tint),
 //!   water areas (sea, lakes, rivers) from the water file's polygons, the airports' fence field,
 //!   runways, taxiways and aprons (class 7 `aeroway`, or `seed.aeroway_class`);
@@ -19,9 +21,13 @@
 //! * airport lights inside the tile rectangle.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use super::airport::{build_airport, AirportGeo, StripIndex};
+use super::airport::{build_airport, AirportGeo, ApproachIndex, StripIndex};
+use super::city::cache::PlanCache;
+use super::city::CellPlan;
+use super::city::hex::Ax;
+use super::city::{CityKinds, CityPlan};
 use super::countryside::{z15_to_px, Countryside, PATCH_ZOOM};
 use super::files::{load_world, City, SeedFiles};
 use super::geom::{m_per_deg_lon, M_PER_DEG};
@@ -35,14 +41,20 @@ use crate::terrain::Terrain;
 
 /// Version of the generator's output: changes with any intended output change (section 7).
 /// 2: S1 fixes (no drape lift inside airport fences, fences cut out of countryside and water,
-/// airport levels 1 / 2 / 3, coast-resolved terrain COLOR).
-pub const SEED_GEN_VERSION: u32 = 2;
+/// airport levels 1 / 2 / 3, coast-resolved terrain COLOR). 3: cities (S2-S4: districts,
+/// arterials, radials, streets, buildings; countryside at stacking level 0 under them; terrain
+/// COLOR of the district class inside city footprints).
+pub const SEED_GEN_VERSION: u32 = 3;
 
 /// Phases of `docs/spec-world-seed.md` section 11 this library has built (`seed_world_info()`).
-pub const SEED_PHASES: &[&str] = &["S0", "S1"];
+pub const SEED_PHASES: &[&str] = &["S0", "S1", "S2", "S3", "S4"];
 
 /// Courtesy attribution of the airport data (public domain).
 pub const OURAIRPORTS_ATTRIBUTION: &str = "Airport data: OurAirports";
+
+/// Stacking level of the countryside patches: the bottom, so city district areas (residential
+/// 2 ... grass 5) draw over them and water (7) over both.
+pub const COUNTRYSIDE_LEVEL: u8 = 0;
 
 /// Tile pixel extent of generated tiles (as the archive's MVT).
 pub const EXTENT: f64 = 4096.0;
@@ -106,6 +118,16 @@ pub struct SeedWorld {
     pub terrain: Arc<SeedTerrain>,
     pub countryside: Countryside,
     pub params: SeedProfile,
+    /// The configuration's terrain with the seed rules (approach caps read it).
+    pub height: Terrain,
+    /// Approach surfaces of every runway end (building caps).
+    pub approach: ApproachIndex,
+    /// Profile resolutions the city generator needs (road classes and widths, area classes).
+    pub city_kinds: CityKinds,
+    /// City plans, built on first use (index = manifest order).
+    city_plans: Vec<OnceLock<Arc<CityPlan>>>,
+    /// District (cell) plans, bounded by `seed.city.plan_cache`.
+    cell_plans: PlanCache,
     /// Ground (class, level) of the countryside kinds and of water, from the profile.
     area_forest: (u8, u8),
     area_farmland: (u8, u8),
@@ -181,6 +203,8 @@ impl SeedWorld {
             .collect();
         let strips = StripIndex::new(&airports, sp.airport.shoulder_m);
         let terrain = Arc::new(SeedTerrain { water: water.clone(), strips });
+        let height = field.clone().with_seed(terrain.clone());
+        let approach = ApproachIndex::new(&airports, &sp.airport.approach, sp.airport.strip_end_m, &|lat, lon| height.height(lat, lon));
         let root = world_root(&files.manifest.world_seed);
         let countryside = Countryside::new(Seed(crate::seed_hash!(root, "countryside")), sp.countryside.clone());
         let mut warnings = files.warnings.clone();
@@ -217,6 +241,11 @@ impl SeedWorld {
             area_farmland: profile.ground_area_class("farmland"),
             area_meadow: profile.ground_area_class("meadow"),
             area_water: profile.ground_area_class("water"),
+            city_plans: (0..files.cities.len()).map(|_| OnceLock::new()).collect(),
+            cell_plans: PlanCache::new(sp.city.plan_cache as usize),
+            city_kinds: CityKinds::resolve(profile),
+            height,
+            approach,
             params: sp,
             content_key,
             attributions,
@@ -269,6 +298,16 @@ impl SeedWorld {
         if self.terrain.strips.in_fence(lat, lon) {
             return (self.aeroway_class(), 0);
         }
+        for i in 0..self.city_plans.len() {
+            let p = self.city_plan(i);
+            let bb = p.bbox_ll;
+            if lon < bb[0] || lon > bb[2] || lat < bb[1] || lat > bb[3] {
+                continue;
+            }
+            if let Some(d) = p.district_at(lat, lon) {
+                return (self.city_kinds.styles[d.style_index].area.0, 0);
+            }
+        }
         let g = [lon_to_tile_x(lon, PATCH_ZOOM), lat_to_tile_y(lat, PATCH_ZOOM)];
         let (cx, cy) = self.countryside.patch_at(g[0], g[1]);
         let (kind, tint) = self.patch_class(cx, cy);
@@ -286,6 +325,26 @@ impl SeedWorld {
     /// Airport by ident.
     pub fn airport(&self, ident: &str) -> Option<&AirportGeo> {
         self.airports.iter().find(|a| a.ident == ident)
+    }
+
+    /// The plan of city `i` (manifest order), built on first use.
+    pub fn city_plan(&self, i: usize) -> Arc<CityPlan> {
+        self.city_plans[i].get_or_init(|| Arc::new(CityPlan::build(i, &self.files.cities[i], self))).clone()
+    }
+
+    /// The district plan of cell `a` of a city plan (cached).
+    pub fn cell_plan(&self, plan: &CityPlan, a: Ax) -> Arc<CellPlan> {
+        self.cell_plans.get(plan.index as u32, a, || CellPlan::build(plan, a, self))
+    }
+
+    /// City plans built so far (without building the others).
+    pub fn built_city_plans(&self) -> Vec<Arc<CityPlan>> {
+        self.city_plans.iter().filter_map(|p| p.get().cloned()).collect()
+    }
+
+    /// District plan cache: (plans held, bytes, plans built, total build ms).
+    pub fn cell_plan_stats(&self) -> (usize, usize, u64, f64) {
+        self.cell_plans.stats()
     }
 }
 
@@ -351,9 +410,10 @@ pub fn generate(key: TileKey, w: &SeedWorld) -> SeedTile {
                 continue;
             }
             let (kind, tint) = w.patch_class(cx, cy);
-            let (class, level) = w.area_of(kind);
+            // Level 0: the countryside is the underlay every city area stacks on.
+            let class = w.area_of(kind).0;
             let id = crate::seed_hash!(w.countryside_id(), cx, cy) & 0xFFFF_FFFF;
-            out.ground.areas.push(GroundArea { class, level, id, rings: vec![px], tint, sub: 0, cut: true });
+            out.ground.areas.push(GroundArea { class, level: COUNTRYSIDE_LEVEL, id, rings: vec![px], tint, sub: 0, cut: true });
         }
     }
     // Water (sea, lakes, rivers): the water file's polygons, clipped by the ground mesher.
@@ -362,6 +422,8 @@ pub fn generate(key: TileKey, w: &SeedWorld) -> SeedTile {
         let (class, level) = w.area_water;
         out.ground.areas.push(GroundArea { class, level, id: 0x5EA0_0000 + i as u64, rings, tint: 0, sub: 0, cut: true });
     }
+    // Cities (districts, roads, buildings).
+    super::city::tile::emit_city(key, tb, w, &mut out);
     // Airports.
     let aeroway = w.aeroway_class();
     for g in w.airports.iter().filter(|g| overlaps(g.bbox, tb)) {
@@ -423,30 +485,11 @@ impl SeedWorld {
     }
 }
 
-/// The shared two-cities world (`low-poly-map/world/two-cities/`, spec 11a.1) for tests: one
-/// copy for the bench scene and `cargo test`.
 #[cfg(test)]
-pub(crate) const TEST_WORLD: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../low-poly-map/world/two-cities/world.json");
-
-/// Profile overrides every seed world needs (terrain on, no flat zone).
+#[path = "world_fixture.rs"]
+mod fixture;
 #[cfg(test)]
-pub(crate) fn test_profile_json() -> serde_json::Value {
-    serde_json::json!({ "terrain": { "enabled": true, "flat_radius_m": 0.0, "flat_blend_m": 0.0 } })
-}
-
-/// The two-cities world loaded once per test binary: (profile, terrain with the seed rules, world).
-#[cfg(test)]
-pub(crate) fn test_world() -> &'static (Profile, Terrain, Arc<SeedWorld>) {
-    static W: std::sync::OnceLock<(Profile, Terrain, Arc<SeedWorld>)> = std::sync::OnceLock::new();
-    W.get_or_init(|| {
-        let p = crate::profile::resolve(None, Some(&test_profile_json()), &crate::NullLog).unwrap();
-        let field = Terrain::from_profile(&p, 54.6872, 25.2797);
-        let read = |path: &str| std::fs::read_to_string(path).map_err(|e| e.to_string());
-        let w = SeedWorld::load(TEST_WORLD, &read, &p, &field, None).unwrap_or_else(|e| panic!("{e}"));
-        let t = field.with_seed(w.terrain.clone());
-        (p, t, w)
-    })
-}
+pub(crate) use fixture::{test_profile_json, test_world, TEST_WORLD};
 
 #[cfg(test)]
 #[path = "world_tests.rs"]

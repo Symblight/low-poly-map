@@ -43,6 +43,7 @@ mod light_schema;
 mod ranges;
 mod resolve;
 mod schema;
+mod seed_city_schema;
 mod seed_schema;
 mod terrain_schema;
 #[cfg(test)]
@@ -54,6 +55,7 @@ pub use light_schema::*;
 pub use ranges::{range_of, RANGES};
 pub use resolve::{empty_object, key_paths, load_file, parse_json, resolve};
 pub use schema::*;
+pub use seed_city_schema::*;
 pub use seed_schema::*;
 pub use terrain_schema::*;
 use compile::{landuse_index, StateRule};

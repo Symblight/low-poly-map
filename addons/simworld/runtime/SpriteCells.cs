@@ -127,10 +127,32 @@ internal sealed class SpriteCells
         _spareMembers.Push(m);
     }
 
-    private SpriteCell StartCell(long key, int ring, Vector3 origin)
+    /// <summary>
+    /// The library's geodetic_to_local (set once by the view). It gives a cell an origin that depends only on its key: without it a cell takes the origin of the tile that happens to
+    /// join it first (arrival order), and the f32 positions stored in the cell then differ by sub-millimetre rounding from run to run.
+    /// </summary>
+    public System.Func<double, double, double, Vector3>? GeodeticToLocal;
+
+    /// <summary>
+    /// Origin of a new cell: the centre of the cell's tile in the current local frame (y = 0, like a tile root), a pure function of the key and the floating origin. Falls back to
+    /// <paramref name="fallback"/> (the first tile's origin) when the library cannot convert.
+    /// </summary>
+    private Vector3 OriginOf(long key, Vector3 fallback)
+    {
+        if (GeodeticToLocal == null) return fallback;
+        long k = key & 0x00FFFFFFFFFFFFFF;
+        double n = (double)(1L << TileKey.Z(k));
+        double lon = (TileKey.X(k) + 0.5) / n * 360.0 - 180.0;
+        double lat = System.Math.Atan(System.Math.Sinh(System.Math.PI * (1.0 - 2.0 * (TileKey.Y(k) + 0.5) / n))) * (180.0 / System.Math.PI);
+        var p = GeodeticToLocal(lat, lon, 0.0);
+        if (p == Vector3.Zero || !float.IsFinite(p.X) || !float.IsFinite(p.Z)) return fallback; // not configured / invalid
+        return new Vector3(p.X, 0f, p.Z);
+    }
+
+    private SpriteCell StartCell(long key, int ring, Vector3 tileOrigin)
     {
         var cell = _free.Count > 0 ? _free.Pop() : new SpriteCell(_root);
-        cell.Begin(key, ring, origin, _materials.CellFades.Rent());
+        cell.Begin(key, ring, OriginOf(key, tileOrigin), _materials.CellFades.Rent());
         _cells[key] = cell;
         _list.Add(cell);
         return cell;

@@ -177,6 +177,7 @@ public partial class WorldView : Node3D
         _markings = new AirportMarkings(this, _settings, AddonPaths.Root + "/shaders");
 
         Streamer = WorldStreamerFacade.Create();
+        _pool.Cells.GeodeticToLocal = Streamer.GeodeticToLocal;
         if (Streamer.IsAvailable) GD.Print($"[WorldView] library api {Streamer.ApiVersionText}");
         _fakeFade = _settings.DebugFakeFade;
         Cover.FadesEnabled = Streamer.HasPollFades || _fakeFade >= 0f;

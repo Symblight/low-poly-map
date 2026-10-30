@@ -2,8 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
-/// World seed (profile_version 6, `docs/spec-world-seed.md` section 9.2). Only the keys phase S1
-/// uses; later phases add `city`, `styles`, `roads`, `landmarks`, `plan_cache`.
+/// World seed (profile_version 6, `docs/spec-world-seed.md` section 9.2). The keys of phases S1
+/// (water, airports, countryside) and S2-S4 (`city`, `styles`, `airport.approach`); later phases
+/// add `roads` and `landmarks`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct SeedProfile {
@@ -14,6 +15,8 @@ pub struct SeedProfile {
     pub water: SeedWater,
     pub airport: SeedAirport,
     pub countryside: SeedCountryside,
+    pub city: super::SeedCity,
+    pub styles: super::SeedStyles,
 }
 
 /// The terrain-water rule (section 5.2a).
@@ -77,6 +80,7 @@ pub struct SeedAirport {
     /// toward their mean (the procedural relief knows nothing about airports; ICAO allows 1 %).
     pub max_slope: f64,
     pub lights: SeedAirportLights,
+    pub approach: super::SeedApproach,
 }
 
 /// Airport lights (ready-tile keys `airport_lights` / `airport_light_colors`, api 1.7), for
@@ -140,6 +144,8 @@ impl Default for SeedProfile {
                 tint_levels: 8,
                 edge_warp: 0.22,
             },
+            city: super::SeedCity::default(),
+            styles: super::SeedStyles::default(),
         }
     }
 }
@@ -170,6 +176,7 @@ impl Default for SeedAirport {
             default_length_m: 800.0,
             max_slope: 0.01,
             lights: SeedAirportLights::default(),
+            approach: super::SeedApproach::default(),
         }
     }
 }

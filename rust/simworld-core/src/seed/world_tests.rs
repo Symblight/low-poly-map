@@ -178,7 +178,7 @@ fn airports_api_lists_eyvi_and_eyka_with_both_ends() {
     assert!((eyvi.runways[0].length_m - 2515.0).abs() < 60.0, "{}", eyvi.runways[0].length_m);
     assert!((eyvi.runways[0].le.heading_deg - 20.0).abs() < 4.0, "{}", eyvi.runways[0].le.heading_deg);
     let info = world.seed_world_info().unwrap();
-    assert_eq!(info.phases, ["S0", "S1"]);
+    assert_eq!(info.phases, ["S0", "S1", "S2", "S3", "S4"]);
     assert_eq!(info.generator_version, SEED_GEN_VERSION);
     assert_eq!((info.world_seed.as_str(), info.world_version), ("bench-two-cities", 1));
     assert_eq!(info.cities.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["vilnius", "kaunas"]);
@@ -287,7 +287,9 @@ fn airport_ground_class_7_sub_kinds_lights_and_kinds() {
     }
     // Buildings resolve to the intended light profiles (section 5.1 step 5).
     let key = tile_for(lat, lon, 14);
-    let dec = generate(key, w).buildings;
+    // The airport's own buildings (the city of S2+ stands next to it).
+    let g = w.airport("EYVI").unwrap();
+    let dec: Vec<_> = generate(key, w).buildings.into_iter().filter(|b| g.buildings.iter().any(|a| a.id == b.id)).collect();
     assert!(!dec.is_empty());
     for b in &dec {
         let built = crate::mvt::TileProjector::new(key, frame, EXTENT).finish(b.clone()).unwrap();

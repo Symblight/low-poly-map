@@ -89,9 +89,24 @@ pub struct SeedCityInfo {
     /// `"synthetic"` (S1 has no real sources; S5 adds `"real:<url>"`, `"synthetic (missing)"`).
     pub source: String,
     pub airports: Vec<String>,
+    /// The city plan (api 1.12; built by this call when no tile needed it yet).
+    pub plan: crate::seed::city::CityStats,
+    /// Plan warnings (district requests that got fewer cells than asked).
+    pub plan_warnings: Vec<String>,
+    /// Approximate memory of the city plan (bytes).
+    pub plan_bytes: usize,
 }
 
-/// Contract `seed_world_info()` (api 1.7).
+/// District plan cache counters (api 1.12, `seed_world_info()["memory"]`).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct DistrictPlanStats {
+    pub held: usize,
+    pub bytes: usize,
+    pub built: u64,
+    pub build_ms: f64,
+}
+
+/// Contract `seed_world_info()` (api 1.7; city plans and district plan counters since 1.12).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SeedInfo {
     pub manifest: String,
@@ -104,6 +119,7 @@ pub struct SeedInfo {
     pub water_polygons: usize,
     pub warnings: Vec<String>,
     pub stats: crate::seed::world::SeedStats,
+    pub district_plans: DistrictPlanStats,
 }
 
 impl World {
@@ -191,7 +207,9 @@ impl World {
             cities: s
                 .cities()
                 .iter()
-                .map(|c| SeedCityInfo {
+                .enumerate()
+                .map(|(i, c)| (c, s.city_plan(i)))
+                .map(|(c, plan)| SeedCityInfo {
                     id: c.id.clone(),
                     name: c.name.clone(),
                     lat: c.center.lat,
@@ -200,12 +218,19 @@ impl World {
                     version: c.version,
                     source: "synthetic".into(),
                     airports: c.airports.clone(),
+                    plan: plan.stats.clone(),
+                    plan_warnings: plan.warnings.clone(),
+                    plan_bytes: plan.bytes(),
                 })
                 .collect(),
             airports: s.airports.len(),
             water_polygons: s.files.water.polygons.len(),
             warnings: s.warnings.clone(),
             stats: s.stats,
+            district_plans: {
+                let (held, bytes, built, build_ms) = s.cell_plan_stats();
+                DistrictPlanStats { held, bytes, built, build_ms }
+            },
         })
     }
 }

@@ -38,7 +38,7 @@ public sealed partial class WorldStreamerFacade
     {
         if (!HasHostApi) return Vector3.Zero;
         _argsGeoToLocal[0] = lat; _argsGeoToLocal[1] = lon; _argsGeoToLocal[2] = altMsl;
-        var v = _node!.Call(MGeodeticToLocal, _argsGeoToLocal);
+        using var v = _node!.Call(MGeodeticToLocal, _argsGeoToLocal);
         return v.VariantType == Variant.Type.Vector3 ? v.AsVector3() : Vector3.Zero;
     }
 

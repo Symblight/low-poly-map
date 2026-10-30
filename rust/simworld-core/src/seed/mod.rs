@@ -1,5 +1,6 @@
-//! M10 World seed (`docs/spec-world-seed.md`): phases S0 (foundations) and S1 (manifest load,
-//! water and countryside ground in all bands, the terrain coupling, airports; api 1.7).
+//! M10 World seed (`docs/spec-world-seed.md`): phases S0 (foundations), S1 (manifest load,
+//! water and countryside ground in all bands, the terrain coupling, airports; api 1.7) and S2-S4
+//! (cities: districts, arterials, radials, streets, lots and buildings; api 1.12).
 //!
 //! * [`hash`]: the one counter-based hash `H(parts…)` with typed parts and the seed hierarchy
 //!   (section 7), pinned by a test vector.
@@ -9,6 +10,8 @@
 //! * [`water`]: the z11 water index, the signed distance raster and the terrain-water rule of
 //!   section 5.2a; the water polygons of a tile.
 //! * [`airport`]: generated airports (section 5.1) and the runway strip rule of the terrain.
+//! * [`city`]: generated cities (S2-S4): city plan (cells, districts, arterials, radials), district
+//!   plans (streets, lots, buildings) and their tile assembly.
 //! * [`countryside`]: forest / farmland / meadow patches with a tint (section 5.2).
 //! * [`terrain`]: the seed world's modifiers of the height function (water rule + strips).
 //! * [`world`]: [`SeedWorld`] (load, cache key, terrain colour class) and the tile generator
@@ -17,6 +20,7 @@
 //!   water`).
 
 pub mod airport;
+pub mod city;
 pub mod countryside;
 pub mod files;
 pub mod geom;
@@ -28,5 +32,7 @@ pub mod world;
 
 pub use world::{SeedWorld, SEED_GEN_VERSION, SEED_PHASES};
 
+#[cfg(test)]
+mod city_tests;
 #[cfg(test)]
 mod drape_tests;

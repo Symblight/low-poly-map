@@ -15,6 +15,12 @@ public static class SeedSpots
 {
     public static readonly string[] Names = { "vilnius", "kaunas", "eyvi", "eyka", "a1", "cruise", "coast", "lake" };
 
+    /// <summary>
+    /// The spots of <c>--seed-selftest</c>: <see cref="Names"/> plus <c>eyvi-field</c> / <c>eyka-field</c> (150 m above the middle of the main runway, along it:
+    /// R0 / R1 tiles over the strip and the inner approaches; for the building and ground checks of the S2-S4 groups).
+    /// </summary>
+    public static readonly string[] SelfTestNames = { "vilnius", "kaunas", "eyvi", "eyka", "eyvi-field", "eyka-field", "a1", "cruise", "coast", "lake" };
+
     /// <summary>3 nautical miles in metres.</summary>
     public const double ThreeNm = 5556.0;
     public const double FinalAglM = 300.0;
@@ -57,6 +63,8 @@ public static class SeedSpots
             case "lake": pose = Fixed(view, name, 54.8550, 24.1700, 500, 0, -28); return true;              // over the middle of Kauno marios
             case "eyvi": return Final(view, "EYVI", name, out pose);
             case "eyka": return Final(view, "EYKA", name, out pose);
+            case "eyvi-field": return Field(view, "EYVI", name, out pose);
+            case "eyka-field": return Field(view, "EYKA", name, out pose);
             default: return false;
         }
     }
@@ -65,6 +73,22 @@ public static class SeedSpots
     {
         var local = view.Streamer.GeodeticToLocal(lat, lon, 0.0);
         return new SpotPose(name, lat, lon, aglM, heading, pitch, local);
+    }
+
+    /// <summary>Over the middle of the main runway, 150 m above ground, heading along it (runway-end threshold midpoint).</summary>
+    private static bool Field(WorldView view, string ident, string name, out SpotPose pose)
+    {
+        pose = default;
+        foreach (var a in view.Airports)
+        {
+            if (a.Ident != ident || a.MainRunway is not { } rw) continue;
+            var local = (rw.Le.ThresholdPosition + rw.He.ThresholdPosition) * 0.5f;
+            var geo = view.Streamer.LocalToGeodetic(local);
+            if (geo == Vector3.Zero) return false;
+            pose = new SpotPose(name, geo.X, geo.Y, 150.0, rw.Le.HeadingDeg, -8.0, local);
+            return true;
+        }
+        return false;
     }
 
     /// <summary>3 nm out on the extended centreline of the main runway's first end, 300 m above ground, heading along the runway.</summary>

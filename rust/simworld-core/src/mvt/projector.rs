@@ -140,66 +140,7 @@ impl TileProjector {
     /// points), so a hill top inside a large footprint counts. With the terrain off, the height
     /// at `centroid` (0, nothing else is sampled).
     pub fn base_height(&self, polygons: &PxPolygons, centroid: [f64; 2]) -> f64 {
-        if !self.terrain.is_active() {
-            return self.ground_at(centroid);
-        }
-        let mut hi = f64::NEG_INFINITY;
-        let step_px = BASE_EDGE_STEP_M / self.m_per_px();
-        let (mut b0, mut b1) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
-        for p in polygons {
-            let Some(outer) = p.first() else { continue };
-            let n = outer.len();
-            for i in 0..n {
-                let (a, b) = (outer[i], outer[(i + 1) % n]);
-                hi = hi.max(self.ground_at(a));
-                for k in 0..2 {
-                    b0[k] = b0[k].min(a[k]);
-                    b1[k] = b1[k].max(a[k]);
-                }
-                let len = crate::math::hypot(b[0] - a[0], b[1] - a[1]);
-                let parts = ((len / step_px).ceil() as usize).clamp(2, BASE_EDGE_MAX_PARTS);
-                for j in 1..parts {
-                    let t = j as f64 / parts as f64;
-                    hi = hi.max(self.ground_at([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]));
-                }
-            }
-        }
-        if !hi.is_finite() {
-            return self.ground_at(centroid);
-        }
-        let inside = |q: [f64; 2]| polygons.iter().any(|p| point_in_rings(q, p));
-        if inside(centroid) {
-            hi = hi.max(self.ground_at(centroid));
-        }
-        // Global lattice (fractional Mercator coordinates i / 2^level), the same points at every
-        // zoom: tile pixel = (i / 2^level * 2^z - x) * extent.
-        let (z, ext) = (self.key.z as i32, self.extent);
-        let to_g = |px: f64, t: u32| (t as f64 + px / ext) / (1u64 << z) as f64;
-        let (gx0, gx1) = (to_g(b0[0], self.key.x), to_g(b1[0], self.key.x));
-        let (gy0, gy1) = (to_g(b0[1], self.key.y), to_g(b1[1], self.key.y));
-        let mut level = BASE_LATTICE_LEVEL;
-        let range = |lv: i32| {
-            let s = (1u64 << lv) as f64;
-            let (ix0, ix1) = ((gx0 * s).ceil() as i64, (gx1 * s).floor() as i64);
-            let (iy0, iy1) = ((gy0 * s).ceil() as i64, (gy1 * s).floor() as i64);
-            (ix0, ix1, iy0, iy1)
-        };
-        let mut r = range(level);
-        while level > 0 && (r.1 - r.0 + 1).max(0) * (r.3 - r.2 + 1).max(0) > BASE_LATTICE_MAX {
-            level -= 1;
-            r = range(level);
-        }
-        let s = (1u64 << level) as f64;
-        let zs = (1u64 << z) as f64;
-        for iy in r.2..=r.3 {
-            for ix in r.0..=r.1 {
-                let q = [(ix as f64 / s * zs - self.key.x as f64) * ext, (iy as f64 / s * zs - self.key.y as f64) * ext];
-                if inside(q) {
-                    hi = hi.max(self.ground_at(q));
-                }
-            }
-        }
-        hi
+        footprint_base(&self.terrain, self.key, self.extent, self.m_per_px(), polygons, centroid)
     }
     pub fn project(&self, px: [f64; 2]) -> [f32; 2] {
         let [e, n] = self.project64(px);
@@ -212,8 +153,7 @@ impl TileProjector {
             let px = self.rect.x1 - self.rect.x0;
             return crate::geo::tile_width_m(lat, self.target.z) / px;
         }
-        let (lat, _) = self.key.center_lat_lon();
-        crate::geo::tile_width_m(lat, self.key.z) / self.extent
+        tile_m_per_px(self.key, self.extent)
     }
 
     pub fn finish(&self, raw: RawBuilding) -> Option<Building> {
@@ -257,4 +197,81 @@ impl TileProjector {
             owned,
         })
     }
+}
+
+/// Metres per pixel at the centre of tile `key` (`extent` pixels), [`TileProjector::m_per_px`]
+/// of an uncut projector.
+pub fn tile_m_per_px(key: TileKey, extent: f64) -> f64 {
+    let (lat, _) = key.center_lat_lon();
+    crate::geo::tile_width_m(lat, key.z) / extent
+}
+
+/// [`TileProjector::base_height`] of a footprint in the pixels of tile `key` (`extent` pixels,
+/// `m_per_px` sets the edge step): the one base rule of the mesher, also called by the seed
+/// generator to cap buildings under approach surfaces against the base the mesh will use.
+pub fn footprint_base(terrain: &Terrain, key: TileKey, extent: f64, m_per_px: f64, polygons: &PxPolygons, centroid: [f64; 2]) -> f64 {
+    let ground_at = |px: [f64; 2]| {
+        let (lat, lon) = key.frac_to_lat_lon(px[0] / extent, px[1] / extent);
+        terrain.height(lat, lon)
+    };
+    if !terrain.is_active() {
+        return ground_at(centroid);
+    }
+    let mut hi = f64::NEG_INFINITY;
+    let step_px = BASE_EDGE_STEP_M / m_per_px;
+    let (mut b0, mut b1) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+    for p in polygons {
+        let Some(outer) = p.first() else { continue };
+        let n = outer.len();
+        for i in 0..n {
+            let (a, b) = (outer[i], outer[(i + 1) % n]);
+            hi = hi.max(ground_at(a));
+            for k in 0..2 {
+                b0[k] = b0[k].min(a[k]);
+                b1[k] = b1[k].max(a[k]);
+            }
+            let len = crate::math::hypot(b[0] - a[0], b[1] - a[1]);
+            let parts = ((len / step_px).ceil() as usize).clamp(2, BASE_EDGE_MAX_PARTS);
+            for j in 1..parts {
+                let t = j as f64 / parts as f64;
+                hi = hi.max(ground_at([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]));
+            }
+        }
+    }
+    if !hi.is_finite() {
+        return ground_at(centroid);
+    }
+    let inside = |q: [f64; 2]| polygons.iter().any(|p| point_in_rings(q, p));
+    if inside(centroid) {
+        hi = hi.max(ground_at(centroid));
+    }
+    // Global lattice (fractional Mercator coordinates i / 2^level), the same points at every
+    // zoom: tile pixel = (i / 2^level * 2^z - x) * extent.
+    let (z, ext) = (key.z as i32, extent);
+    let to_g = |px: f64, t: u32| (t as f64 + px / ext) / (1u64 << z) as f64;
+    let (gx0, gx1) = (to_g(b0[0], key.x), to_g(b1[0], key.x));
+    let (gy0, gy1) = (to_g(b0[1], key.y), to_g(b1[1], key.y));
+    let mut level = BASE_LATTICE_LEVEL;
+    let range = |lv: i32| {
+        let s = (1u64 << lv) as f64;
+        let (ix0, ix1) = ((gx0 * s).ceil() as i64, (gx1 * s).floor() as i64);
+        let (iy0, iy1) = ((gy0 * s).ceil() as i64, (gy1 * s).floor() as i64);
+        (ix0, ix1, iy0, iy1)
+    };
+    let mut r = range(level);
+    while level > 0 && (r.1 - r.0 + 1).max(0) * (r.3 - r.2 + 1).max(0) > BASE_LATTICE_MAX {
+        level -= 1;
+        r = range(level);
+    }
+    let s = (1u64 << level) as f64;
+    let zs = (1u64 << z) as f64;
+    for iy in r.2..=r.3 {
+        for ix in r.0..=r.1 {
+            let q = [(ix as f64 / s * zs - key.x as f64) * ext, (iy as f64 / s * zs - key.y as f64) * ext];
+            if inside(q) {
+                hi = hi.max(ground_at(q));
+            }
+        }
+    }
+    hi
 }

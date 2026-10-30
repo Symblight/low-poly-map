@@ -11,7 +11,7 @@ namespace LowPolyMap;
 /// <c>--set=</c>, <c>--benchmark=</c> / <c>--soak=</c> / <c>--perf-selftest</c> (see <c>Diagnostics/</c>), <c>--lod-selftest</c>, <c>--view=</c> / <c>--cam-fov=</c> (screen-space LOD view), <c>--world=</c> (seed world), <c>--seed-spot=</c>, <c>--seed-selftest</c>, <c>--cover-selftest</c>, <c>--latency-log=</c> and the terrain arguments (<c>--terrain</c>, <c>--terrain-detail=</c>,
 /// <c>--terrain-reach-km=</c>, <c>--terrain-amplitude=</c>, <c>--far=</c>, <c>--terrain-selftest</c>, <c>--terrain-collision</c>,
 /// <c>--terrain-collision-selftest</c>), then starts the view (the scene turns
-/// <c>AutoStart</c> off). See low-poly-map/CLAUDE.md.
+/// <c>AutoStart</c> off). Arguments: docs/bench/keys-and-args.md.
 /// </summary>
 public partial class BenchArgs : Node
 {
@@ -93,6 +93,9 @@ public partial class BenchArgs : Node
             // A second instance (e.g. a screenshot run while the bench is open) needs its own cache folder: the cache is locked per folder.
             else if (arg.StartsWith("--cache-dir=", System.StringComparison.Ordinal)) view.CacheDir = arg.Substring(12).Trim();
         }
+        // A seed benchmark (BenchmarkDef.World) brings its world unless --world= named another one.
+        if (view.SeedWorld.Length == 0 && Diagnostics.BenchmarkArgs.Parse() is { } benchArgs && Diagnostics.BenchmarkDef.Find(benchArgs.Name) is { World.Length: > 0 } benchDef)
+            view.SeedWorld = benchDef.World;
         // A seed world generates every tile: no archive, whatever --tile-url= or the scene said (the view would only warn and ignore it).
         if (view.SeedWorld.Length > 0)
         {

@@ -1542,7 +1542,7 @@
       "additionalProperties": false
     },
     "seed": {
-      "description": "World seed (profile_version 6, docs/spec-world-seed.md section 9.2): how a seed world's generated airports, countryside and terrain-water rule look. Used only by a world configured with the configure_world option seed_world (api 1.7). Phase S1 keys; later phases add city, styles, roads and landmarks.",
+      "description": "World seed (profile_version 6, docs/spec-world-seed.md section 9.2): how a seed world's generated airports, countryside, cities and terrain-water rule look. Used only by a world configured with the configure_world option seed_world (api 1.7). Phase S1 keys (water, airport, countryside) and S2-S4 keys (city, styles, airport.approach); later phases add roads and landmarks.",
       "type": "object",
       "properties": {
         "aeroway_class": {
@@ -1807,6 +1807,75 @@
                 }
               },
               "additionalProperties": false
+            },
+            "approach": {
+              "description": "Approach surfaces (spec section 5.1 step 3, ICAO Annex 14 first section, simplified): from an inner edge strip_end_m before each landing threshold, a trapezoid widening outward whose height limit rises from the threshold height. Generated city buildings inside are capped at the surface (at the lowest point over their footprint); placement keeps tall districts away from them.",
+              "type": "object",
+              "properties": {
+                "long": {
+                  "description": "Surface of paved runways at least long_min_runway_m long (code 3/4).",
+                  "type": "object",
+                  "properties": {
+                    "divergence": {
+                      "description": "Widening per side per metre of distance from the inner edge.",
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 1
+                    },
+                    "length_m": {
+                      "description": "Length of the surface from its inner edge, meters.",
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 15000
+                    },
+                    "slope": {
+                      "description": "Rise of the height limit per metre of distance from the inner edge.",
+                      "type": "number",
+                      "minimum": 0.001,
+                      "maximum": 1
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "short": {
+                  "description": "Surface of shorter or unpaved runways (code 1/2).",
+                  "type": "object",
+                  "properties": {
+                    "divergence": {
+                      "description": "Widening per side per metre of distance from the inner edge.",
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 1
+                    },
+                    "length_m": {
+                      "description": "Length of the surface from its inner edge, meters.",
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 15000
+                    },
+                    "slope": {
+                      "description": "Rise of the height limit per metre of distance from the inner edge.",
+                      "type": "number",
+                      "minimum": 0.001,
+                      "maximum": 1
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "long_min_runway_m": {
+                  "description": "Paved runways at least this long use the long surface, meters.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 6000
+                },
+                "min_building_m": {
+                  "description": "A capped building lower than this is dropped, meters.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 50
+                }
+              },
+              "additionalProperties": false
             }
           },
           "additionalProperties": false
@@ -1856,6 +1925,1061 @@
               "type": "number",
               "minimum": 0,
               "maximum": 0.4
+            }
+          },
+          "additionalProperties": false
+        },
+        "city": {
+          "description": "Generated city plans (spec section 5.3; phase S2): hex cells, automatic district placement, curved arterials on the cell edges, radials and airport access roads, and the district (cell) plan cache.",
+          "type": "object",
+          "properties": {
+            "arterial_drop": {
+              "description": "Share of the arterial candidates outside their spanning tree that are dropped (T and X junctions instead of a honeycomb). The spanning tree is always kept, so the network is never split.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 0.9
+            },
+            "edge_warp": {
+              "description": "Arterial midpoints move across their hex edge by up to this share of the cell size (curved arterials; both cells compute the same curve).",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 0.3
+            },
+            "max_district_m2": {
+              "description": "Neighbouring cells of one district merge into one district (no arterial between them, one street lattice) up to this area, square meters.",
+              "type": "number",
+              "minimum": 50000,
+              "maximum": 20000000
+            },
+            "bridge_spacing_km": {
+              "description": "At most one arterial bridge within this distance (kilometres); other arterial water crossings end at the shore.",
+              "type": "number",
+              "minimum": 0.1,
+              "maximum": 50
+            },
+            "bridge_max_m": {
+              "description": "Arterial and radial water crossings longer than this are never bridged, meters.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 5000
+            },
+            "approach_penalty": {
+              "description": "Placement score penalty, in rings, per share of a cell inside an approach surface, for districts taller than approach_tall_m.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 100
+            },
+            "approach_tall_m": {
+              "description": "Districts whose max_height_m exceeds this avoid approach surfaces in placement, meters.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1000
+            },
+            "radial_step_m": {
+              "description": "Step length of the radial roads' random walk, meters.",
+              "type": "number",
+              "minimum": 20,
+              "maximum": 500
+            },
+            "radial_turn_deg": {
+              "description": "Heading change per radial step, degrees either way (from the hash).",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 45
+            },
+            "access_max_km": {
+              "description": "A radial bent toward a linked airport gives up after this many kilometres outside the city.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 200
+            },
+            "clearance_m": {
+              "description": "Buildings keep this distance from the edge of an arterial or radial, meters.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 50
+            },
+            "floor_m": {
+              "description": "Storey height of generated buildings (levels = height / floor_m), meters.",
+              "type": "number",
+              "minimum": 2,
+              "maximum": 6
+            },
+            "landmark_height_m": {
+              "description": "Height range of an old town's landmark buildings (kinds church and tower; the district's landmarks count), meters.",
+              "type": "array",
+              "items": {
+                "type": "number",
+                "minimum": 5,
+                "maximum": 300
+              },
+              "minItems": 2,
+              "maxItems": 2
+            },
+            "plan_cache": {
+              "description": "District (cell) plans kept in memory; older plans are rebuilt on demand (same output).",
+              "type": "integer",
+              "minimum": 16,
+              "maximum": 65536
+            }
+          },
+          "additionalProperties": false
+        },
+        "styles": {
+          "description": "District styles (spec section 6.2; phases S3 and S4): each district lays a warped street lattice in its own orientation, splits the blocks into lots and puts one building on each kept lot. One entry per district type and style.",
+          "type": "object",
+          "properties": {
+            "old_town": {
+              "description": "old_town / organic: small irregular blocks, closed street fronts, 2-5 floors, the old town's landmarks.",
+              "type": "object",
+              "properties": {
+                "spacing_m": {
+                  "description": "Street spacing range, meters: each lattice line takes a value in it by hash.",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 20,
+                    "maximum": 2000
+                  },
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "jitter": {
+                  "description": "Lattice points move up to this share of the spacing (irregular blocks).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 0.45
+                },
+                "warp_m": {
+                  "description": "Amplitude of the smooth street warp, meters (value noise; the district boundary is never moved).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 200
+                },
+                "street": {
+                  "description": "OSM highway value of the local streets, resolved through ground.roads (width, class, LOD drop).",
+                  "type": "string"
+                },
+                "loop_street": {
+                  "description": "OSM highway value of a loop road inside every block (microdistrict service roads); empty = none.",
+                  "type": "string"
+                },
+                "street_lit": {
+                  "description": "Share of the local streets with street lamps (a district's lit in the city file overrides it).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "street_drop": {
+                  "description": "Share of the lattice street segments left out (merged blocks, dead ends).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 0.9
+                },
+                "frontage_m": {
+                  "description": "Lot frontage range, meters.",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 4,
+                    "maximum": 500
+                  },
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "depth_m": {
+                  "description": "Building depth range from the lot front, meters.",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 3,
+                    "maximum": 500
+                  },
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "setback_m": {
+                  "description": "Building distance from the street edge, meters.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 100
+                },
+                "side_gap_m": {
+                  "description": "Gap between the buildings of neighbouring lots, meters (0 = a closed street front).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 100
+                },
+                "floors": {
+                  "description": "Storey range of the buildings (capped by the district's max_height_m).",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 1,
+                    "maximum": 150
+                  },
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "height_exp": {
+                  "description": "Storeys = min + (max - min) x u^height_exp with u uniform: 1 = even, above 1 = few tall buildings.",
+                  "type": "number",
+                  "minimum": 0.1,
+                  "maximum": 10
+                },
+                "keep": {
+                  "description": "Share of the lots that get a building, scaled by the district density / 0.6.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "l_share": {
+                  "description": "Share of the buildings that are L-shaped.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "kinds": {
+                  "description": "OSM building kinds, chosen per building by hash; they resolve through the light profiles' kinds (night windows, lights).",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "landuse": {
+                  "description": "OSM landuse kind of the district's ground area, resolved through ground.areas.",
+                  "type": "string"
+                },
+                "max_height_m": {
+                  "description": "Height cap of a district of this style when neither the district nor the city file sets max_height_m, meters.",
+                  "type": "number",
+                  "minimum": 3,
+                  "maximum": 1000
+                },
+                "density": {
+                  "description": "Density of a district of this style when neither the district nor the city file sets one (scales keep).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                }
+              },
+              "additionalProperties": false
+            },
+            "business": {
+              "description": "business / grid: towers and slabs, few tall (height_exp), taller toward the district centre.",
+              "type": "object",
+              "properties": {
+                "spacing_m": {
+                  "description": "Street spacing range, meters: each lattice line takes a value in it by hash.",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 20,
+                    "maximum": 2000
+                  },
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "jitter": {
+                  "description": "Lattice points move up to this share of the spacing (irregular blocks).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 0.45
+                },
+                "warp_m": {
+                  "description": "Amplitude of the smooth street warp, meters (value noise; the district boundary is never moved).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 200
+                },
+                "street": {
+                  "description": "OSM highway value of the local streets, resolved through ground.roads (width, class, LOD drop).",
+                  "type": "string"
+                },
+                "loop_street": {
+                  "description": "OSM highway value of a loop road inside every block (microdistrict service roads); empty = none.",
+                  "type": "string"
+                },
+                "street_lit": {
+                  "description": "Share of the local streets with street lamps (a district's lit in the city file overrides it).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "street_drop": {
+                  "description": "Share of the lattice street segments left out (merged blocks, dead ends).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 0.9
+                },
+                "frontage_m": {
+                  "description": "Lot frontage range, meters.",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 4,
+                    "maximum": 500
+                  },
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "depth_m": {
+                  "description": "Building depth range from the lot front, meters.",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 3,
+                    "maximum": 500
+                  },
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "setback_m": {
+                  "description": "Building distance from the street edge, meters.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 100
+                },
+                "side_gap_m": {
+                  "description": "Gap between the buildings of neighbouring lots, meters (0 = a closed street front).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 100
+                },
+                "floors": {
+                  "description": "Storey range of the buildings (capped by the district's max_height_m).",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 1,
+                    "maximum": 150
+                  },
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "height_exp": {
+                  "description": "Storeys = min + (max - min) x u^height_exp with u uniform: 1 = even, above 1 = few tall buildings.",
+                  "type": "number",
+                  "minimum": 0.1,
+                  "maximum": 10
+                },
+                "keep": {
+                  "description": "Share of the lots that get a building, scaled by the district density / 0.6.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "l_share": {
+                  "description": "Share of the buildings that are L-shaped.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "kinds": {
+                  "description": "OSM building kinds, chosen per building by hash; they resolve through the light profiles' kinds (night windows, lights).",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "landuse": {
+                  "description": "OSM landuse kind of the district's ground area, resolved through ground.areas.",
+                  "type": "string"
+                },
+                "max_height_m": {
+                  "description": "Height cap of a district of this style when neither the district nor the city file sets max_height_m, meters.",
+                  "type": "number",
+                  "minimum": 3,
+                  "maximum": 1000
+                },
+                "density": {
+                  "description": "Density of a district of this style when neither the district nor the city file sets one (scales keep).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                }
+              },
+              "additionalProperties": false
+            },
+            "microdistrict": {
+              "description": "residential / microdistrict: superblocks with a service loop, slabs of 5-16 floors around a yard, a school or kindergarten per superblock.",
+              "type": "object",
+              "properties": {
+                "spacing_m": {
+                  "description": "Street spacing range, meters: each lattice line takes a value in it by hash.",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 20,
+                    "maximum": 2000
+                  },
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "jitter": {
+                  "description": "Lattice points move up to this share of the spacing (irregular blocks).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 0.45
+                },
+                "warp_m": {
+                  "description": "Amplitude of the smooth street warp, meters (value noise; the district boundary is never moved).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 200
+                },
+                "street": {
+                  "description": "OSM highway value of the local streets, resolved through ground.roads (width, class, LOD drop).",
+                  "type": "string"
+                },
+                "loop_street": {
+                  "description": "OSM highway value of a loop road inside every block (microdistrict service roads); empty = none.",
+                  "type": "string"
+                },
+                "street_lit": {
+                  "description": "Share of the local streets with street lamps (a district's lit in the city file overrides it).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "street_drop": {
+                  "description": "Share of the lattice street segments left out (merged blocks, dead ends).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 0.9
+                },
+                "frontage_m": {
+                  "description": "Lot frontage range, meters.",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 4,
+                    "maximum": 500
+                  },
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "depth_m": {
+                  "description": "Building depth range from the lot front, meters.",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 3,
+                    "maximum": 500
+                  },
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "setback_m": {
+                  "description": "Building distance from the street edge, meters.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 100
+                },
+                "side_gap_m": {
+                  "description": "Gap between the buildings of neighbouring lots, meters (0 = a closed street front).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 100
+                },
+                "floors": {
+                  "description": "Storey range of the buildings (capped by the district's max_height_m).",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 1,
+                    "maximum": 150
+                  },
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "height_exp": {
+                  "description": "Storeys = min + (max - min) x u^height_exp with u uniform: 1 = even, above 1 = few tall buildings.",
+                  "type": "number",
+                  "minimum": 0.1,
+                  "maximum": 10
+                },
+                "keep": {
+                  "description": "Share of the lots that get a building, scaled by the district density / 0.6.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "l_share": {
+                  "description": "Share of the buildings that are L-shaped.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "kinds": {
+                  "description": "OSM building kinds, chosen per building by hash; they resolve through the light profiles' kinds (night windows, lights).",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "landuse": {
+                  "description": "OSM landuse kind of the district's ground area, resolved through ground.areas.",
+                  "type": "string"
+                },
+                "max_height_m": {
+                  "description": "Height cap of a district of this style when neither the district nor the city file sets max_height_m, meters.",
+                  "type": "number",
+                  "minimum": 3,
+                  "maximum": 1000
+                },
+                "density": {
+                  "description": "Density of a district of this style when neither the district nor the city file sets one (scales keep).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                }
+              },
+              "additionalProperties": false
+            },
+            "houses": {
+              "description": "residential / houses: small curved blocks of detached houses.",
+              "type": "object",
+              "properties": {
+                "spacing_m": {
+                  "description": "Street spacing range, meters: each lattice line takes a value in it by hash.",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 20,
+                    "maximum": 2000
+                  },
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "jitter": {
+                  "description": "Lattice points move up to this share of the spacing (irregular blocks).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 0.45
+                },
+                "warp_m": {
+                  "description": "Amplitude of the smooth street warp, meters (value noise; the district boundary is never moved).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 200
+                },
+                "street": {
+                  "description": "OSM highway value of the local streets, resolved through ground.roads (width, class, LOD drop).",
+                  "type": "string"
+                },
+                "loop_street": {
+                  "description": "OSM highway value of a loop road inside every block (microdistrict service roads); empty = none.",
+                  "type": "string"
+                },
+                "street_lit": {
+                  "description": "Share of the local streets with street lamps (a district's lit in the city file overrides it).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "street_drop": {
+                  "description": "Share of the lattice street segments left out (merged blocks, dead ends).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 0.9
+                },
+                "frontage_m": {
+                  "description": "Lot frontage range, meters.",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 4,
+                    "maximum": 500
+                  },
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "depth_m": {
+                  "description": "Building depth range from the lot front, meters.",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 3,
+                    "maximum": 500
+                  },
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "setback_m": {
+                  "description": "Building distance from the street edge, meters.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 100
+                },
+                "side_gap_m": {
+                  "description": "Gap between the buildings of neighbouring lots, meters (0 = a closed street front).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 100
+                },
+                "floors": {
+                  "description": "Storey range of the buildings (capped by the district's max_height_m).",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 1,
+                    "maximum": 150
+                  },
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "height_exp": {
+                  "description": "Storeys = min + (max - min) x u^height_exp with u uniform: 1 = even, above 1 = few tall buildings.",
+                  "type": "number",
+                  "minimum": 0.1,
+                  "maximum": 10
+                },
+                "keep": {
+                  "description": "Share of the lots that get a building, scaled by the district density / 0.6.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "l_share": {
+                  "description": "Share of the buildings that are L-shaped.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "kinds": {
+                  "description": "OSM building kinds, chosen per building by hash; they resolve through the light profiles' kinds (night windows, lights).",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "landuse": {
+                  "description": "OSM landuse kind of the district's ground area, resolved through ground.areas.",
+                  "type": "string"
+                },
+                "max_height_m": {
+                  "description": "Height cap of a district of this style when neither the district nor the city file sets max_height_m, meters.",
+                  "type": "number",
+                  "minimum": 3,
+                  "maximum": 1000
+                },
+                "density": {
+                  "description": "Density of a district of this style when neither the district nor the city file sets one (scales keep).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                }
+              },
+              "additionalProperties": false
+            },
+            "industrial": {
+              "description": "industrial / grid: large blocks of big low boxes.",
+              "type": "object",
+              "properties": {
+                "spacing_m": {
+                  "description": "Street spacing range, meters: each lattice line takes a value in it by hash.",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 20,
+                    "maximum": 2000
+                  },
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "jitter": {
+                  "description": "Lattice points move up to this share of the spacing (irregular blocks).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 0.45
+                },
+                "warp_m": {
+                  "description": "Amplitude of the smooth street warp, meters (value noise; the district boundary is never moved).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 200
+                },
+                "street": {
+                  "description": "OSM highway value of the local streets, resolved through ground.roads (width, class, LOD drop).",
+                  "type": "string"
+                },
+                "loop_street": {
+                  "description": "OSM highway value of a loop road inside every block (microdistrict service roads); empty = none.",
+                  "type": "string"
+                },
+                "street_lit": {
+                  "description": "Share of the local streets with street lamps (a district's lit in the city file overrides it).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "street_drop": {
+                  "description": "Share of the lattice street segments left out (merged blocks, dead ends).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 0.9
+                },
+                "frontage_m": {
+                  "description": "Lot frontage range, meters.",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 4,
+                    "maximum": 500
+                  },
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "depth_m": {
+                  "description": "Building depth range from the lot front, meters.",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 3,
+                    "maximum": 500
+                  },
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "setback_m": {
+                  "description": "Building distance from the street edge, meters.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 100
+                },
+                "side_gap_m": {
+                  "description": "Gap between the buildings of neighbouring lots, meters (0 = a closed street front).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 100
+                },
+                "floors": {
+                  "description": "Storey range of the buildings (capped by the district's max_height_m).",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 1,
+                    "maximum": 150
+                  },
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "height_exp": {
+                  "description": "Storeys = min + (max - min) x u^height_exp with u uniform: 1 = even, above 1 = few tall buildings.",
+                  "type": "number",
+                  "minimum": 0.1,
+                  "maximum": 10
+                },
+                "keep": {
+                  "description": "Share of the lots that get a building, scaled by the district density / 0.6.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "l_share": {
+                  "description": "Share of the buildings that are L-shaped.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "kinds": {
+                  "description": "OSM building kinds, chosen per building by hash; they resolve through the light profiles' kinds (night windows, lights).",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "landuse": {
+                  "description": "OSM landuse kind of the district's ground area, resolved through ground.areas.",
+                  "type": "string"
+                },
+                "max_height_m": {
+                  "description": "Height cap of a district of this style when neither the district nor the city file sets max_height_m, meters.",
+                  "type": "number",
+                  "minimum": 3,
+                  "maximum": 1000
+                },
+                "density": {
+                  "description": "Density of a district of this style when neither the district nor the city file sets one (scales keep).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                }
+              },
+              "additionalProperties": false
+            },
+            "port": {
+              "description": "port / quay: warehouses.",
+              "type": "object",
+              "properties": {
+                "spacing_m": {
+                  "description": "Street spacing range, meters: each lattice line takes a value in it by hash.",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 20,
+                    "maximum": 2000
+                  },
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "jitter": {
+                  "description": "Lattice points move up to this share of the spacing (irregular blocks).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 0.45
+                },
+                "warp_m": {
+                  "description": "Amplitude of the smooth street warp, meters (value noise; the district boundary is never moved).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 200
+                },
+                "street": {
+                  "description": "OSM highway value of the local streets, resolved through ground.roads (width, class, LOD drop).",
+                  "type": "string"
+                },
+                "loop_street": {
+                  "description": "OSM highway value of a loop road inside every block (microdistrict service roads); empty = none.",
+                  "type": "string"
+                },
+                "street_lit": {
+                  "description": "Share of the local streets with street lamps (a district's lit in the city file overrides it).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "street_drop": {
+                  "description": "Share of the lattice street segments left out (merged blocks, dead ends).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 0.9
+                },
+                "frontage_m": {
+                  "description": "Lot frontage range, meters.",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 4,
+                    "maximum": 500
+                  },
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "depth_m": {
+                  "description": "Building depth range from the lot front, meters.",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 3,
+                    "maximum": 500
+                  },
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "setback_m": {
+                  "description": "Building distance from the street edge, meters.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 100
+                },
+                "side_gap_m": {
+                  "description": "Gap between the buildings of neighbouring lots, meters (0 = a closed street front).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 100
+                },
+                "floors": {
+                  "description": "Storey range of the buildings (capped by the district's max_height_m).",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 1,
+                    "maximum": 150
+                  },
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "height_exp": {
+                  "description": "Storeys = min + (max - min) x u^height_exp with u uniform: 1 = even, above 1 = few tall buildings.",
+                  "type": "number",
+                  "minimum": 0.1,
+                  "maximum": 10
+                },
+                "keep": {
+                  "description": "Share of the lots that get a building, scaled by the district density / 0.6.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "l_share": {
+                  "description": "Share of the buildings that are L-shaped.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "kinds": {
+                  "description": "OSM building kinds, chosen per building by hash; they resolve through the light profiles' kinds (night windows, lights).",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "landuse": {
+                  "description": "OSM landuse kind of the district's ground area, resolved through ground.areas.",
+                  "type": "string"
+                },
+                "max_height_m": {
+                  "description": "Height cap of a district of this style when neither the district nor the city file sets max_height_m, meters.",
+                  "type": "number",
+                  "minimum": 3,
+                  "maximum": 1000
+                },
+                "density": {
+                  "description": "Density of a district of this style when neither the district nor the city file sets one (scales keep).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                }
+              },
+              "additionalProperties": false
+            },
+            "park": {
+              "description": "park / paths: curved footpaths, no buildings.",
+              "type": "object",
+              "properties": {
+                "spacing_m": {
+                  "description": "Street spacing range, meters: each lattice line takes a value in it by hash.",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 20,
+                    "maximum": 2000
+                  },
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "jitter": {
+                  "description": "Lattice points move up to this share of the spacing (irregular blocks).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 0.45
+                },
+                "warp_m": {
+                  "description": "Amplitude of the smooth street warp, meters (value noise; the district boundary is never moved).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 200
+                },
+                "street": {
+                  "description": "OSM highway value of the local streets, resolved through ground.roads (width, class, LOD drop).",
+                  "type": "string"
+                },
+                "loop_street": {
+                  "description": "OSM highway value of a loop road inside every block (microdistrict service roads); empty = none.",
+                  "type": "string"
+                },
+                "street_lit": {
+                  "description": "Share of the local streets with street lamps (a district's lit in the city file overrides it).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "street_drop": {
+                  "description": "Share of the lattice street segments left out (merged blocks, dead ends).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 0.9
+                },
+                "frontage_m": {
+                  "description": "Lot frontage range, meters.",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 4,
+                    "maximum": 500
+                  },
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "depth_m": {
+                  "description": "Building depth range from the lot front, meters.",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 3,
+                    "maximum": 500
+                  },
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "setback_m": {
+                  "description": "Building distance from the street edge, meters.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 100
+                },
+                "side_gap_m": {
+                  "description": "Gap between the buildings of neighbouring lots, meters (0 = a closed street front).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 100
+                },
+                "floors": {
+                  "description": "Storey range of the buildings (capped by the district's max_height_m).",
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": 1,
+                    "maximum": 150
+                  },
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "height_exp": {
+                  "description": "Storeys = min + (max - min) x u^height_exp with u uniform: 1 = even, above 1 = few tall buildings.",
+                  "type": "number",
+                  "minimum": 0.1,
+                  "maximum": 10
+                },
+                "keep": {
+                  "description": "Share of the lots that get a building, scaled by the district density / 0.6.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "l_share": {
+                  "description": "Share of the buildings that are L-shaped.",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "kinds": {
+                  "description": "OSM building kinds, chosen per building by hash; they resolve through the light profiles' kinds (night windows, lights).",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "landuse": {
+                  "description": "OSM landuse kind of the district's ground area, resolved through ground.areas.",
+                  "type": "string"
+                },
+                "max_height_m": {
+                  "description": "Height cap of a district of this style when neither the district nor the city file sets max_height_m, meters.",
+                  "type": "number",
+                  "minimum": 3,
+                  "maximum": 1000
+                },
+                "density": {
+                  "description": "Density of a district of this style when neither the district nor the city file sets one (scales keep).",
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                }
+              },
+              "additionalProperties": false
             }
           },
           "additionalProperties": false

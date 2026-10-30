@@ -76,6 +76,29 @@ pub(crate) fn seed_info_dict(i: &SeedInfo) -> VarDictionary {
         cd.set("source", &GString::from(c.source.as_str()));
         let ap: PackedStringArray = c.airports.iter().map(|s| GString::from(s.as_str())).collect();
         cd.set("airports", &ap);
+        // api 1.12: the city plan.
+        let st = &c.plan;
+        let mut pd = VarDictionary::new();
+        pd.set("land_cells", st.land_cells as i64);
+        pd.set("water_cells", st.water_cells as i64);
+        pd.set("airport_cells", st.airport_cells as i64);
+        pd.set("districts", st.districts as i64);
+        let mut by_type = VarDictionary::new();
+        for (k, v) in &st.cells_by_type {
+            by_type.set(k.as_str(), *v as i64);
+        }
+        pd.set("cells_by_type", &by_type);
+        pd.set("arterial_edges", st.arterial_edges as i64);
+        pd.set("arterial_components", st.arterial_components as i64);
+        pd.set("arterial_components_before", st.arterial_components_before as i64);
+        pd.set("bridges", st.bridges as i64);
+        pd.set("radials", st.radials as i64);
+        pd.set("airport_access", st.airport_access as i64);
+        pd.set("build_ms", st.build_ms);
+        pd.set("kb", c.plan_bytes as f64 / 1024.0);
+        let pw: PackedStringArray = c.plan_warnings.iter().map(|s| GString::from(s.as_str())).collect();
+        pd.set("warnings", &pw);
+        cd.set("plan", &pd);
         cities.push(&cd);
     }
     d.set("cities", &cities);
@@ -90,6 +113,11 @@ pub(crate) fn seed_info_dict(i: &SeedInfo) -> VarDictionary {
     m.set("strip_index_kb", i.stats.strip_index_bytes as f64 / 1024.0);
     m.set("airports_kb", i.stats.airport_bytes as f64 / 1024.0);
     m.set("load_ms", i.stats.build_ms);
+    m.set("city_plans_kb", i.cities.iter().map(|c| c.plan_bytes).sum::<usize>() as f64 / 1024.0);
+    m.set("district_plans", i.district_plans.held as i64);
+    m.set("district_plans_mb", mb(i.district_plans.bytes));
+    m.set("district_plans_built", i.district_plans.built as i64);
+    m.set("district_plan_ms", i.district_plans.build_ms);
     d.set("memory", &m);
     d
 }

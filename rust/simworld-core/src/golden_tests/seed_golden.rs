@@ -60,21 +60,26 @@ fn seed_golden_keys() -> (Vec<(TileKey, usize)>, Vec<(TileKey, usize)>) {
 /// for the intended change "no drape lift inside airport fences, fences cut out of countryside and
 /// water, overlapping strips share one plane, coast-resolved terrain COLOR"; regenerated again
 /// 2026-10-28, W0: every vector tile for the 52105cf building / drape work (as `GOLDEN_TERRAIN`),
-/// the three terrain tiles for the TIN sink with the sea and lake vertices pinned at their level).
+/// the three terrain tiles for the TIN sink with the sea and lake vertices pinned at their level;
+/// regenerated 2026-10-29 for generator 3 (cities S2-S4, countryside at level 0): every vector
+/// tile and the EYVI terrain tile, whose COLOR now carries Vilnius' district classes);
+/// regenerated 2026-10-30 for the approach-cap fix (seed C1 review: the cap reads the mesher's
+/// base rule and keeps `BASE_MARGIN_M` = 5 cm headroom for the per-tile edge split), which lowers
+/// the capped buildings by 5 cm and moves `13/4671/2605` (the cities' buildings stage below too).
 const GOLDEN_SEED: &[(&str, usize, u64)] = &[
-    ("16/37371/20844", 0, 0x3cf706f5b2f2b688),
-    ("15/18685/10422", 1, 0x99c3583cb3b78c18),
-    ("14/9342/5211", 2, 0xc937de90c6feb02d),
-    ("13/4671/2605", 3, 0xf1dca27a4e703c5f),
-    ("15/18595/10324", 1, 0x2f8342746dbc499f),
-    ("13/4648/2581", 3, 0x456d6ea0837839a3),
-    ("14/9152/5124", 2, 0xa057805df42b8677),
-    ("15/18573/10386", 1, 0x0ec008066bc95dc3),
+    ("16/37371/20844", 0, 0x248394d192e0e4a6),
+    ("15/18685/10422", 1, 0x2c4c0df28ccaccae),
+    ("14/9342/5211", 2, 0xb285af8a17cbb129),
+    ("13/4671/2605", 3, 0x692151ee5d17cb1c),
+    ("15/18595/10324", 1, 0xc122b1a81d060a49),
+    ("13/4648/2581", 3, 0x300ce454d6b94ee5),
+    ("14/9152/5124", 2, 0x1ef7a6cb069822de),
+    ("15/18573/10386", 1, 0xbf6ef8fe7ff530af),
 ];
 /// Seed terrain tiles; the T2 and T4 rows regenerated for perf review 2 item 3 (128-cell height
 /// patch on coarse bands; neither tile touches an airport, which keeps the zoom's lattice).
 const GOLDEN_SEED_TERRAIN: &[(&str, usize, u64)] = &[
-    ("14/9342/5211", 0, 0x29aab6a9ec11be0c),
+    ("14/9342/5211", 0, 0x3e0338e41001d92c),
     ("12/2288/1283", 2, 0xc7e6da76e1921356),
     ("10/577/322", 4, 0xca25f5228e785486),
 ];
@@ -138,4 +143,47 @@ fn golden_seed_terrain_cover() {
     }
     let want: Vec<(Vec<usize>, u64)> = GOLDEN_SEED_TERRAIN_COVER.iter().map(|(c, h)| (c.to_vec(), *h)).collect();
     assert_eq!(covers, want, "seed terrain golden cover changed; new table:\n{ctable}");
+}
+
+/// Per-stage content hashes of the generated cities (`docs/spec-seed-city-pipeline.md` section
+/// 8, phase C1) on the two-cities world: per city the city-plan stages (context, zoning, major
+/// network), then the district-plan stages (local network, lots, buildings) folded over every
+/// land cell. A stage change shows as "this stage and the ones after it changed, the ones before
+/// identical".
+/// Column order: context, zoning, network, local, lots, buildings.
+const GOLDEN_SEED_CITY_STAGES: &[(&str, [u64; 6])] = &[
+    ("vilnius", [0x1dc17f560fca86d5, 0xe62796906102be0a, 0xf08bb39a8f38e366, 0x3ab79b1e10775a2f, 0xe7c51ba6ea0d7356, 0xdb6ee28f774c4d26]),
+    ("kaunas", [0x2dcb1f340a82c9d2, 0x0f747cb3c2d5d48d, 0x181fdc078bc68c65, 0x14102aa440ad7c8b, 0x6a9951449cec9089, 0x4cae8430bfbcfee3]),
+];
+
+#[test]
+fn golden_seed_city_stages() {
+    use crate::seed::city::{buildings, lots, network, CellInput, CityPlan, StageHash};
+    let w = &crate::seed::world::test_world().2;
+    let mut got: Vec<(String, [u64; 6])> = Vec::new();
+    for (i, city) in w.cities().iter().enumerate() {
+        let (ctx, zoning, net) = CityPlan::stages(city, w);
+        let plan = w.city_plan(i);
+        let (mut hl, mut ho, mut hb) = (StageHash::new("local"), StageHash::new("lots"), StageHash::new("buildings"));
+        for c in plan.cells.values() {
+            let Some(inp) = CellInput::new(&plan, c.ax, w) else { continue };
+            let l = network::local::build(&inp);
+            let o = lots::build(&inp, &l);
+            let b = buildings::build(&inp, &l, &o);
+            hl.ax(c.ax).u(l.hash());
+            ho.ax(c.ax).u(o.hash());
+            hb.ax(c.ax).u(buildings::hash(&b));
+        }
+        got.push((city.id.clone(), [ctx.hash(), zoning.hash(), net.hash(), hl.finish(), ho.finish(), hb.finish()]));
+    }
+    let table: String = got
+        .iter()
+        .map(|(id, h)| format!("    (\"{id}\", [{}]),\n", h.iter().map(|x| format!("0x{x:016x}")).collect::<Vec<_>>().join(", ")))
+        .collect();
+    if std::env::var("SIMWORLD_UPDATE_GOLDEN").is_ok_and(|v| v == "1") {
+        println!("const GOLDEN_SEED_CITY_STAGES: &[(&str, [u64; 6])] = &[\n{table}];");
+        return;
+    }
+    let want: Vec<(String, [u64; 6])> = GOLDEN_SEED_CITY_STAGES.iter().map(|(id, h)| (id.to_string(), *h)).collect();
+    assert_eq!(got, want, "seed city stage hashes changed (columns: context, zoning, network, local, lots, buildings); new table:\n{table}");
 }

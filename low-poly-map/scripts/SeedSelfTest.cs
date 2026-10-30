@@ -17,7 +17,7 @@ namespace LowPolyMap;
 /// <c>airport_lights</c> (the key is non-empty regardless of the hour; the spot is flown at the clock of the bench, 22:00 by default).</item>
 /// <item>At <c>coast</c>: ten offshore points of <c>ground_height_at</c> equal <c>terrain.sea_level_m</c>, and every surface vertex of every held terrain
 /// tile in the open sea is at sea level. At <c>lake</c>: 25 points over the lake are flat.</item>
-/// <item>At every spot (<see cref="SeedSpots.Names"/>): the first vector tile arrives within 5 s of the teleport (<c>update_camera_geodetic</c>), an R3 ground
+/// <item>At every spot (<see cref="SeedSpots.SelfTestNames"/>): the first vector tile arrives within 5 s of the teleport (<c>update_camera_geodetic</c>), an R3 ground
 /// mesh is held, every vector tile in <c>debug_tiles</c> says <c>source: seed</c> and every terrain tile <c>terrain</c>.</item>
 /// <item>Determinism: after each spot settles, <c>SEED HASHES &lt;spot&gt; &lt;hash&gt;</c> prints a hash of every held tile (keys, rings, quantized mesh and
 /// light content, not the frame-dependent origins); two runs must print the same lines.</item>
@@ -42,8 +42,9 @@ public partial class SeedSelfTest : Node
     private double _timeoutS = 240.0;
     private ulong _startMs;
     private bool _abort;
-    private string[] _spots = SeedSpots.Names;
+    private string[] _spots = SeedSpots.SelfTestNames;
     private double _seaLevel;
+    private bool _s2, _s3;
 
     public override void _Ready()
     {
@@ -128,6 +129,12 @@ public partial class SeedSelfTest : Node
         }
         Note($"airports(): {_view.Airports.Length}, EYVI/EYKA present, sea level {_seaLevel:0.##} m");
 
+        _s2 = info.HasPhase("S2");
+        _s3 = info.HasPhase("S3") || info.HasPhase("S4");
+        if (_s2) CheckPlans();
+        else Note("S2 group skipped: phases [" + string.Join(", ", info.Phases) + "]");
+        if (!_s3) Note("S3-S4 group skipped: phases [" + string.Join(", ", info.Phases) + "]");
+
         // ---- spots -------------------------------------------------------------------------
         foreach (var spot in _spots)
         {
@@ -205,8 +212,10 @@ public partial class SeedSelfTest : Node
         string extra = "";
         switch (name)
         {
-            case "eyvi": extra = CheckAirport("EYVI", name); break;
-            case "eyka": extra = CheckAirport("EYKA", name); break;
+            case "eyvi": extra = CheckAirport("EYVI", name) + (_s2 || _s3 ? CheckAirportRules(name, false, _s3) : ""); break;
+            case "eyka": extra = CheckAirport("EYKA", name) + (_s2 || _s3 ? CheckAirportRules(name, false, _s3) : ""); break;
+            case "eyvi-field": case "eyka-field": if (_s2 || _s3) extra = CheckAirportRules(name, _s2, _s3); break;
+            case "vilnius": case "kaunas": if (_s3) extra = CheckCity(name); break;
             case "coast": extra = CheckCoast(); break;
             case "lake": extra = CheckLake(pose); break;
         }
